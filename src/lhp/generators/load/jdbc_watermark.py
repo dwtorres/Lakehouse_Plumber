@@ -132,7 +132,7 @@ class JDBCWatermarkLoadGenerator(BaseActionGenerator):
         """Extract the target table name from the flowgroup context.
 
         Prefers the write action's declared table; falls back to deriving the
-        name from the JDBC source table string.
+        name from the JDBC source table string with a warning.
 
         Args:
             action: Action configuration.
@@ -154,7 +154,17 @@ class JDBCWatermarkLoadGenerator(BaseActionGenerator):
         # Fallback: derive from JDBC source table name
         source_config = action.source if isinstance(action.source, dict) else {}
         source_table = source_config.get("table", "")
-        # Strip schema qualification: "schema"."table" -> table
         if "." in source_table:
-            return source_table.split(".")[-1].strip('"').strip("'")
-        return source_table.strip('"').strip("'")
+            derived = source_table.split(".")[-1].strip('"').strip("'")
+        else:
+            derived = source_table.strip('"').strip("'")
+
+        logger.warning(
+            f"JDBC watermark action '{action.name}': no write action with a "
+            f"'table' field found in the flowgroup. Deriving Bronze target "
+            f"table name '{derived}' from the JDBC source table "
+            f"'{source_table}'. If the Bronze table has a different name, "
+            f"add a write action to the same flowgroup or the self-watermark "
+            f"HWM query will target the wrong table."
+        )
+        return derived

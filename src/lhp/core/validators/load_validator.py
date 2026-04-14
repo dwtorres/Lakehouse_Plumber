@@ -1,6 +1,7 @@
 """Load action validator."""
 
 import logging
+import re
 from typing import List
 
 from ...models.config import Action, ActionType, LoadSourceType
@@ -162,6 +163,9 @@ class LoadActionValidator(BaseActionValidator):
 
         return errors
 
+    # SQL identifier pattern: letters, digits, underscores — no special chars
+    _SQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
     def _validate_jdbc_watermark_source(self, action: Action, prefix: str) -> List[str]:
         """Validate JDBC watermark source configuration."""
         errors = []
@@ -176,8 +180,35 @@ class LoadActionValidator(BaseActionValidator):
                 errors.append(
                     f"{prefix}: watermark.column is required for jdbc_watermark source"
                 )
+            elif not self._SQL_IDENTIFIER_RE.match(action.watermark.column):
+                errors.append(
+                    f"{prefix}: watermark.column '{action.watermark.column}' "
+                    "must be a valid SQL identifier "
+                    "(letters, digits, underscores only)"
+                )
 
-        # Reuse standard JDBC field validation
+        # jdbc_watermark requires 'table' — 'query' alone is not supported
+        # because the template constructs its own filtered query from the table name
+        if not action.source.get("table"):
+            errors.append(
+                f"{prefix}: JDBC watermark source requires 'table' "
+                "(query-only mode is not supported for watermark loads)"
+            )
+
+        # Warn when >= operator may produce duplicates without Silver dedup
+        if (
+            action.watermark
+            and getattr(action.watermark, "operator", ">=") == ">="
+        ):
+            logger.warning(
+                f"Action '{action.name}': watermark operator is '>=' which "
+                "re-reads rows matching the high-water mark on each run. "
+                "Ensure the downstream Silver layer uses "
+                "create_auto_cdc_flow() with sequence_by to deduplicate, "
+                "or set operator to '>' if the watermark column has no ties."
+            )
+
+        # Reuse standard JDBC field validation for url, user, password, driver
         errors.extend(self._validate_jdbc_source(action, prefix))
 
         return errors

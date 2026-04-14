@@ -140,6 +140,55 @@ class TestJDBCWatermarkValidation:
         # Standard JDBC validation should pass; watermark section is simply ignored
         assert errors == [], f"Expected no errors for standard jdbc, got: {errors}"
 
+    def test_watermark_column_with_special_chars_rejected(self):
+        """Watermark column containing special characters should be rejected."""
+        action = self._make_valid_watermark_action(
+            watermark={"column": "col; DROP TABLE--", "type": "timestamp"}
+        )
+        errors = self.validator.validate(action, "test")
+        assert len(errors) > 0
+        assert any(
+            "valid SQL identifier" in str(e) for e in errors
+        ), f"Expected SQL identifier error, got: {errors}"
+
+    def test_watermark_column_with_spaces_rejected(self):
+        """Watermark column containing spaces should be rejected."""
+        action = self._make_valid_watermark_action(
+            watermark={"column": "my column", "type": "timestamp"}
+        )
+        errors = self.validator.validate(action, "test")
+        assert len(errors) > 0
+        assert any(
+            "valid SQL identifier" in str(e) for e in errors
+        ), f"Expected SQL identifier error, got: {errors}"
+
+    def test_watermark_column_valid_identifier_passes(self):
+        """A valid SQL identifier watermark column should pass."""
+        action = self._make_valid_watermark_action(
+            watermark={"column": "modified_date_utc", "type": "timestamp"}
+        )
+        errors = self.validator.validate(action, "test")
+        assert errors == [], f"Expected no errors, got: {errors}"
+
+    def test_query_only_jdbc_watermark_rejected(self):
+        """jdbc_watermark with query but no table should be rejected.
+
+        The ConfigFieldValidator rejects 'query' as an unknown field for
+        jdbc_watermark sources before the type-specific validator runs.
+        Either way, the config is rejected.
+        """
+        source_with_query_only = {
+            "type": "jdbc_watermark",
+            "url": "jdbc:postgresql://host:5432/db",
+            "user": "test_user",
+            "password": "test_pass",
+            "driver": "org.postgresql.Driver",
+            "query": "SELECT * FROM some_table",
+        }
+        action = self._make_valid_watermark_action(source=source_with_query_only)
+        errors = self.validator.validate(action, "test")
+        assert len(errors) > 0, "Expected errors for query-only jdbc_watermark"
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

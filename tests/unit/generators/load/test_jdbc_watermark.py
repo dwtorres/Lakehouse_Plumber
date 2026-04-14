@@ -64,8 +64,10 @@ class TestJDBCWatermarkLoadGenerator:
         assert "@dp.temporary_view()" in code
         assert "SELECT MAX(modified_date) AS _hwm" in code
         assert "WHERE modified_date >= '{}'" in code
-        assert "except Exception:" in code
+        assert "from pyspark.errors import AnalysisException" in code
+        assert "except AnalysisException:" in code
         assert "_hwm = None" in code
+        assert "_hwm_safe = str(_hwm).replace" in code
 
     def test_numeric_watermark_generation(self):
         """Numeric watermark does NOT wrap HWM value in quotes."""
@@ -77,6 +79,7 @@ class TestJDBCWatermarkLoadGenerator:
 
         assert "WHERE product_id >= {}" in code
         assert "WHERE product_id >= '{}'" not in code
+        assert "_hwm_safe = int(_hwm)" in code
 
     def test_first_run_handling(self):
         """Generated code handles first run when target table does not exist."""
@@ -84,7 +87,7 @@ class TestJDBCWatermarkLoadGenerator:
         code = self.generator.generate(action, {})
 
         assert "try:" in code
-        assert "except Exception:" in code
+        assert "except AnalysisException:" in code
         assert "_hwm = None" in code
 
     def test_partitioning_present(self):
@@ -145,15 +148,26 @@ class TestJDBCWatermarkLoadGenerator:
 
         compile(code, "<test>", "exec")
 
-    def test_bronze_target_with_substitution_context(self):
-        """Substitution manager catalog/schema appear in HWM query target."""
+    def test_bronze_target_with_substitution_context(self, caplog):
+        """Substitution manager catalog/schema appear in HWM query target.
+
+        When no write action is in the flowgroup, the generator should emit a
+        warning about deriving the Bronze target from the JDBC source table.
+        """
+        import logging
+
         sub_mgr = MockSubstitutionManager(
             mappings={"catalog": "dev_catalog", "bronze_schema": "bronze"},
         )
         action = _make_watermark_action(jdbc_table='"schema"."orders"')
-        code = self.generator.generate(action, {"substitution_manager": sub_mgr})
+        with caplog.at_level(logging.WARNING, logger="lhp.generators.load.jdbc_watermark"):
+            code = self.generator.generate(action, {"substitution_manager": sub_mgr})
 
         assert "dev_catalog.bronze.orders" in code
+        assert any(
+            "no write action" in record.message and "Deriving Bronze target" in record.message
+            for record in caplog.records
+        ), f"Expected fallback warning, got: {[r.message for r in caplog.records]}"
 
     def test_bronze_target_from_write_action(self):
         """Write action table name is used for the bronze target in HWM query."""

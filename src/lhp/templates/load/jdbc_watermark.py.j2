@@ -1,6 +1,8 @@
 @dp.temporary_view()
 def {{ target_view }}():
     """{{ description }}"""
+    from pyspark.errors import AnalysisException
+
     # Self-watermark: read HWM from Bronze target
     _target_table = "{{ bronze_target }}"
     try:
@@ -8,27 +10,31 @@ def {{ target_view }}():
             f"SELECT MAX({{ watermark_column }}) AS _hwm FROM {_target_table}"
         ).first()
         _hwm = _hwm_result["_hwm"] if _hwm_result else None
-    except Exception:
+    except AnalysisException:
         _hwm = None  # First run — table doesn't exist yet
 
     # Filtered JDBC read
 {% if watermark_type == "timestamp" %}
     if _hwm is not None:
-        _query = """(SELECT * FROM {{ jdbc_table }} WHERE {{ watermark_column }} {{ watermark_operator }} '{}') AS t""".format(_hwm)
+        _hwm_safe = str(_hwm).replace("'", "")
+        _query = """(SELECT * FROM {{ jdbc_table }} WHERE {{ watermark_column }} {{ watermark_operator }} '{}') AS t""".format(_hwm_safe)
     else:
         _query = """(SELECT * FROM {{ jdbc_table }}) AS t"""
 {% elif watermark_type == "numeric" %}
     if _hwm is not None:
-        _query = """(SELECT * FROM {{ jdbc_table }} WHERE {{ watermark_column }} {{ watermark_operator }} {}) AS t""".format(_hwm)
+        _hwm_safe = int(_hwm) if float(_hwm) == int(float(_hwm)) else float(_hwm)
+        _query = """(SELECT * FROM {{ jdbc_table }} WHERE {{ watermark_column }} {{ watermark_operator }} {}) AS t""".format(_hwm_safe)
     else:
         _query = """(SELECT * FROM {{ jdbc_table }}) AS t"""
+{% else %}
+    raise ValueError("Unsupported watermark type '{{ watermark_type }}' — expected 'timestamp' or 'numeric'")
 {% endif %}
     df = spark.read \
         .format("jdbc") \
-        .option("url", "{{ jdbc_url }}") \
-        .option("user", "{{ jdbc_user }}") \
-        .option("password", "{{ jdbc_password }}") \
-        .option("driver", "{{ jdbc_driver }}") \
+        .option("url", "{{ jdbc_url|replace('\\', '\\\\')|replace('"', '\\"') }}") \
+        .option("user", "{{ jdbc_user|replace('\\', '\\\\')|replace('"', '\\"') }}") \
+        .option("password", "{{ jdbc_password|replace('\\', '\\\\')|replace('"', '\\"') }}") \
+        .option("driver", "{{ jdbc_driver|replace('\\', '\\\\')|replace('"', '\\"') }}") \
         .option("dbtable", _query) \
 {% if num_partitions and num_partitions != "1" %}        .option("numPartitions", {{ num_partitions }}) \
         .option("partitionColumn", "{{ partition_column }}") \

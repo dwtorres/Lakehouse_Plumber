@@ -54,7 +54,7 @@ class TestJDBCWatermarkIntegration:
         assert "@dp.temporary_view()" in code
         assert "def v_orders_raw():" in code
         assert "SELECT MAX(modified_date) AS _hwm" in code
-        assert "except Exception:" in code
+        assert "except AnalysisException:" in code
         assert "_hwm = None" in code
         assert 'format("jdbc")' in code
         assert "modified_date >=" in code
