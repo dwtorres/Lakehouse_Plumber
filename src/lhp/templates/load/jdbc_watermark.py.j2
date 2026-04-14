@@ -1,0 +1,46 @@
+@dp.temporary_view()
+def {{ target_view }}():
+    """{{ description }}"""
+    # Self-watermark: read HWM from Bronze target
+    _target_table = "{{ bronze_target }}"
+    try:
+        _hwm_result = spark.sql(
+            f"SELECT MAX({{ watermark_column }}) AS _hwm FROM {_target_table}"
+        ).first()
+        _hwm = _hwm_result["_hwm"] if _hwm_result else None
+    except Exception:
+        _hwm = None  # First run — table doesn't exist yet
+
+    # Filtered JDBC read
+{% if watermark_type == "timestamp" %}
+    if _hwm is not None:
+        _query = """(SELECT * FROM {{ jdbc_table }} WHERE {{ watermark_column }} {{ watermark_operator }} '{}') AS t""".format(_hwm)
+    else:
+        _query = """(SELECT * FROM {{ jdbc_table }}) AS t"""
+{% elif watermark_type == "numeric" %}
+    if _hwm is not None:
+        _query = """(SELECT * FROM {{ jdbc_table }} WHERE {{ watermark_column }} {{ watermark_operator }} {}) AS t""".format(_hwm)
+    else:
+        _query = """(SELECT * FROM {{ jdbc_table }}) AS t"""
+{% endif %}
+    df = spark.read \
+        .format("jdbc") \
+        .option("url", "{{ jdbc_url }}") \
+        .option("user", "{{ jdbc_user }}") \
+        .option("password", "{{ jdbc_password }}") \
+        .option("driver", "{{ jdbc_driver }}") \
+        .option("dbtable", _query) \
+{% if num_partitions and num_partitions != "1" %}        .option("numPartitions", {{ num_partitions }}) \
+        .option("partitionColumn", "{{ partition_column }}") \
+        .option("lowerBound", "{{ lower_bound }}") \
+        .option("upperBound", "{{ upper_bound }}") \
+{% endif %}        .load()
+    {% if add_operational_metadata %}
+
+    # Add operational metadata columns
+    {% for col_name, expression in metadata_columns.items()|sort %}
+    df = df.withColumn('{{ col_name }}', {{ expression }})
+    {% endfor %}
+    {% endif %}
+
+    return df

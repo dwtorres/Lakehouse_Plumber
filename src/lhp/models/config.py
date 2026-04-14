@@ -2,9 +2,13 @@ import warnings
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
 
+from .pipeline_config import WatermarkConfig
+
 # Suppress Pydantic warning about 'schema' field shadowing BaseModel.schema() class method.
 # This is deliberate: 'schema' is a UC namespace field, not related to Pydantic's schema().
-warnings.filterwarnings("ignore", message=r".*Field name \"schema\".*shadows an attribute.*")
+warnings.filterwarnings(
+    "ignore", message=r".*Field name \"schema\".*shadows an attribute.*"
+)
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
@@ -46,6 +50,7 @@ class LoadSourceType(str, Enum):
     JDBC = "jdbc"
     CUSTOM_DATASOURCE = "custom_datasource"
     KAFKA = "kafka"
+    JDBC_WATERMARK = "jdbc_watermark"
 
 
 class TransformType(str, Enum):
@@ -176,7 +181,9 @@ class WriteTarget(BaseModel):
 
     # Streaming table and materialized view fields
     catalog: Optional[str] = None
-    schema: Optional[str] = None  # UC namespace schema (not DDL — use table_schema for DDL)
+    schema: Optional[str] = (
+        None  # UC namespace schema (not DDL — use table_schema for DDL)
+    )
     database: Optional[str] = None  # REMOVE_AT_V1.0.0: deprecated, use catalog + schema
     table: Optional[str] = None
     create_table: bool = (
@@ -232,6 +239,8 @@ class Action(BaseModel):
         None,
         description="Read mode: 'batch' or 'stream'. Controls spark.read vs spark.readStream",
     )
+    # Watermark configuration for incremental loads
+    watermark: Optional[WatermarkConfig] = None
     # Write-specific target configuration
     write_target: Optional[Union[WriteTarget, Dict[str, Any]]] = None
     # Action-specific configurations

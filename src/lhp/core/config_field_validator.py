@@ -45,6 +45,19 @@ class ConfigFieldValidator:
             },
             "sql": {"type", "sql", "sql_path"},
             "jdbc": {"type", "url", "user", "password", "driver", "query", "table"},
+            "jdbc_watermark": {
+                "type",
+                "url",
+                "user",
+                "password",
+                "driver",
+                "table",
+                "schema_name",
+                "num_partitions",
+                "partition_column",
+                "lower_bound",
+                "upper_bound",
+            },
             "python": {"type", "module_path", "function_name", "parameters"},
             "kafka": {
                 "type",
@@ -172,6 +185,8 @@ class ConfigFieldValidator:
             "lookup_columns",
             "lookup_result_columns",
             "expectations",
+            # Watermark configuration for incremental loads
+            "watermark",
         }
 
     def validate_load_source(

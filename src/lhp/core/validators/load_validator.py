@@ -84,6 +84,8 @@ class LoadActionValidator(BaseActionValidator):
                 errors.extend(self._validate_python_source(action, prefix))
             elif load_type == LoadSourceType.KAFKA:
                 errors.extend(self._validate_kafka_source(action, prefix))
+            elif load_type == LoadSourceType.JDBC_WATERMARK:
+                errors.extend(self._validate_jdbc_watermark_source(action, prefix))
 
         except ValueError as e:
             logger.debug(f"Unrecognized load source type for '{action.name}': {e}")
@@ -157,5 +159,25 @@ class LoadActionValidator(BaseActionValidator):
             errors.append(
                 f"{prefix}: Kafka source can only have ONE of: 'subscribe', 'subscribePattern', or 'assign'"
             )
+
+        return errors
+
+    def _validate_jdbc_watermark_source(self, action: Action, prefix: str) -> List[str]:
+        """Validate JDBC watermark source configuration."""
+        errors = []
+
+        # Watermark config is required for jdbc_watermark source type
+        if not action.watermark:
+            errors.append(
+                f"{prefix}: JDBC watermark source requires a 'watermark' configuration"
+            )
+        else:
+            if not action.watermark.column:
+                errors.append(
+                    f"{prefix}: watermark.column is required for jdbc_watermark source"
+                )
+
+        # Reuse standard JDBC field validation
+        errors.extend(self._validate_jdbc_source(action, prefix))
 
         return errors
