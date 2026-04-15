@@ -63,6 +63,16 @@ class JDBCWatermarkLoadGenerator(BaseActionGenerator):
             action, context
         )
 
+        # JDBC watermark is always batch
+        readMode = action.readMode or "batch"
+        if readMode != "batch":
+            raise ErrorFormatter.invalid_read_mode(
+                action_name=action.name,
+                action_type="jdbc_watermark",
+                provided=readMode,
+                valid_modes=["batch"],
+            )
+
         watermark = action.watermark
         watermark_column = watermark.column if watermark else None
         watermark_type = watermark.type.value if watermark else None

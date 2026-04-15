@@ -505,7 +505,7 @@ environment:
     def test_streaming_table_once_false_with_batch_readmode(self):
         """Test that readMode: batch works with once=False."""
         generator = StreamingTableWriteGenerator()
-        
+
         action = Action(
             name="write_customers",
             type=ActionType.WRITE,
@@ -520,14 +520,45 @@ environment:
                 "create_table": True
             }
         )
-        
+
         code = generator.generate(action, {"flowgroup": FlowGroup(
             pipeline="test", flowgroup="test", actions=[]
         )})
-        
+
         # Should use spark.read (explicit readMode: batch)
         assert "spark.read.table" in code
         assert "spark.readStream" not in code
+
+    def test_jdbc_watermark_load_plus_streaming_table_write_generates_batch_read(self):
+        """Test that streaming_table write uses spark.read.table when readMode: batch is set.
+
+        This is the regression test for the bug where readMode: batch on a write action
+        was ignored and spark.readStream.table was generated instead. It mirrors the
+        JDBC watermark incremental load pattern, where the downstream write action must
+        use batch semantics to consume the watermark-gated view.
+        """
+        generator = StreamingTableWriteGenerator()
+
+        action = Action(
+            name="write_product_raw",
+            type=ActionType.WRITE,
+            source="v_product_raw",
+            readMode="batch",
+            write_target={
+                "type": "streaming_table",
+                "catalog": "test_cat",
+                "schema": "bronze",
+                "table": "product_raw",
+                "create_table": True
+            }
+        )
+
+        code = generator.generate(action, {"flowgroup": FlowGroup(
+            pipeline="test_pipeline", flowgroup="test_flowgroup", actions=[]
+        )})
+
+        assert "spark.read.table" in code
+        assert "spark.readStream.table" not in code
 
 
 if __name__ == "__main__":

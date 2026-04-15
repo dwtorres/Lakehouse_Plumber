@@ -5,7 +5,9 @@ import pytest
 from lhp.core.action_registry import ActionRegistry
 from lhp.core.config_field_validator import ConfigFieldValidator
 from lhp.core.validators.load_validator import LoadActionValidator
+from lhp.generators.load.jdbc_watermark import JDBCWatermarkLoadGenerator
 from lhp.models.config import Action
+from lhp.utils.error_formatter import LHPValidationError
 
 
 @pytest.mark.unit
@@ -188,6 +190,56 @@ class TestJDBCWatermarkValidation:
         action = self._make_valid_watermark_action(source=source_with_query_only)
         errors = self.validator.validate(action, "test")
         assert len(errors) > 0, "Expected errors for query-only jdbc_watermark"
+
+
+@pytest.mark.unit
+class TestJDBCWatermarkReadModeEnforcement:
+    """Test readMode enforcement in the JDBC watermark generator."""
+
+    def _make_watermark_action(self, readMode=None):
+        """Build a valid jdbc_watermark Action with optional readMode."""
+        return Action(
+            name="load_test_jdbc",
+            type="load",
+            readMode=readMode,
+            source={
+                "type": "jdbc_watermark",
+                "url": "jdbc:postgresql://host:5432/db",
+                "user": "test_user",
+                "password": "test_pass",
+                "driver": "org.postgresql.Driver",
+                "table": '"schema"."table"',
+            },
+            target="v_test_raw",
+            watermark={"column": "modified_date", "type": "timestamp"},
+        )
+
+    def test_jdbc_watermark_rejects_stream_readmode(self):
+        """readMode: stream on jdbc_watermark load should raise LHPValidationError."""
+        action = self._make_watermark_action(readMode="stream")
+        generator = JDBCWatermarkLoadGenerator()
+        with pytest.raises(LHPValidationError, match="Invalid readMode"):
+            generator.generate(action, {})
+
+    def test_jdbc_watermark_accepts_batch_readmode(self):
+        """readMode: batch on jdbc_watermark load should not raise a readMode error."""
+        action = self._make_watermark_action(readMode="batch")
+        generator = JDBCWatermarkLoadGenerator()
+        try:
+            generator.generate(action, {})
+        except LHPValidationError as e:
+            if "readMode" in str(e) or "Invalid readMode" in str(e):
+                pytest.fail(f"Unexpected readMode error: {e}")
+
+    def test_jdbc_watermark_defaults_batch_readmode(self):
+        """readMode: None on jdbc_watermark load should default to batch without error."""
+        action = self._make_watermark_action(readMode=None)
+        generator = JDBCWatermarkLoadGenerator()
+        try:
+            generator.generate(action, {})
+        except LHPValidationError as e:
+            if "readMode" in str(e) or "Invalid readMode" in str(e):
+                pytest.fail(f"Unexpected readMode error: {e}")
 
 
 if __name__ == "__main__":

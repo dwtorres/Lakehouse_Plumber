@@ -1394,5 +1394,127 @@ class TestConfigValidator:
             assert len(errors) == 0, f"Single item list should pass: {errors}"
 
 
+@pytest.mark.unit
+class TestReadModeCompatibilityValidation:
+    """Test cross-action readMode compatibility warnings."""
+
+    def setup_method(self):
+        self.validator = ConfigValidator()
+
+    def _make_flowgroup(self, actions):
+        """Build a FlowGroup with the given actions."""
+        return FlowGroup(
+            pipeline="test_pipeline",
+            flowgroup="test_flowgroup",
+            actions=actions,
+        )
+
+    def test_warns_streaming_write_from_batch_jdbc_view(self, caplog):
+        """Should warn when streaming_table write reads from JDBC batch view without readMode: batch."""
+        actions = [
+            Action(
+                name="load_test",
+                type="load",
+                source={
+                    "type": "jdbc_watermark",
+                    "url": "jdbc:postgresql://host:5432/db",
+                    "user": "u",
+                    "password": "p",
+                    "driver": "org.postgresql.Driver",
+                    "table": '"s"."t"',
+                },
+                target="v_test_raw",
+                watermark={"column": "modified_date", "type": "timestamp"},
+            ),
+            Action(
+                name="write_test",
+                type="write",
+                source="v_test_raw",
+                write_target={
+                    "type": "streaming_table",
+                    "catalog": "main",
+                    "schema": "bronze",
+                    "table": "test",
+                },
+            ),
+        ]
+        fg = self._make_flowgroup(actions)
+        import logging
+        with caplog.at_level(logging.WARNING, logger="lhp.core.validator"):
+            self.validator.validate_flowgroup(fg)
+        assert any("readMode: batch" in msg for msg in caplog.messages), \
+            f"Expected readMode warning but got: {caplog.messages}"
+
+    def test_no_warning_when_batch_readmode_set(self, caplog):
+        """Should NOT warn when write action has readMode: batch."""
+        actions = [
+            Action(
+                name="load_test",
+                type="load",
+                source={
+                    "type": "jdbc_watermark",
+                    "url": "jdbc:postgresql://host:5432/db",
+                    "user": "u",
+                    "password": "p",
+                    "driver": "org.postgresql.Driver",
+                    "table": '"s"."t"',
+                },
+                target="v_test_raw",
+                watermark={"column": "modified_date", "type": "timestamp"},
+            ),
+            Action(
+                name="write_test",
+                type="write",
+                readMode="batch",
+                source="v_test_raw",
+                write_target={
+                    "type": "streaming_table",
+                    "catalog": "main",
+                    "schema": "bronze",
+                    "table": "test",
+                },
+            ),
+        ]
+        fg = self._make_flowgroup(actions)
+        import logging
+        with caplog.at_level(logging.WARNING, logger="lhp.core.validator"):
+            self.validator.validate_flowgroup(fg)
+        readmode_warnings = [m for m in caplog.messages if "readMode: batch" in m]
+        assert len(readmode_warnings) == 0, \
+            f"Unexpected readMode warning: {readmode_warnings}"
+
+    def test_no_warning_for_streaming_sources(self, caplog):
+        """Should NOT warn for CloudFiles sources (streaming, not batch)."""
+        actions = [
+            Action(
+                name="load_test",
+                type="load",
+                source={
+                    "type": "cloudfiles",
+                    "path": "/mnt/data",
+                    "format": "json",
+                },
+                target="v_test_raw",
+            ),
+            Action(
+                name="write_test",
+                type="write",
+                source="v_test_raw",
+                write_target={
+                    "type": "streaming_table",
+                    "catalog": "main",
+                    "schema": "bronze",
+                    "table": "test",
+                },
+            ),
+        ]
+        fg = self._make_flowgroup(actions)
+        import logging
+        with caplog.at_level(logging.WARNING, logger="lhp.core.validator"):
+            self.validator.validate_flowgroup(fg)
+        readmode_warnings = [m for m in caplog.messages if "batch-only" in m]
+        assert len(readmode_warnings) == 0, \
+            f"Unexpected batch-only warning for CloudFiles: {readmode_warnings}"
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"]) 

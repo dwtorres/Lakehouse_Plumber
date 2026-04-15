@@ -6,7 +6,7 @@ import logging
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
-from ..models.config import Action, ActionType, FlowGroup, WriteTargetType
+from ..models.config import Action, ActionType, BATCH_ONLY_SOURCE_TYPES, FlowGroup, LoadSourceType, WriteTargetType
 from ..utils.error_formatter import LHPError
 from .action_registry import ActionRegistry
 from .config_field_validator import ConfigFieldValidator
@@ -112,6 +112,9 @@ class ConfigValidator:
                 logger.debug(f"Dependency validation error: {e}")
                 errors.append(str(e))
 
+        # Cross-action readMode compatibility check
+        self._validate_readmode_compatibility(flowgroup.actions)
+
         # Validate template usage
         if flowgroup.use_template and not flowgroup.template_parameters:
             self.logger.warning(
@@ -170,6 +173,55 @@ class ConfigValidator:
             errors.append(f"{prefix}: Unknown action type '{action.type}'")
 
         return errors
+
+    def _validate_readmode_compatibility(self, actions: list) -> None:
+        """Warn when a streaming_table write reads from a batch-only source without readMode: batch."""
+        # Build set of view names produced by batch-only load actions
+        batch_only_views: set = set()
+        for action in actions:
+            if action.type != ActionType.LOAD:
+                continue
+            source_type_str = (
+                action.source.get("type")
+                if isinstance(action.source, dict)
+                else None
+            )
+            if not source_type_str:
+                continue
+            try:
+                if LoadSourceType(source_type_str) in BATCH_ONLY_SOURCE_TYPES:
+                    if action.target:
+                        batch_only_views.add(action.target)
+            except ValueError:
+                continue
+
+        if not batch_only_views:
+            return
+
+        # Check write actions for readMode compatibility
+        for action in actions:
+            if action.type != ActionType.WRITE:
+                continue
+            if not action.write_target or action.write_target.get("type") != "streaming_table":
+                continue
+            if action.readMode == "batch":
+                continue
+
+            # Check if source references a batch-only view
+            sources = (
+                [action.source]
+                if isinstance(action.source, str)
+                else action.source
+                if isinstance(action.source, list)
+                else []
+            )
+            for source in sources:
+                if source in batch_only_views:
+                    logger.warning(
+                        f"Action '{action.name}': reads from '{source}' which is "
+                        f"produced by a batch-only source. Set readMode: batch on "
+                        f"this write action to avoid spark.readStream errors at runtime."
+                    )
 
     def validate_action_references(self, actions: List[Action]) -> List[str]:
         """Validate that all action references are valid."""

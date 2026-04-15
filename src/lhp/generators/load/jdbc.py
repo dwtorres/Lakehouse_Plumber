@@ -38,6 +38,16 @@ class JDBCLoadGenerator(BaseActionGenerator):
                 source_config
             )
 
+        # JDBC is always batch
+        readMode = action.readMode or "batch"
+        if readMode != "batch":
+            raise ErrorFormatter.invalid_read_mode(
+                action_name=action.name,
+                action_type="jdbc",
+                provided=readMode,
+                valid_modes=["batch"],
+            )
+
         # Handle operational metadata
         add_operational_metadata, metadata_columns = self._get_operational_metadata(
             action, context

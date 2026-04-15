@@ -53,6 +53,10 @@ class LoadSourceType(str, Enum):
     JDBC_WATERMARK = "jdbc_watermark"
 
 
+# NOTE: update when adding batch-only source types
+BATCH_ONLY_SOURCE_TYPES = {LoadSourceType.JDBC, LoadSourceType.JDBC_WATERMARK}
+
+
 class TransformType(str, Enum):
     SQL = "sql"
     PYTHON = "python"
