@@ -201,6 +201,8 @@ class ConfigFieldValidator:
             "expectations",
             # Watermark configuration for incremental loads
             "watermark",
+            # JDBC watermark v2 landing zone path
+            "landing_path",
         }
 
     def validate_load_source(
