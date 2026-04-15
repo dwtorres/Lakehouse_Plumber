@@ -11,6 +11,7 @@ from ..generators.load import (
     CustomDataSourceLoadGenerator,
     DeltaLoadGenerator,
     JDBCLoadGenerator,
+    JDBCWatermarkJobGenerator,
     JDBCWatermarkLoadGenerator,
     KafkaLoadGenerator,
     PythonLoadGenerator,
@@ -73,6 +74,7 @@ class ActionRegistry:
             LoadSourceType.CUSTOM_DATASOURCE: CustomDataSourceLoadGenerator,
             LoadSourceType.KAFKA: KafkaLoadGenerator,
             LoadSourceType.JDBC_WATERMARK: JDBCWatermarkLoadGenerator,
+            LoadSourceType.JDBC_WATERMARK_V2: JDBCWatermarkJobGenerator,
         }
 
         # Transform generators

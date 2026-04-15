@@ -87,6 +87,10 @@ class LoadActionValidator(BaseActionValidator):
                 errors.extend(self._validate_kafka_source(action, prefix))
             elif load_type == LoadSourceType.JDBC_WATERMARK:
                 errors.extend(self._validate_jdbc_watermark_source(action, prefix))
+            elif load_type == LoadSourceType.JDBC_WATERMARK_V2:
+                errors.extend(
+                    self._validate_jdbc_watermark_v2_source(action, prefix)
+                )
 
         except ValueError as e:
             logger.debug(f"Unrecognized load source type for '{action.name}': {e}")
@@ -210,5 +214,77 @@ class LoadActionValidator(BaseActionValidator):
 
         # Reuse standard JDBC field validation for url, user, password, driver
         errors.extend(self._validate_jdbc_source(action, prefix))
+
+        return errors
+
+    def _validate_jdbc_watermark_v2_source(
+        self, action: Action, prefix: str
+    ) -> List[str]:
+        """Validate JDBC watermark v2 source configuration (LHP-VAL-04x)."""
+        errors = []
+
+        # LHP-VAL-040: landing_path is required
+        if not action.landing_path:
+            errors.append(
+                f"{prefix}: landing_path is required for jdbc_watermark_v2 source"
+            )
+        elif not action.landing_path.startswith("/Volumes/"):
+            logger.warning(
+                f"Action '{action.name}': landing_path '{action.landing_path}' "
+                "does not start with /Volumes/. Recommended to use Unity Catalog "
+                "Volumes for landing zone paths."
+            )
+
+        # LHP-VAL-041: watermark config required
+        if not action.watermark:
+            errors.append(
+                f"{prefix}: watermark configuration is required for "
+                "jdbc_watermark_v2 source"
+            )
+        else:
+            # LHP-VAL-042: watermark.column required
+            if not action.watermark.column:
+                errors.append(
+                    f"{prefix}: watermark.column is required for "
+                    "jdbc_watermark_v2 source"
+                )
+            elif not self._SQL_IDENTIFIER_RE.match(action.watermark.column):
+                errors.append(
+                    f"{prefix}: watermark.column '{action.watermark.column}' "
+                    "must be a valid SQL identifier "
+                    "(letters, digits, underscores only)"
+                )
+
+            # LHP-VAL-044: watermark.source_system_id required
+            if not getattr(action.watermark, "source_system_id", None):
+                errors.append(
+                    f"{prefix}: watermark.source_system_id is required for "
+                    "jdbc_watermark_v2 source"
+                )
+
+        # LHP-VAL-045: source.schema_name required
+        if not action.source.get("schema_name"):
+            errors.append(
+                f"{prefix}: source.schema_name is required for "
+                "jdbc_watermark_v2 source"
+            )
+
+        # LHP-VAL-046: source.table_name required
+        if not action.source.get("table_name"):
+            errors.append(
+                f"{prefix}: source.table_name is required for "
+                "jdbc_watermark_v2 source"
+            )
+
+        # LHP-VAL-047: core JDBC fields (url, user, password, driver, table)
+        errors.extend(self._validate_jdbc_source(action, prefix))
+
+        # Warning: num_partitions is not yet supported in v2
+        if action.source.get("num_partitions"):
+            logger.warning(
+                f"Action '{action.name}': num_partitions is set but "
+                "partitioned JDBC reads are not yet supported in v2. "
+                "The extraction Job will use a single-threaded read."
+            )
 
         return errors
