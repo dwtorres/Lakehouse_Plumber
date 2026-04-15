@@ -1,0 +1,21 @@
+resources:
+  jobs:
+    {{ pipeline_name }}_workflow:
+      name: {{ pipeline_name }}_workflow
+      tasks:
+{% for task in extraction_tasks %}
+        - task_key: {{ task.task_name }}
+          notebook_task:
+            notebook_path: {{ task.notebook_path }}
+          libraries:
+            - whl: {{ lhp_whl_path }}
+          # TODO: Add JDBC driver JAR to libraries, e.g.:
+          # - jar: dbfs:/path/to/postgresql-42.7.3.jar
+{% endfor %}
+        - task_key: {{ dlt_task_name }}
+          pipeline_task:
+            pipeline_id: {{ dlt_pipeline_ref }}
+          depends_on:
+{% for task_name in extraction_task_names %}
+            - task_key: {{ task_name }}
+{% endfor %}
