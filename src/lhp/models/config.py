@@ -51,10 +51,15 @@ class LoadSourceType(str, Enum):
     CUSTOM_DATASOURCE = "custom_datasource"
     KAFKA = "kafka"
     JDBC_WATERMARK = "jdbc_watermark"
+    JDBC_WATERMARK_V2 = "jdbc_watermark_v2"
 
 
 # NOTE: update when adding batch-only source types
-BATCH_ONLY_SOURCE_TYPES = {LoadSourceType.JDBC, LoadSourceType.JDBC_WATERMARK}
+BATCH_ONLY_SOURCE_TYPES = {
+    LoadSourceType.JDBC,
+    LoadSourceType.JDBC_WATERMARK,
+    LoadSourceType.JDBC_WATERMARK_V2,
+}
 
 
 class TransformType(str, Enum):
@@ -243,6 +248,8 @@ class Action(BaseModel):
         None,
         description="Read mode: 'batch' or 'stream'. Controls spark.read vs spark.readStream",
     )
+    # Autoloader landing zone path for v2 JDBC watermark ingestion
+    landing_path: Optional[str] = None
     # Watermark configuration for incremental loads
     watermark: Optional[WatermarkConfig] = None
     # Write-specific target configuration
