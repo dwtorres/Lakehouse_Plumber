@@ -954,6 +954,12 @@ class ActionOrchestrator:
                         )
                     raise
 
+        # 5b. Generate workflow resources for jdbc_watermark_v2 flowgroups
+        if pipeline_output_dir:
+            self._generate_workflow_resources(
+                processed_flowgroups, smart_writer
+            )
+
         # 6. Finalize
         if state_manager:
             with perf_timer("state_save"):
@@ -1500,6 +1506,44 @@ class ActionOrchestrator:
             Dictionary mapping target table names to lists of actions
         """
         return self.generator.group_write_actions_by_target(write_actions)
+
+    def _generate_workflow_resources(
+        self,
+        processed_flowgroups: List[FlowGroup],
+        smart_writer: "SmartFileWriter",
+    ) -> None:
+        """Generate DAB Workflow YAML for flowgroups with jdbc_watermark_v2 actions.
+
+        Args:
+            processed_flowgroups: List of processed FlowGroup objects.
+            smart_writer: File writer instance.
+        """
+        from ..generators.bundle.workflow_resource import WorkflowResourceGenerator
+        from ..models.config import LoadSourceType
+
+        workflow_gen = WorkflowResourceGenerator()
+
+        for flowgroup in processed_flowgroups:
+            has_v2 = any(
+                isinstance(a.source, dict)
+                and a.source.get("type") == LoadSourceType.JDBC_WATERMARK_V2.value
+                for a in flowgroup.actions
+            )
+            if not has_v2:
+                continue
+
+            try:
+                workflow_yaml = workflow_gen.generate(flowgroup, {})
+                resources_dir = self.project_root / "resources" / "lhp"
+                resources_dir.mkdir(parents=True, exist_ok=True)
+                workflow_file = resources_dir / f"{flowgroup.pipeline}_workflow.yml"
+                smart_writer.write_if_changed(workflow_file, workflow_yaml)
+                self.logger.info(f"Generated workflow resource: {workflow_file}")
+            except Exception as e:
+                self.logger.warning(
+                    f"Failed to generate workflow resource for "
+                    f"'{flowgroup.pipeline}': {e}"
+                )
 
     def _sync_bundle_resources(
         self, output_dir: Optional[Path], environment: str
