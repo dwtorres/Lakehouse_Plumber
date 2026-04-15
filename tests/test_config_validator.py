@@ -1410,7 +1410,7 @@ class TestReadModeCompatibilityValidation:
         )
 
     def test_warns_streaming_write_from_batch_jdbc_view(self, caplog):
-        """Should warn when streaming_table write reads from JDBC batch view without readMode: batch."""
+        """Should warn when streaming_table write reads from JDBC batch view."""
         actions = [
             Action(
                 name="load_test",
@@ -1442,11 +1442,11 @@ class TestReadModeCompatibilityValidation:
         import logging
         with caplog.at_level(logging.WARNING, logger="lhp.core.validator"):
             self.validator.validate_flowgroup(fg)
-        assert any("readMode: batch" in msg for msg in caplog.messages), \
-            f"Expected readMode warning but got: {caplog.messages}"
+        assert any("incompatibleViewCheck" in msg for msg in caplog.messages), \
+            f"Expected incompatibleViewCheck warning but got: {caplog.messages}"
 
-    def test_no_warning_when_batch_readmode_set(self, caplog):
-        """Should NOT warn when write action has readMode: batch."""
+    def test_warns_even_with_batch_readmode(self, caplog):
+        """Should still warn even when write action has readMode: batch (informational)."""
         actions = [
             Action(
                 name="load_test",
@@ -1479,9 +1479,8 @@ class TestReadModeCompatibilityValidation:
         import logging
         with caplog.at_level(logging.WARNING, logger="lhp.core.validator"):
             self.validator.validate_flowgroup(fg)
-        readmode_warnings = [m for m in caplog.messages if "readMode: batch" in m]
-        assert len(readmode_warnings) == 0, \
-            f"Unexpected readMode warning: {readmode_warnings}"
+        assert any("incompatibleViewCheck" in msg for msg in caplog.messages), \
+            f"Expected incompatibleViewCheck warning but got: {caplog.messages}"
 
     def test_no_warning_for_streaming_sources(self, caplog):
         """Should NOT warn for CloudFiles sources (streaming, not batch)."""

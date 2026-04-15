@@ -175,7 +175,7 @@ class ConfigValidator:
         return errors
 
     def _validate_readmode_compatibility(self, actions: list) -> None:
-        """Warn when a streaming_table write reads from a batch-only source without readMode: batch."""
+        """Warn when a streaming_table write reads from a batch-only JDBC source."""
         # Build set of view names produced by batch-only load actions
         batch_only_views: set = set()
         for action in actions:
@@ -198,13 +198,11 @@ class ConfigValidator:
         if not batch_only_views:
             return
 
-        # Check write actions for readMode compatibility
+        # Check write actions that consume batch-only views
         for action in actions:
             if action.type != ActionType.WRITE:
                 continue
             if not action.write_target or action.write_target.get("type") != "streaming_table":
-                continue
-            if action.readMode == "batch":
                 continue
 
             # Check if source references a batch-only view
@@ -219,8 +217,10 @@ class ConfigValidator:
                 if source in batch_only_views:
                     logger.warning(
                         f"Action '{action.name}': reads from '{source}' which is "
-                        f"produced by a batch-only source. Set readMode: batch on "
-                        f"this write action to avoid spark.readStream errors at runtime."
+                        f"produced by a batch-only JDBC source. Ensure the pipeline "
+                        f"configuration includes "
+                        f"'pipelines.incompatibleViewCheck.enabled: false' "
+                        f"to allow DLT to consume batch views in append flows."
                     )
 
     def validate_action_references(self, actions: List[Action]) -> List[str]:
