@@ -1596,6 +1596,12 @@ class BundleManager:
         if file_name.endswith(".pipeline.yml"):
             return file_name[:-13]  # Remove ".pipeline.yml"
 
+        # Workflow resource files ({pipeline}_workflow.yml) are managed by
+        # the orchestrator's post-generation hook, not the bundle sync.
+        # Extract the base pipeline name so orphan cleanup recognizes them.
+        elif file_name.endswith("_workflow.yml"):
+            return file_name[:-13]  # Remove "_workflow.yml" → base pipeline name
+
         # Handle .yml format
         elif file_name.endswith(".yml"):
             return file_name[:-4]  # Remove ".yml"

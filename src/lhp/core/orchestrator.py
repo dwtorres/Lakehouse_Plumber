@@ -1518,31 +1518,48 @@ class ActionOrchestrator:
             processed_flowgroups: List of processed FlowGroup objects.
             smart_writer: File writer instance.
         """
+        from collections import defaultdict
+
         from ..generators.bundle.workflow_resource import WorkflowResourceGenerator
+        from ..models.config import FlowGroup as FG
         from ..models.config import LoadSourceType
 
         workflow_gen = WorkflowResourceGenerator()
 
-        for flowgroup in processed_flowgroups:
-            has_v2 = any(
-                isinstance(a.source, dict)
-                and a.source.get("type") == LoadSourceType.JDBC_WATERMARK_V2.value
-                for a in flowgroup.actions
-            )
-            if not has_v2:
-                continue
+        # Group all v2 actions by pipeline name across flowgroups
+        pipeline_v2_actions: dict = defaultdict(list)
+        pipeline_name_map: dict = {}  # pipeline_name → first flowgroup (for metadata)
 
+        for flowgroup in processed_flowgroups:
+            for action in flowgroup.actions:
+                if (
+                    isinstance(action.source, dict)
+                    and action.source.get("type")
+                    == LoadSourceType.JDBC_WATERMARK_V2.value
+                ):
+                    pipeline_v2_actions[flowgroup.pipeline].append(action)
+                    if flowgroup.pipeline not in pipeline_name_map:
+                        pipeline_name_map[flowgroup.pipeline] = flowgroup
+
+        for pipeline_name, v2_actions in pipeline_v2_actions.items():
             try:
-                workflow_yaml = workflow_gen.generate(flowgroup, {})
+                # Build a synthetic flowgroup with all v2 actions for this pipeline
+                ref_fg = pipeline_name_map[pipeline_name]
+                merged_fg = FG(
+                    pipeline=pipeline_name,
+                    flowgroup=ref_fg.flowgroup,
+                    actions=v2_actions,
+                )
+                workflow_yaml = workflow_gen.generate(merged_fg, {})
                 resources_dir = self.project_root / "resources" / "lhp"
                 resources_dir.mkdir(parents=True, exist_ok=True)
-                workflow_file = resources_dir / f"{flowgroup.pipeline}_workflow.yml"
+                workflow_file = resources_dir / f"{pipeline_name}_workflow.yml"
                 smart_writer.write_if_changed(workflow_file, workflow_yaml)
                 self.logger.info(f"Generated workflow resource: {workflow_file}")
             except Exception as e:
                 self.logger.warning(
                     f"Failed to generate workflow resource for "
-                    f"'{flowgroup.pipeline}': {e}"
+                    f"'{pipeline_name}': {e}"
                 )
 
     def _sync_bundle_resources(
