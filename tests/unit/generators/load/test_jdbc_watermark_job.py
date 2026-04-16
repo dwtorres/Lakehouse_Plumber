@@ -104,6 +104,15 @@ class TestJDBCWatermarkJobGenerator:
         notebook = fg._auxiliary_files[f"extract_{action.name}.py"]
         assert "from lhp.extensions.watermark_manager import WatermarkManager" in notebook
 
+    def test_extraction_notebook_passes_spark_to_watermark_manager(self):
+        """WatermarkManager constructor must receive spark as first arg."""
+        action = _make_v2_action()
+        fg = _make_flowgroup_with_write(action)
+        gen = JDBCWatermarkJobGenerator()
+        gen.generate(action, {"flowgroup": fg})
+        notebook = fg._auxiliary_files[f"extract_{action.name}.py"]
+        assert "WatermarkManager(\n    spark," in notebook or "WatermarkManager(spark," in notebook
+
     def test_extraction_notebook_has_get_latest_watermark(self):
         action = _make_v2_action()
         fg = _make_flowgroup_with_write(action)
@@ -111,6 +120,7 @@ class TestJDBCWatermarkJobGenerator:
         gen.generate(action, {"flowgroup": fg})
         notebook = fg._auxiliary_files[f"extract_{action.name}.py"]
         assert "get_latest_watermark(" in notebook
+        assert '["watermark_value"]' in notebook  # dict access pattern
 
     def test_extraction_notebook_has_insert_new(self):
         action = _make_v2_action()
@@ -119,6 +129,7 @@ class TestJDBCWatermarkJobGenerator:
         gen.generate(action, {"flowgroup": fg})
         notebook = fg._auxiliary_files[f"extract_{action.name}.py"]
         assert "insert_new(" in notebook
+        assert "watermark_column_name=" in notebook  # required kwarg
 
     def test_extraction_notebook_no_dlt_decorators(self):
         action = _make_v2_action()
@@ -137,7 +148,7 @@ class TestJDBCWatermarkJobGenerator:
         gen.generate(action, {"flowgroup": fg})
         notebook = fg._auxiliary_files[f"extract_{action.name}.py"]
         # Template should have a branch that quotes timestamp values
-        assert "'{" in notebook or "'{}" in notebook or "'" in notebook
+        assert "'{" in notebook  # HWM value is single-quoted in the SQL WHERE clause
 
     def test_numeric_watermark_no_quotes(self):
         """Numeric watermark WHERE clause should NOT quote the HWM value."""

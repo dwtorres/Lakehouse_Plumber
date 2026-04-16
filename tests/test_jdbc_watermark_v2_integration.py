@@ -131,6 +131,8 @@ class TestJDBCWatermarkV2Integration:
         assert "WatermarkManager" in content
         assert "get_latest_watermark(" in content
         assert "insert_new(" in content
+        assert '["watermark_value"]' in content  # dict access pattern
+        assert "watermark_column_name=" in content  # required kwarg
 
     def test_extraction_notebook_has_jdbc_read(self, v2_project):
         _, output_dir = self._generate(v2_project)

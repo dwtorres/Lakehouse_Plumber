@@ -8,16 +8,18 @@ from lhp.extensions.watermark_manager import WatermarkManager
 
 # WatermarkManager for HWM tracking
 wm = WatermarkManager(
+    spark,
     catalog="{{ wm_catalog }}",
     schema="{{ wm_schema }}",
 )
 
 # Get latest high-water mark
-hwm_value = wm.get_latest_watermark(
+hwm_result = wm.get_latest_watermark(
     source_system_id="{{ source_system_id }}",
     schema_name="{{ schema_name }}",
     table_name="{{ table_name }}",
 )
+hwm_value = hwm_result["watermark_value"] if hwm_result else None
 
 # Build JDBC query
 jdbc_table = '{{ jdbc_table|replace("'", "\\'") }}'
@@ -74,8 +76,17 @@ if row_count > 0:
 
     # Compute new watermark
     new_hwm = df.agg({"{{ watermark_column }}": "max"}).first()[0]
-    if new_hwm is None:
+    if new_hwm is None and hwm_value is not None:
         new_hwm = hwm_value
+    elif new_hwm is None:
+        print(
+            f"WARNING: No non-NULL values in {{ watermark_column }}. "
+            f"Parquet written ({row_count} rows) but skipping watermark update."
+        )
+        df.unpersist()
+        dbutils.notebook.exit(
+            f"WARNING: {row_count} rows written but no watermark recorded"
+        )
 
     # Record watermark
     pipeline_name = "{{ pipeline_name }}"
@@ -83,13 +94,15 @@ if row_count > 0:
     extraction_type = "full" if hwm_value is None else "incremental"
 
     wm.insert_new(
+        run_id=run_id,
         source_system_id="{{ source_system_id }}",
         schema_name="{{ schema_name }}",
         table_name="{{ table_name }}",
+        watermark_column_name="{{ watermark_column }}",
         watermark_value=str(new_hwm),
-        run_id=run_id,
         row_count=row_count,
         extraction_type=extraction_type,
+        previous_watermark_value=str(hwm_value) if hwm_value else None,
     )
 
     print(
