@@ -117,12 +117,27 @@ class TestWorkflowResourceGenerator:
         result = gen.generate(fg, {})
         assert "${resources.pipelines." in result
 
-    def test_libraries_contains_whl(self):
+    def test_environments_contains_whl_dependency(self):
         action = _make_v2_action()
         fg = _make_flowgroup([action, _make_write_action()])
         gen = WorkflowResourceGenerator()
         result = gen.generate(fg, {})
-        assert "whl" in result
+        parsed = yaml.safe_load(result)
+        job = parsed["resources"]["jobs"]["my_pipeline_workflow"]
+        assert "environments" in job
+        env = job["environments"][0]
+        assert env["environment_key"] == "lhp_env"
+        assert len(env["spec"]["dependencies"]) >= 1
+
+    def test_extraction_tasks_have_environment_key(self):
+        action = _make_v2_action()
+        fg = _make_flowgroup([action, _make_write_action()])
+        gen = WorkflowResourceGenerator()
+        result = gen.generate(fg, {})
+        parsed = yaml.safe_load(result)
+        tasks = parsed["resources"]["jobs"]["my_pipeline_workflow"]["tasks"]
+        notebook_task = tasks[0]
+        assert notebook_task.get("environment_key") == "lhp_env"
 
     def test_two_actions_produces_two_notebook_tasks(self):
         action1 = _make_v2_action(name="load_product", target="v_product_raw")

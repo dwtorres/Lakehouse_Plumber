@@ -2,15 +2,19 @@ resources:
   jobs:
     {{ pipeline_name }}_workflow:
       name: {{ pipeline_name }}_workflow
+      environments:
+        - environment_key: lhp_env
+          spec:
+            dependencies:
+              - {{ lhp_whl_path }}
+              # TODO: Add JDBC driver JAR dependency, e.g.:
+              # - postgresql-42.7.3.jar
       tasks:
 {% for task in extraction_tasks %}
         - task_key: {{ task.task_name }}
+          environment_key: lhp_env
           notebook_task:
             notebook_path: {{ task.notebook_path }}
-          libraries:
-            - whl: {{ lhp_whl_path }}
-          # TODO: Add JDBC driver JAR to libraries, e.g.:
-          # - jar: dbfs:/path/to/postgresql-42.7.3.jar
 {% endfor %}
         - task_key: {{ dlt_task_name }}
           pipeline_task:
