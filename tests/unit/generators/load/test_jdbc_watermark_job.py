@@ -209,6 +209,114 @@ class TestJDBCWatermarkJobGenerator:
         assert 'dbutils.secrets.get(scope="scope", key="jdbc_user")' in notebook
         assert 'dbutils.secrets.get(scope="scope", key="jdbc_pass")' in notebook
 
+    def test_secret_placeholders_resolved_via_substitution_manager(self):
+        """__SECRET_ placeholders (post-substitution) resolved via SecretCodeGenerator."""
+        from unittest.mock import MagicMock
+
+        from lhp.utils.substitution import SecretReference
+
+        action = _make_v2_action(
+            source_overrides={
+                "user": "__SECRET_dev-secrets_jdbc_user__",
+                "password": "__SECRET_dev-secrets_jdbc_pass__",
+            }
+        )
+        fg = _make_flowgroup_with_write(action)
+
+        mock_sub_mgr = MagicMock()
+        mock_sub_mgr.get_secret_references.return_value = {
+            SecretReference("dev-secrets", "jdbc_user"),
+            SecretReference("dev-secrets", "jdbc_pass"),
+        }
+
+        gen = JDBCWatermarkJobGenerator()
+        gen.generate(action, {"flowgroup": fg, "substitution_manager": mock_sub_mgr})
+        notebook = fg._auxiliary_files[f"extract_{action.name}.py"]
+        assert 'dbutils.secrets.get(scope="dev-secrets", key="jdbc_user")' in notebook
+        assert 'dbutils.secrets.get(scope="dev-secrets", key="jdbc_pass")' in notebook
+        assert "__SECRET_" not in notebook
+
+    def test_secret_resolution_noop_when_no_placeholders(self):
+        """Aux file unchanged when secret_refs populated but no placeholders in content."""
+        from unittest.mock import MagicMock
+
+        from lhp.utils.substitution import SecretReference
+
+        action = _make_v2_action()  # no secret placeholders in source
+        fg = _make_flowgroup_with_write(action)
+
+        mock_sub_mgr = MagicMock()
+        mock_sub_mgr.get_secret_references.return_value = {
+            SecretReference("some-scope", "some_key"),
+        }
+
+        gen = JDBCWatermarkJobGenerator()
+        gen.generate(action, {"flowgroup": fg, "substitution_manager": mock_sub_mgr})
+
+        # Also generate without sub_mgr for comparison
+        fg2 = _make_flowgroup_with_write(_make_v2_action())
+        gen2 = JDBCWatermarkJobGenerator()
+        gen2.generate(_make_v2_action(), {"flowgroup": fg2})
+
+        assert fg._auxiliary_files[f"extract_{action.name}.py"] == fg2._auxiliary_files[f"extract_{action.name}.py"]
+
+    def test_secret_resolution_idempotent(self):
+        """Applying secret resolution twice produces same result."""
+        from unittest.mock import MagicMock
+
+        from lhp.utils.secret_code_generator import SecretCodeGenerator
+        from lhp.utils.substitution import SecretReference
+
+        action = _make_v2_action(
+            source_overrides={
+                "user": "__SECRET_dev-secrets_jdbc_user__",
+            }
+        )
+        fg = _make_flowgroup_with_write(action)
+        mock_sub_mgr = MagicMock()
+        refs = {SecretReference("dev-secrets", "jdbc_user")}
+        mock_sub_mgr.get_secret_references.return_value = refs
+
+        gen = JDBCWatermarkJobGenerator()
+        gen.generate(action, {"flowgroup": fg, "substitution_manager": mock_sub_mgr})
+        notebook_first = fg._auxiliary_files[f"extract_{action.name}.py"]
+
+        # Apply SecretCodeGenerator again
+        notebook_second = SecretCodeGenerator().generate_python_code(notebook_first, refs)
+        assert notebook_first == notebook_second
+        assert "__SECRET_" not in notebook_second
+
+    def test_placeholder_format_round_trips(self):
+        """Placeholder format contract: substitution.py and SecretCodeGenerator agree."""
+        from lhp.utils.secret_code_generator import SecretCodeGenerator
+        from lhp.utils.substitution import SecretReference
+
+        scope, key = "dev-secrets", "jdbc_user"
+        ref = SecretReference(scope, key)
+        placeholder = f"__SECRET_{scope}_{key}__"
+        quoted = f'"{placeholder}"'
+
+        resolved = SecretCodeGenerator().generate_python_code(quoted, {ref})
+        assert f"scope=" in resolved and scope in resolved
+        assert f"key=" in resolved and key in resolved
+        assert "dbutils.secrets.get(" in resolved
+        assert "__SECRET_" not in resolved
+
+    def test_substitution_manager_none_is_safe(self):
+        """Generator works when substitution_manager absent from context."""
+        action = _make_v2_action(
+            source_overrides={
+                "user": "__SECRET_dev-secrets_jdbc_user__",
+            }
+        )
+        fg = _make_flowgroup_with_write(action)
+        gen = JDBCWatermarkJobGenerator()
+        # No substitution_manager in context — should not crash
+        gen.generate(action, {"flowgroup": fg})
+        notebook = fg._auxiliary_files[f"extract_{action.name}.py"]
+        # Placeholder survives (no resolution), but no crash
+        assert "__SECRET_dev-secrets_jdbc_user__" in notebook
+
     def test_source_system_id_from_watermark_config(self):
         action = _make_v2_action(source_system_id="my_system")
         fg = _make_flowgroup_with_write(action)

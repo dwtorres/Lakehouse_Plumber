@@ -228,3 +228,87 @@ actions:
         )
         workflow = v2_project / "resources" / "lhp" / "sales_bronze_workflow.yml"
         assert not workflow.exists(), "Non-v2 pipeline should not produce workflow YAML"
+
+    # ------------------------------------------------------------------
+    # Secret resolution in extraction notebooks
+    # ------------------------------------------------------------------
+
+    def test_extraction_notebook_secrets_resolved(self, tmp_path):
+        """Secret refs in extraction notebook resolve to dbutils.secrets.get()."""
+        project = tmp_path / "secret_project"
+        project.mkdir()
+
+        (project / "lhp.yaml").write_text(
+            "name: secret_test\nversion: '1.0'\n"
+        )
+        for d in ("presets", "templates", "substitutions", "generated"):
+            (project / d).mkdir()
+
+        (project / "substitutions" / "dev.yaml").write_text(
+            "dev:\n"
+            "  catalog: bronze_catalog\n"
+            "  schema: bronze\n"
+            "secrets:\n"
+            "  default_scope: dev-secrets\n"
+            "  scopes:\n"
+            "    jdbc: dev-secrets\n"
+        )
+
+        pipeline_dir = project / "pipelines" / "crm_bronze"
+        pipeline_dir.mkdir(parents=True)
+        (pipeline_dir / "product_ingestion.yaml").write_text("""\
+pipeline: crm_bronze
+flowgroup: product_ingestion
+
+actions:
+  - name: load_product_jdbc
+    type: load
+    source:
+      type: jdbc_watermark_v2
+      url: "jdbc:postgresql://host:5432/db"
+      user: "${secret:jdbc/jdbc_user}"
+      password: "${secret:jdbc/jdbc_pass}"
+      driver: "org.postgresql.Driver"
+      table: '"Production"."Product"'
+      schema_name: "Production"
+      table_name: "Product"
+    watermark:
+      column: "ModifiedDate"
+      type: "timestamp"
+      operator: ">="
+      source_system_id: "pg_crm"
+    target: v_product_raw
+    landing_path: "/Volumes/bronze_catalog/bronze/landing/product"
+
+  - name: write_product_bronze
+    type: write
+    source: v_product_raw
+    write_target:
+      type: streaming_table
+      catalog: "bronze_catalog"
+      schema: "bronze"
+      table: "product"
+      table_properties:
+        delta.enableChangeDataFeed: "true"
+""")
+        output_dir = project / "generated"
+        orchestrator = ActionOrchestrator(project)
+        orchestrator.generate_pipeline_by_field(
+            pipeline_field="crm_bronze",
+            env="dev",
+            output_dir=output_dir,
+        )
+
+        notebook = output_dir / "crm_bronze" / "extract_load_product_jdbc.py"
+        assert notebook.exists(), f"Extraction notebook not found at {notebook}"
+        content = notebook.read_text()
+
+        # Positive: secrets resolved
+        assert "dbutils.secrets.get(" in content
+        assert "dev-secrets" in content
+        assert "jdbc_user" in content
+
+        # Negative: no surviving placeholders
+        assert "__SECRET_" not in content, (
+            f"Unresolved secret placeholder found in notebook:\n{content}"
+        )

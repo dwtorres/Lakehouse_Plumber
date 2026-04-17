@@ -105,7 +105,21 @@ class JDBCWatermarkJobGenerator(BaseActionGenerator):
             "load/jdbc_watermark_job.py.j2", template_context
         )
 
-        # Format with Black
+        # Resolve secret placeholders (__SECRET_scope_key__) to dbutils.secrets.get()
+        # NOTE: Any generator producing auxiliary files with secret placeholders
+        # must apply SecretCodeGenerator here — aux files bypass the primary
+        # code path's secret resolution in code_generator.py.
+        sub_mgr = context.get("substitution_manager")
+        if sub_mgr:
+            from ...utils.secret_code_generator import SecretCodeGenerator
+
+            secret_refs = sub_mgr.get_secret_references()
+            if secret_refs:
+                extraction_code = SecretCodeGenerator().generate_python_code(
+                    extraction_code, secret_refs
+                )
+
+        # Format with Black (after secret resolution — resolved calls may be longer)
         try:
             extraction_code = black.format_str(
                 extraction_code, mode=black.Mode(line_length=88)

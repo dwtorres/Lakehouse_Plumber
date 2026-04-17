@@ -14,9 +14,6 @@ class SecretCodeGenerator:
 
     def __init__(self):
         """Initialize the secret code generator."""
-        # Regex to find secret placeholders in the format __SECRET_scope_key__
-        self.secret_placeholder_pattern = re.compile(r"__SECRET_([^_]+)_([^_]+)__")
-
         # More robust regex to find string literals (handles escaped quotes)
         # Matches both single and double quoted strings, including those with escaped quotes
         self.string_pattern = re.compile(r'(["\'])((?:\\.|(?!\1)[^\\])*?)\1')
