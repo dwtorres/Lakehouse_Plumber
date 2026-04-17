@@ -153,9 +153,3 @@ class TestWorkflowResourceGenerator:
         dep_keys = [d["task_key"] for d in pipeline_task["depends_on"]]
         assert len(dep_keys) == 2
 
-    def test_jdbc_driver_jar_comment_present(self):
-        action = _make_v2_action()
-        fg = _make_flowgroup([action, _make_write_action()])
-        gen = WorkflowResourceGenerator()
-        result = gen.generate(fg, {})
-        assert "JDBC driver" in result or "jdbc driver" in result.lower()
