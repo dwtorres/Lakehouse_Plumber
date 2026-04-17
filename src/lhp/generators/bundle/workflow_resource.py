@@ -38,7 +38,7 @@ class WorkflowResourceGenerator(BaseActionGenerator):
                 task_name = f"extract_{action.name}"
                 notebook_path = (
                     f"${{workspace.file_path}}/generated/${{bundle.target}}"
-                    f"/{pipeline_name}/{task_name}.py"
+                    f"/{pipeline_name}/{task_name}"
                 )
                 extraction_tasks.append(
                     {"task_name": task_name, "notebook_path": notebook_path}
