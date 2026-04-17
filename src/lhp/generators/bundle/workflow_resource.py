@@ -37,7 +37,7 @@ class WorkflowResourceGenerator(BaseActionGenerator):
             if source_type == LoadSourceType.JDBC_WATERMARK_V2.value:
                 task_name = f"extract_{action.name}"
                 notebook_path = (
-                    f"generated/${{var.environment}}/{pipeline_name}"
+                    f"generated/${{bundle.target}}/{pipeline_name}"
                     f"/{task_name}.py"
                 )
                 extraction_tasks.append(
