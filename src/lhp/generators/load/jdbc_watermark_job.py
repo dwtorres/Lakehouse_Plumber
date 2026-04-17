@@ -131,7 +131,7 @@ class JDBCWatermarkJobGenerator(BaseActionGenerator):
 
         # Store as auxiliary file on the flowgroup
         if flowgroup:
-            aux_key = f"extract_{action.name}.py"
+            aux_key = f"__lhp_extract_{action.name}.py"
             flowgroup._auxiliary_files[aux_key] = extraction_code
             logger.debug(
                 f"Stored extraction notebook as auxiliary file '{aux_key}'"

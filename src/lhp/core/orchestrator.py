@@ -851,8 +851,20 @@ class ActionOrchestrator:
                         None,
                     )
                     if flowgroup_for_aux and flowgroup_for_aux._auxiliary_files:
+                        # Extraction notebooks go to sibling _extract/ dir
+                        # (outside pipeline glob scope) to prevent DLT loading them
+                        has_extract_aux = any(
+                            k.startswith("__lhp_extract_") and k.endswith(".py")
+                            for k in flowgroup_for_aux._auxiliary_files
+                        )
+                        if has_extract_aux:
+                            extract_dir = pipeline_output_dir.parent / f"{pipeline_output_dir.name}_extract"
+                            extract_dir.mkdir(exist_ok=True)
                         for aux_name, aux_content in flowgroup_for_aux._auxiliary_files.items():
-                            aux_file = pipeline_output_dir / aux_name
+                            if aux_name.startswith("__lhp_extract_") and aux_name.endswith(".py"):
+                                aux_file = extract_dir / aux_name
+                            else:
+                                aux_file = pipeline_output_dir / aux_name
                             smart_writer.write_if_changed(aux_file, aux_content)
                             self.logger.info(f"Generated auxiliary: {aux_file}")
         else:
@@ -935,9 +947,21 @@ class ActionOrchestrator:
                         self.logger.info(f"Generated: {output_file}")
 
                         # Write auxiliary files (e.g. Python load placeholder)
+                        # Extraction notebooks go to sibling _extract/ dir
+                        # (outside pipeline glob scope) to prevent DLT loading them
                         if processed_flowgroup._auxiliary_files:
+                            has_extract_aux = any(
+                                k.startswith("__lhp_extract_") and k.endswith(".py")
+                                for k in processed_flowgroup._auxiliary_files
+                            )
+                            if has_extract_aux:
+                                extract_dir = pipeline_output_dir.parent / f"{pipeline_output_dir.name}_extract"
+                                extract_dir.mkdir(exist_ok=True)
                             for aux_name, aux_content in processed_flowgroup._auxiliary_files.items():
-                                aux_file = pipeline_output_dir / aux_name
+                                if aux_name.startswith("__lhp_extract_") and aux_name.endswith(".py"):
+                                    aux_file = extract_dir / aux_name
+                                else:
+                                    aux_file = pipeline_output_dir / aux_name
                                 smart_writer.write_if_changed(aux_file, aux_content)
                                 self.logger.info(f"Generated auxiliary: {aux_file}")
                     else:

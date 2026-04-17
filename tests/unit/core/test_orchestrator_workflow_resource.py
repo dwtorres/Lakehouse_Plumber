@@ -156,3 +156,43 @@ class TestGenerateWorkflowResources:
         assert "depends_on" in pipeline_task
         dep_keys = [d["task_key"] for d in pipeline_task["depends_on"]]
         assert "extract_load_product_jdbc" in dep_keys
+
+    def test_workflow_notebook_path_uses_extract_sibling_dir(self, tmp_path):
+        """Regression: extraction notebook paths must use sibling _extract/ dir.
+
+        Extraction notebooks are written to <pipeline>_extract/__lhp_extract_<name>.py
+        (outside the DLT pipeline glob scope) to prevent DLT from loading them.
+        The workflow notebook_path must reference this sibling directory, and the
+        task_key must stay clean (no __lhp_ prefix) for readability in the DAB UI.
+        """
+        smart_writer = MagicMock()
+
+        orchestrator = MagicMock(spec=ActionOrchestrator)
+        orchestrator.project_root = tmp_path
+        orchestrator.logger = MagicMock()
+
+        fg = _make_v2_flowgroup()
+        ActionOrchestrator._generate_workflow_resources(
+            orchestrator, [fg], smart_writer
+        )
+
+        written_content = smart_writer.write_if_changed.call_args[0][1]
+        parsed = yaml.safe_load(written_content)
+        tasks = parsed["resources"]["jobs"]["test_pipeline_workflow"]["tasks"]
+
+        # Extraction tasks are all tasks except the final pipeline_task
+        extraction_tasks = [t for t in tasks if "notebook_task" in t]
+        assert extraction_tasks, "Expected at least one notebook_task in workflow"
+
+        for task in extraction_tasks:
+            notebook_path = task["notebook_task"]["notebook_path"]
+            task_key = task["task_key"]
+
+            assert "_extract/__lhp_extract_" in notebook_path, (
+                f"notebook_path must use sibling _extract/ dir with __lhp_extract_ prefix; "
+                f"got: {notebook_path}"
+            )
+            assert not task_key.startswith("__lhp_"), (
+                f"task_key must NOT contain __lhp_ prefix (keeps DAB UI clean); "
+                f"got: {task_key}"
+            )
