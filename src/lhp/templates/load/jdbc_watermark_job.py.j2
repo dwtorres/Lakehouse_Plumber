@@ -28,7 +28,7 @@ if hwm_value is not None:
     hwm_safe = str(hwm_value).replace("'", "")
     query = (
         f"(SELECT * FROM {jdbc_table}"
-        f" WHERE {{ watermark_column }} {{ watermark_operator }} '{hwm_safe}') AS t"
+        f" WHERE \"{{ watermark_column|replace('\"', '\"\"') }}\" {{ watermark_operator }} '{hwm_safe}') AS t"
     )
 else:
     query = f"(SELECT * FROM {jdbc_table}) AS t"
@@ -41,7 +41,7 @@ if hwm_value is not None:
     )
     query = (
         f"(SELECT * FROM {jdbc_table}"
-        f" WHERE {{ watermark_column }} {{ watermark_operator }} {hwm_safe}) AS t"
+        f" WHERE \"{{ watermark_column|replace('\"', '\"\"') }}\" {{ watermark_operator }} {hwm_safe}) AS t"
     )
 else:
     query = f"(SELECT * FROM {jdbc_table}) AS t"

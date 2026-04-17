@@ -57,7 +57,7 @@ class TestJDBCWatermarkIntegration:
         assert "except AnalysisException:" in code
         assert "_hwm = None" in code
         assert 'format("jdbc")' in code
-        assert "modified_date >=" in code
+        assert '"modified_date" >=' in code
 
         # Verify valid Python syntax
         compile(code, "<integration_test>", "exec")

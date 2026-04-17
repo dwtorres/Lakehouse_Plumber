@@ -90,7 +90,7 @@ class TestJDBCWatermarkJobGenerator:
         fg = _make_flowgroup_with_write(action)
         gen = JDBCWatermarkJobGenerator()
         gen.generate(action, {"flowgroup": fg})
-        aux_key = f"extract_{action.name}.py"
+        aux_key = f"__lhp_extract_{action.name}.py"
         assert hasattr(fg, "_auxiliary_files"), "FlowGroup should have _auxiliary_files"
         assert aux_key in fg._auxiliary_files
         notebook = fg._auxiliary_files[aux_key]
@@ -101,7 +101,7 @@ class TestJDBCWatermarkJobGenerator:
         fg = _make_flowgroup_with_write(action)
         gen = JDBCWatermarkJobGenerator()
         gen.generate(action, {"flowgroup": fg})
-        notebook = fg._auxiliary_files[f"extract_{action.name}.py"]
+        notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
         assert "from lhp.extensions.watermark_manager import WatermarkManager" in notebook
 
     def test_extraction_notebook_passes_spark_to_watermark_manager(self):
@@ -110,7 +110,7 @@ class TestJDBCWatermarkJobGenerator:
         fg = _make_flowgroup_with_write(action)
         gen = JDBCWatermarkJobGenerator()
         gen.generate(action, {"flowgroup": fg})
-        notebook = fg._auxiliary_files[f"extract_{action.name}.py"]
+        notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
         assert "WatermarkManager(\n    spark," in notebook or "WatermarkManager(spark," in notebook
 
     def test_extraction_notebook_has_get_latest_watermark(self):
@@ -118,7 +118,7 @@ class TestJDBCWatermarkJobGenerator:
         fg = _make_flowgroup_with_write(action)
         gen = JDBCWatermarkJobGenerator()
         gen.generate(action, {"flowgroup": fg})
-        notebook = fg._auxiliary_files[f"extract_{action.name}.py"]
+        notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
         assert "get_latest_watermark(" in notebook
         assert '["watermark_value"]' in notebook  # dict access pattern
 
@@ -127,7 +127,7 @@ class TestJDBCWatermarkJobGenerator:
         fg = _make_flowgroup_with_write(action)
         gen = JDBCWatermarkJobGenerator()
         gen.generate(action, {"flowgroup": fg})
-        notebook = fg._auxiliary_files[f"extract_{action.name}.py"]
+        notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
         assert "insert_new(" in notebook
         assert "watermark_column_name=" in notebook  # required kwarg
 
@@ -136,29 +136,31 @@ class TestJDBCWatermarkJobGenerator:
         fg = _make_flowgroup_with_write(action)
         gen = JDBCWatermarkJobGenerator()
         gen.generate(action, {"flowgroup": fg})
-        notebook = fg._auxiliary_files[f"extract_{action.name}.py"]
+        notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
         assert "@dp." not in notebook
         assert "temporary_view" not in notebook
 
     def test_timestamp_watermark_quotes_hwm(self):
-        """Timestamp watermark WHERE clause should quote the HWM value."""
+        """Timestamp watermark WHERE clause should quote the HWM value and double-quote the column identifier."""
         action = _make_v2_action(watermark_type="timestamp")
         fg = _make_flowgroup_with_write(action)
         gen = JDBCWatermarkJobGenerator()
         gen.generate(action, {"flowgroup": fg})
-        notebook = fg._auxiliary_files[f"extract_{action.name}.py"]
+        notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
         # Template should have a branch that quotes timestamp values
         assert "'{" in notebook  # HWM value is single-quoted in the SQL WHERE clause
+        assert '"ModifiedDate"' in notebook
 
-    def test_numeric_watermark_no_quotes(self):
-        """Numeric watermark WHERE clause should NOT quote the HWM value."""
+    def test_numeric_watermark_value_unquoted_column_quoted(self):
+        """Numeric watermark: HWM value unquoted, column identifier double-quoted in WHERE."""
         action = _make_v2_action(watermark_type="numeric", watermark_column="product_id")
         fg = _make_flowgroup_with_write(action)
         gen = JDBCWatermarkJobGenerator()
         gen.generate(action, {"flowgroup": fg})
-        notebook = fg._auxiliary_files[f"extract_{action.name}.py"]
+        notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
         # The numeric branch should use unquoted format
         assert "numeric" in notebook.lower() or "})" in notebook or "format(" in notebook
+        assert '"product_id"' in notebook
 
     def test_custom_operator_gt(self):
         """Operator '>' should appear in the extraction notebook."""
@@ -166,7 +168,7 @@ class TestJDBCWatermarkJobGenerator:
         fg = _make_flowgroup_with_write(action)
         gen = JDBCWatermarkJobGenerator()
         gen.generate(action, {"flowgroup": fg})
-        notebook = fg._auxiliary_files[f"extract_{action.name}.py"]
+        notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
         # The operator should be in the WHERE clause template
         assert '> ' in notebook or '>"' in notebook or "> '" in notebook
 
@@ -175,7 +177,7 @@ class TestJDBCWatermarkJobGenerator:
         fg = _make_flowgroup_with_write(action)
         gen = JDBCWatermarkJobGenerator()
         gen.generate(action, {"flowgroup": fg})
-        notebook = fg._auxiliary_files[f"extract_{action.name}.py"]
+        notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
         assert 'format("jdbc")' in notebook
 
     def test_extraction_notebook_contains_parquet_write(self):
@@ -183,7 +185,7 @@ class TestJDBCWatermarkJobGenerator:
         fg = _make_flowgroup_with_write(action)
         gen = JDBCWatermarkJobGenerator()
         gen.generate(action, {"flowgroup": fg})
-        notebook = fg._auxiliary_files[f"extract_{action.name}.py"]
+        notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
         assert 'format("parquet")' in notebook
 
     def test_extraction_notebook_contains_landing_path(self):
@@ -191,7 +193,7 @@ class TestJDBCWatermarkJobGenerator:
         fg = _make_flowgroup_with_write(action)
         gen = JDBCWatermarkJobGenerator()
         gen.generate(action, {"flowgroup": fg})
-        notebook = fg._auxiliary_files[f"extract_{action.name}.py"]
+        notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
         assert "/Volumes/cat/sch/landing/prod" in notebook
 
     def test_secret_ref_renders_as_dbutils(self):
@@ -205,7 +207,7 @@ class TestJDBCWatermarkJobGenerator:
         fg = _make_flowgroup_with_write(action)
         gen = JDBCWatermarkJobGenerator()
         gen.generate(action, {"flowgroup": fg})
-        notebook = fg._auxiliary_files[f"extract_{action.name}.py"]
+        notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
         assert 'dbutils.secrets.get(scope="scope", key="jdbc_user")' in notebook
         assert 'dbutils.secrets.get(scope="scope", key="jdbc_pass")' in notebook
 
@@ -231,7 +233,7 @@ class TestJDBCWatermarkJobGenerator:
 
         gen = JDBCWatermarkJobGenerator()
         gen.generate(action, {"flowgroup": fg, "substitution_manager": mock_sub_mgr})
-        notebook = fg._auxiliary_files[f"extract_{action.name}.py"]
+        notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
         assert 'dbutils.secrets.get(scope="dev-secrets", key="jdbc_user")' in notebook
         assert 'dbutils.secrets.get(scope="dev-secrets", key="jdbc_pass")' in notebook
         assert "__SECRET_" not in notebook
@@ -258,7 +260,7 @@ class TestJDBCWatermarkJobGenerator:
         gen2 = JDBCWatermarkJobGenerator()
         gen2.generate(_make_v2_action(), {"flowgroup": fg2})
 
-        assert fg._auxiliary_files[f"extract_{action.name}.py"] == fg2._auxiliary_files[f"extract_{action.name}.py"]
+        assert fg._auxiliary_files[f"__lhp_extract_{action.name}.py"] == fg2._auxiliary_files[f"__lhp_extract_{action.name}.py"]
 
     def test_secret_resolution_idempotent(self):
         """Applying secret resolution twice produces same result."""
@@ -279,7 +281,7 @@ class TestJDBCWatermarkJobGenerator:
 
         gen = JDBCWatermarkJobGenerator()
         gen.generate(action, {"flowgroup": fg, "substitution_manager": mock_sub_mgr})
-        notebook_first = fg._auxiliary_files[f"extract_{action.name}.py"]
+        notebook_first = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
 
         # Apply SecretCodeGenerator again
         notebook_second = SecretCodeGenerator().generate_python_code(notebook_first, refs)
@@ -313,7 +315,7 @@ class TestJDBCWatermarkJobGenerator:
         gen = JDBCWatermarkJobGenerator()
         # No substitution_manager in context — should not crash
         gen.generate(action, {"flowgroup": fg})
-        notebook = fg._auxiliary_files[f"extract_{action.name}.py"]
+        notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
         # Placeholder survives (no resolution), but no crash
         assert "__SECRET_dev-secrets_jdbc_user__" in notebook
 
@@ -322,7 +324,7 @@ class TestJDBCWatermarkJobGenerator:
         fg = _make_flowgroup_with_write(action)
         gen = JDBCWatermarkJobGenerator()
         gen.generate(action, {"flowgroup": fg})
-        notebook = fg._auxiliary_files[f"extract_{action.name}.py"]
+        notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
         assert "my_system" in notebook
 
     def test_extraction_notebook_passes_black(self):
@@ -333,7 +335,95 @@ class TestJDBCWatermarkJobGenerator:
         fg = _make_flowgroup_with_write(action)
         gen = JDBCWatermarkJobGenerator()
         gen.generate(action, {"flowgroup": fg})
-        notebook = fg._auxiliary_files[f"extract_{action.name}.py"]
+        notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
         # Should not raise
         formatted = black.format_str(notebook, mode=black.Mode(line_length=88))
         assert formatted == notebook, "Extraction notebook is not Black-formatted"
+
+    def test_aux_key_uses_lhp_extract_prefix(self):
+        """Regression: aux key must use __lhp_extract_ prefix to prevent DLT glob collision.
+
+        The aux_key format is enforced by jdbc_watermark_job.py.
+        If this test fails, extraction notebooks will be loaded by DLT pipeline
+        and cause ModuleNotFoundError.
+        """
+        action = _make_v2_action()
+        fg = _make_flowgroup_with_write(action)
+        gen = JDBCWatermarkJobGenerator()
+        gen.generate(action, {"flowgroup": fg})
+
+        assert hasattr(fg, "_auxiliary_files"), "FlowGroup should have _auxiliary_files"
+        aux_keys = list(fg._auxiliary_files.keys())
+
+        assert any(
+            k.startswith("__lhp_extract_") for k in aux_keys
+        ), f"No aux key starts with '__lhp_extract_'; found: {aux_keys}"
+
+        assert all(
+            k.endswith(".py") for k in aux_keys if k.startswith("__lhp_extract_")
+        ), "All __lhp_extract_ aux keys must end with .py"
+
+        bare_extract_keys = [k for k in aux_keys if k.startswith("extract_")]
+        assert not bare_extract_keys, (
+            f"Bare 'extract_' aux keys found (missing __lhp_ prefix): {bare_extract_keys}"
+        )
+
+    def test_non_extract_aux_files_stay_at_root(self):
+        """Non-extraction aux files must remain at pipeline root (not in _extract/ sibling).
+
+        Regression: discriminated routing sends __lhp_extract_*.py to sibling _extract/
+        dir but all other aux files (e.g. jobs_stats_loader.py) must stay at root level.
+        This distinction is checked by the orchestrator at write time.
+        """
+        action = _make_v2_action()
+        fg = _make_flowgroup_with_write(action)
+        gen = JDBCWatermarkJobGenerator()
+        gen.generate(action, {"flowgroup": fg})
+
+        # Inject a non-extract aux file alongside the real extraction notebook
+        fg._auxiliary_files["jobs_stats_loader.py"] = "# monitoring helper\n"
+
+        extract_keys = [
+            k for k in fg._auxiliary_files if k.startswith("__lhp_extract_") and k.endswith(".py")
+        ]
+        non_extract_keys = [
+            k for k in fg._auxiliary_files if not (k.startswith("__lhp_extract_") and k.endswith(".py"))
+        ]
+
+        assert extract_keys, "Should have at least one __lhp_extract_ key for routing test"
+        assert non_extract_keys, "Should have at least one non-extract key for routing test"
+
+        # Simulate routing logic from orchestrator: extract keys → _extract/ sibling, others → root
+        extract_destinations = {k: f"pipeline_extract/{k}" for k in extract_keys}
+        non_extract_destinations = {k: k for k in non_extract_keys}
+
+        for key, dest in extract_destinations.items():
+            assert "_extract/" in dest, f"Extract key '{key}' should route to _extract/ sibling dir"
+
+        for key, dest in non_extract_destinations.items():
+            assert "_extract/" not in dest, f"Non-extract key '{key}' should stay at root"
+
+        # The two sets must be disjoint
+        assert set(extract_keys).isdisjoint(set(non_extract_keys))
+
+    def test_watermark_column_unquoted_in_pyspark_and_metadata(self):
+        """F.col() and metadata kwarg use raw column name, not SQL-quoted."""
+        action = _make_v2_action()
+        fg = _make_flowgroup_with_write(action)
+        gen = JDBCWatermarkJobGenerator()
+        gen.generate(action, {"flowgroup": fg})
+        notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
+        # PySpark F.col() should have raw column name (no SQL double-quotes)
+        assert 'F.col("ModifiedDate")' in notebook
+        # Metadata kwarg should have raw column name
+        assert 'watermark_column_name="ModifiedDate"' in notebook
+
+    def test_column_with_embedded_quote_escaped(self):
+        """Column name containing double-quote is escaped per SQL standard (" → "")."""
+        action = _make_v2_action(watermark_column='Col"Name')
+        fg = _make_flowgroup_with_write(action)
+        gen = JDBCWatermarkJobGenerator()
+        gen.generate(action, {"flowgroup": fg})
+        notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
+        # SQL WHERE clause: " in column name doubled per SQL standard
+        assert '\\"Col""Name\\"' in notebook

@@ -63,7 +63,7 @@ class TestJDBCWatermarkLoadGenerator:
         assert "def v_orders_raw():" in code
         assert "@dp.temporary_view()" in code
         assert "SELECT MAX(modified_date) AS _hwm" in code
-        assert "WHERE modified_date >= '{}'" in code
+        assert 'WHERE "modified_date" >= ' in code
         assert "from pyspark.errors import AnalysisException" in code
         assert "except AnalysisException:" in code
         assert "_hwm = None" in code
@@ -77,8 +77,8 @@ class TestJDBCWatermarkLoadGenerator:
         )
         code = self.generator.generate(action, {})
 
-        assert "WHERE product_id >= {}" in code
-        assert "WHERE product_id >= '{}'" not in code
+        assert 'WHERE "product_id" >= ' in code
+        assert """WHERE "product_id" >= '""" not in code
         assert "_hwm_safe = int(_hwm)" in code
 
     def test_first_run_handling(self):
@@ -126,8 +126,8 @@ class TestJDBCWatermarkLoadGenerator:
         action = _make_watermark_action(watermark_operator=">")
         code = self.generator.generate(action, {})
 
-        assert "WHERE modified_date > " in code
-        assert "WHERE modified_date >= " not in code
+        assert 'WHERE "modified_date" > ' in code
+        assert 'WHERE "modified_date" >= ' not in code
 
     def test_string_source_raises_error(self):
         """A plain string source raises an error."""
