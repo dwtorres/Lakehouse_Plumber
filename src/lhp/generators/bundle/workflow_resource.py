@@ -35,10 +35,14 @@ class WorkflowResourceGenerator(BaseActionGenerator):
                 continue
             source_type = action.source.get("type", "")
             if source_type == LoadSourceType.JDBC_WATERMARK_V2.value:
+                # task_key uses extract_<name> for readability in DAB UI/logs.
+                # notebook_path points to sibling _extract/ dir (outside pipeline
+                # glob scope) using __lhp_extract_ prefix from jdbc_watermark_job.py.
                 task_name = f"extract_{action.name}"
+                aux_filename = f"__lhp_extract_{action.name}"
                 notebook_path = (
                     f"${{workspace.file_path}}/generated/${{bundle.target}}"
-                    f"/{pipeline_name}/{task_name}"
+                    f"/{pipeline_name}_extract/{aux_filename}"
                 )
                 extraction_tasks.append(
                     {"task_name": task_name, "notebook_path": notebook_path}

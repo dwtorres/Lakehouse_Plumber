@@ -271,6 +271,11 @@ class BundleManager:
             # Sort directories to ensure deterministic processing order across platforms
             for item in sorted(output_dir.iterdir()):
                 if item.is_dir():
+                    # Skip _extract sibling dirs (extraction notebook storage,
+                    # not DLT pipelines) — created by jdbc_watermark_v2 generation
+                    if item.name.endswith("_extract"):
+                        self.logger.debug("Skipping extraction dir: %s", item.name)
+                        continue
                     pipeline_dirs.append(item)
                     self.logger.debug("Found pipeline directory: %s", item.name)
 

@@ -933,6 +933,31 @@ dev:
         finally:
             manager.template_renderer.render_template = original_render
 
+    def test_pipeline_glob_uses_recursive_pattern(self):
+        """Regression: glob must be /** (DAB only supports directory-recursive globs).
+
+        Extraction notebooks are placed in a sibling _extract/ directory (outside
+        the pipeline glob scope) so the recursive /** pattern is safe — it only
+        matches DLT pipeline code within the pipeline directory.
+        """
+        pipeline_name = "test_pipeline"
+        context = {
+            "pipeline_name": pipeline_name,
+            "pipeline_config": {
+                "serverless": True,
+                "edition": "ADVANCED",
+                "channel": "CURRENT",
+                "continuous": False,
+            },
+        }
+        content = self.manager.template_renderer.render_template(
+            "bundle/pipeline_resource.yml.j2", context
+        )
+
+        assert f"/{pipeline_name}/**" in content, (
+            "Glob pattern must use /** (DAB only supports directory-recursive globs)"
+        )
+
 
 class TestBundleJinja2TemplateHelpers:
     """Helper test class for template-specific utilities."""
