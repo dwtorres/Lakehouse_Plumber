@@ -8,8 +8,6 @@ resources:
             environment_version: "2"
             dependencies:
               - {{ lhp_whl_path }}
-              # TODO: Add JDBC driver JAR dependency, e.g.:
-              # - postgresql-42.7.3.jar
       tasks:
 {% for task in extraction_tasks %}
         - task_key: {{ task.task_name }}
