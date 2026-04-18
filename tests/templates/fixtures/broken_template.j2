@@ -1,0 +1,15 @@
+{% raw %}
+# Deliberately broken fixture for Task 12 Jinja AST SQL-context lint.
+#
+# Each interpolation below sits on a line that contains a SQL keyword
+# (SELECT / WHERE / UPDATE) WITHOUT being wrapped in one of the four
+# sanctioned emitters. The lint in
+# tests/templates/test_template_sql_lint.py must flag every one of
+# these with an actionable line-level message.
+#
+# DO NOT "fix" this file. It exists specifically to prove the lint
+# catches regressions.
+{% endraw %}
+query_select = f"SELECT * FROM {{ table_name }} AS t"
+query_where = f"WHERE id = {{ user_id }}"
+query_update = f"UPDATE meta SET col = {{ new_value }}"
