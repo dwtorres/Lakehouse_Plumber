@@ -192,34 +192,17 @@ class TestJDBCWatermarkV2Validation:
         ), "Expected warning about num_partitions"
 
     def test_non_volumes_landing_path_emits_warning_not_error(self, caplog):
-        action = self._make_valid_v2_action(landing_path="abfss://container@storage/path")
+        action = self._make_valid_v2_action(
+            landing_path="abfss://container@storage/path"
+        )
         import logging
 
         with caplog.at_level(logging.WARNING):
             errors = self.validator.validate(action, "test")
-        assert errors == [], f"Non-/Volumes/ path should not produce errors, got: {errors}"
+        assert (
+            errors == []
+        ), f"Non-/Volumes/ path should not produce errors, got: {errors}"
         assert any(
             "volumes" in r.message.lower() or "/Volumes/" in r.message
             for r in caplog.records
         ), "Expected warning about non-/Volumes/ landing_path"
-
-    # --- Backward compat: v1 unchanged ---
-
-    def test_v1_jdbc_watermark_still_validates(self):
-        """v1 jdbc_watermark action should still pass validation unchanged."""
-        action = Action(
-            name="load_v1_jdbc",
-            type="load",
-            source={
-                "type": "jdbc_watermark",
-                "url": "jdbc:postgresql://host:5432/db",
-                "user": "test_user",
-                "password": "test_pass",
-                "driver": "org.postgresql.Driver",
-                "table": '"schema"."table"',
-            },
-            target="v_test_raw",
-            watermark={"column": "modified_date", "type": "timestamp"},
-        )
-        errors = self.validator.validate(action, "test")
-        assert errors == [], f"v1 should still pass, got: {errors}"

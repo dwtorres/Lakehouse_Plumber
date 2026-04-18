@@ -858,10 +858,18 @@ class ActionOrchestrator:
                             for k in flowgroup_for_aux._auxiliary_files
                         )
                         if has_extract_aux:
-                            extract_dir = pipeline_output_dir.parent / f"{pipeline_output_dir.name}_extract"
+                            extract_dir = (
+                                pipeline_output_dir.parent
+                                / f"{pipeline_output_dir.name}_extract"
+                            )
                             extract_dir.mkdir(exist_ok=True)
-                        for aux_name, aux_content in flowgroup_for_aux._auxiliary_files.items():
-                            if aux_name.startswith("__lhp_extract_") and aux_name.endswith(".py"):
+                        for (
+                            aux_name,
+                            aux_content,
+                        ) in flowgroup_for_aux._auxiliary_files.items():
+                            if aux_name.startswith(
+                                "__lhp_extract_"
+                            ) and aux_name.endswith(".py"):
                                 aux_file = extract_dir / aux_name
                             else:
                                 aux_file = pipeline_output_dir / aux_name
@@ -955,10 +963,18 @@ class ActionOrchestrator:
                                 for k in processed_flowgroup._auxiliary_files
                             )
                             if has_extract_aux:
-                                extract_dir = pipeline_output_dir.parent / f"{pipeline_output_dir.name}_extract"
+                                extract_dir = (
+                                    pipeline_output_dir.parent
+                                    / f"{pipeline_output_dir.name}_extract"
+                                )
                                 extract_dir.mkdir(exist_ok=True)
-                            for aux_name, aux_content in processed_flowgroup._auxiliary_files.items():
-                                if aux_name.startswith("__lhp_extract_") and aux_name.endswith(".py"):
+                            for (
+                                aux_name,
+                                aux_content,
+                            ) in processed_flowgroup._auxiliary_files.items():
+                                if aux_name.startswith(
+                                    "__lhp_extract_"
+                                ) and aux_name.endswith(".py"):
                                     aux_file = extract_dir / aux_name
                                 else:
                                     aux_file = pipeline_output_dir / aux_name
@@ -980,9 +996,7 @@ class ActionOrchestrator:
 
         # 5b. Generate workflow resources for jdbc_watermark_v2 flowgroups
         if pipeline_output_dir:
-            self._generate_workflow_resources(
-                processed_flowgroups, smart_writer
-            )
+            self._generate_workflow_resources(processed_flowgroups, smart_writer)
 
         # 6. Finalize
         if state_manager:
@@ -1572,6 +1586,7 @@ class ActionOrchestrator:
                 merged_fg = FG(
                     pipeline=pipeline_name,
                     flowgroup=ref_fg.flowgroup,
+                    workflow=ref_fg.workflow,
                     actions=v2_actions,
                 )
                 workflow_yaml = workflow_gen.generate(merged_fg, {})

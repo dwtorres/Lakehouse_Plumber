@@ -1,18 +1,16 @@
-"""Tests for JDBC watermark validation rules in LoadActionValidator."""
+"""Tests for removed jdbc_watermark validation behavior."""
 
 import pytest
 
 from lhp.core.action_registry import ActionRegistry
 from lhp.core.config_field_validator import ConfigFieldValidator
 from lhp.core.validators.load_validator import LoadActionValidator
-from lhp.generators.load.jdbc_watermark import JDBCWatermarkLoadGenerator
 from lhp.models.config import Action
-from lhp.utils.error_formatter import LHPValidationError
 
 
 @pytest.mark.unit
-class TestJDBCWatermarkValidation:
-    """Test suite for JDBC watermark source validation."""
+class TestRemovedJDBCWatermarkValidation:
+    """Legacy jdbc_watermark configs should fail with a migration message."""
 
     def setup_method(self):
         """Set up test fixtures."""
@@ -20,8 +18,8 @@ class TestJDBCWatermarkValidation:
         self.field_validator = ConfigFieldValidator()
         self.validator = LoadActionValidator(self.registry, self.field_validator)
 
-    def _make_valid_watermark_action(self, **overrides):
-        """Build a valid jdbc_watermark Action, applying any overrides."""
+    def _make_legacy_watermark_action(self, **overrides):
+        """Build a legacy jdbc_watermark Action, applying any overrides."""
         source = {
             "type": "jdbc_watermark",
             "url": "jdbc:postgresql://host:5432/db",
@@ -41,205 +39,26 @@ class TestJDBCWatermarkValidation:
         kwargs.update(overrides)
         return Action(**kwargs)
 
-    def test_valid_jdbc_watermark_passes_validation(self):
-        """A fully valid jdbc_watermark action should produce zero errors."""
-        action = self._make_valid_watermark_action()
+    def test_removed_source_type_fails_validation(self):
+        action = self._make_legacy_watermark_action()
         errors = self.validator.validate(action, "test")
-        assert errors == [], f"Expected no errors but got: {errors}"
+        assert len(errors) == 1
+        assert "jdbc_watermark_v2" in str(errors[0])
 
-    def test_missing_watermark_section(self):
-        """Omitting the watermark section on a jdbc_watermark source is an error."""
-        action = self._make_valid_watermark_action(watermark=None)
-        errors = self.validator.validate(action, "test")
-        assert len(errors) > 0
-        assert any(
-            "watermark" in str(e).lower() for e in errors
-        ), f"Expected watermark-related error, got: {errors}"
-
-    def test_missing_watermark_column(self):
-        """An empty watermark column should be rejected."""
-        try:
-            action = self._make_valid_watermark_action(
-                watermark={"column": "", "type": "timestamp"}
-            )
-        except Exception:
-            # Pydantic may reject empty column at model creation time,
-            # which is acceptable — the constraint is enforced either way.
-            return
-
-        errors = self.validator.validate(action, "test")
-        assert len(errors) > 0
-        assert any(
-            "column" in str(e).lower() for e in errors
-        ), f"Expected column-related error, got: {errors}"
-
-    def test_missing_jdbc_url(self):
-        """Omitting the JDBC url should produce a validation error."""
-        source_without_url = {
-            "type": "jdbc_watermark",
-            "user": "test_user",
-            "password": "test_pass",
-            "driver": "org.postgresql.Driver",
-            "table": '"schema"."table"',
-        }
-        action = self._make_valid_watermark_action(source=source_without_url)
-        errors = self.validator.validate(action, "test")
-        assert len(errors) > 0
-        assert any(
-            "url" in str(e).lower() for e in errors
-        ), f"Expected url-related error, got: {errors}"
-
-    def test_missing_jdbc_driver(self):
-        """Omitting the JDBC driver should produce a validation error."""
-        source_without_driver = {
-            "type": "jdbc_watermark",
-            "url": "jdbc:postgresql://host:5432/db",
-            "user": "test_user",
-            "password": "test_pass",
-            "table": '"schema"."table"',
-        }
-        action = self._make_valid_watermark_action(source=source_without_driver)
-        errors = self.validator.validate(action, "test")
-        assert len(errors) > 0
-        assert any(
-            "driver" in str(e).lower() for e in errors
-        ), f"Expected driver-related error, got: {errors}"
-
-    def test_missing_jdbc_table(self):
-        """Omitting both table and query should produce a validation error."""
-        source_without_table = {
-            "type": "jdbc_watermark",
-            "url": "jdbc:postgresql://host:5432/db",
-            "user": "test_user",
-            "password": "test_pass",
-            "driver": "org.postgresql.Driver",
-        }
-        action = self._make_valid_watermark_action(source=source_without_table)
-        errors = self.validator.validate(action, "test")
-        assert len(errors) > 0
-        assert any(
-            "table" in str(e).lower() or "query" in str(e).lower()
-            for e in errors
-        ), f"Expected table/query-related error, got: {errors}"
-
-    def test_standard_jdbc_unaffected_by_watermark(self):
-        """A standard jdbc source with a watermark field should not trigger watermark validation."""
-        action = Action(
-            name="load_test_jdbc",
-            type="load",
-            source={
-                "type": "jdbc",
-                "url": "jdbc:postgresql://host:5432/db",
-                "user": "test_user",
-                "password": "test_pass",
-                "driver": "org.postgresql.Driver",
-                "table": '"schema"."table"',
-            },
-            target="v_test_raw",
-            watermark={"column": "modified_date", "type": "timestamp"},
+    def test_removed_source_type_short_circuits_other_errors(self):
+        action = self._make_legacy_watermark_action(
+            watermark=None,
+            source={"type": "jdbc_watermark"},
         )
         errors = self.validator.validate(action, "test")
-        # Standard JDBC validation should pass; watermark section is simply ignored
-        assert errors == [], f"Expected no errors for standard jdbc, got: {errors}"
+        assert len(errors) == 1
+        assert "removed" in str(errors[0]).lower()
 
-    def test_watermark_column_with_special_chars_rejected(self):
-        """Watermark column containing special characters should be rejected."""
-        action = self._make_valid_watermark_action(
-            watermark={"column": "col; DROP TABLE--", "type": "timestamp"}
-        )
+    def test_removed_source_type_from_field_validator(self):
+        action = self._make_legacy_watermark_action()
         errors = self.validator.validate(action, "test")
-        assert len(errors) > 0
-        assert any(
-            "valid SQL identifier" in str(e) for e in errors
-        ), f"Expected SQL identifier error, got: {errors}"
-
-    def test_watermark_column_with_spaces_rejected(self):
-        """Watermark column containing spaces should be rejected."""
-        action = self._make_valid_watermark_action(
-            watermark={"column": "my column", "type": "timestamp"}
-        )
-        errors = self.validator.validate(action, "test")
-        assert len(errors) > 0
-        assert any(
-            "valid SQL identifier" in str(e) for e in errors
-        ), f"Expected SQL identifier error, got: {errors}"
-
-    def test_watermark_column_valid_identifier_passes(self):
-        """A valid SQL identifier watermark column should pass."""
-        action = self._make_valid_watermark_action(
-            watermark={"column": "modified_date_utc", "type": "timestamp"}
-        )
-        errors = self.validator.validate(action, "test")
-        assert errors == [], f"Expected no errors, got: {errors}"
-
-    def test_query_only_jdbc_watermark_rejected(self):
-        """jdbc_watermark with query but no table should be rejected.
-
-        The ConfigFieldValidator rejects 'query' as an unknown field for
-        jdbc_watermark sources before the type-specific validator runs.
-        Either way, the config is rejected.
-        """
-        source_with_query_only = {
-            "type": "jdbc_watermark",
-            "url": "jdbc:postgresql://host:5432/db",
-            "user": "test_user",
-            "password": "test_pass",
-            "driver": "org.postgresql.Driver",
-            "query": "SELECT * FROM some_table",
-        }
-        action = self._make_valid_watermark_action(source=source_with_query_only)
-        errors = self.validator.validate(action, "test")
-        assert len(errors) > 0, "Expected errors for query-only jdbc_watermark"
-
-
-@pytest.mark.unit
-class TestJDBCWatermarkReadModeEnforcement:
-    """Test readMode enforcement in the JDBC watermark generator."""
-
-    def _make_watermark_action(self, readMode=None):
-        """Build a valid jdbc_watermark Action with optional readMode."""
-        return Action(
-            name="load_test_jdbc",
-            type="load",
-            readMode=readMode,
-            source={
-                "type": "jdbc_watermark",
-                "url": "jdbc:postgresql://host:5432/db",
-                "user": "test_user",
-                "password": "test_pass",
-                "driver": "org.postgresql.Driver",
-                "table": '"schema"."table"',
-            },
-            target="v_test_raw",
-            watermark={"column": "modified_date", "type": "timestamp"},
-        )
-
-    def test_jdbc_watermark_rejects_stream_readmode(self):
-        """readMode: stream on jdbc_watermark load should raise LHPValidationError."""
-        action = self._make_watermark_action(readMode="stream")
-        generator = JDBCWatermarkLoadGenerator()
-        with pytest.raises(LHPValidationError, match="Invalid readMode"):
-            generator.generate(action, {})
-
-    def test_jdbc_watermark_accepts_batch_readmode(self):
-        """readMode: batch on jdbc_watermark load should not raise a readMode error."""
-        action = self._make_watermark_action(readMode="batch")
-        generator = JDBCWatermarkLoadGenerator()
-        try:
-            generator.generate(action, {})
-        except LHPValidationError as e:
-            if "readMode" in str(e) or "Invalid readMode" in str(e):
-                pytest.fail(f"Unexpected readMode error: {e}")
-
-    def test_jdbc_watermark_defaults_batch_readmode(self):
-        """readMode: None on jdbc_watermark load should default to batch without error."""
-        action = self._make_watermark_action(readMode=None)
-        generator = JDBCWatermarkLoadGenerator()
-        try:
-            generator.generate(action, {})
-        except LHPValidationError as e:
-            if "readMode" in str(e) or "Invalid readMode" in str(e):
-                pytest.fail(f"Unexpected readMode error: {e}")
+        assert len(errors) == 1
+        assert "jdbc_watermark_v2" in str(errors[0])
 
 
 if __name__ == "__main__":

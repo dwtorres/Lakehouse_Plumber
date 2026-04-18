@@ -50,14 +50,12 @@ class LoadSourceType(str, Enum):
     JDBC = "jdbc"
     CUSTOM_DATASOURCE = "custom_datasource"
     KAFKA = "kafka"
-    JDBC_WATERMARK = "jdbc_watermark"
     JDBC_WATERMARK_V2 = "jdbc_watermark_v2"
 
 
 # NOTE: update when adding batch-only source types
 BATCH_ONLY_SOURCE_TYPES = {
     LoadSourceType.JDBC,
-    LoadSourceType.JDBC_WATERMARK,
     LoadSourceType.JDBC_WATERMARK_V2,
 }
 
@@ -349,6 +347,7 @@ class FlowGroup(BaseModel):
     pipeline: str
     flowgroup: str
     job_name: Optional[str] = None
+    workflow: Optional[Dict[str, Any]] = None
     variables: Optional[Dict[str, str]] = None  # Local variable definitions
     presets: List[str] = []
     use_template: Optional[str] = None

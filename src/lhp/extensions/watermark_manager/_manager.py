@@ -214,7 +214,7 @@ class WatermarkManager:
         Return the most recent terminal-success watermark, or ``None``.
 
         Filters strictly by ``status='completed'`` so non-terminal rows
-        (``running``, ``failed``, ``timed_out``, future ``landed_not_committed``)
+        (``running``, ``failed``, ``timed_out``, ``landed_not_committed``)
         cannot be picked up as the "latest" — that was the pre-Slice-A bug
         FR-L-04 fixes. Same-second collisions tie-break deterministically by
         ``run_id`` lexicographic descending.
@@ -295,6 +295,60 @@ class WatermarkManager:
             duration_ms,
         )
         return watermark
+
+    def get_recoverable_landed_run(
+        self,
+        source_system_id: str,
+        schema_name: str,
+        table_name: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the latest landed-but-not-finalized run for a table key.
+
+        This is the recovery hook for jdbc_watermark_v2 extraction notebooks.
+        If a durable landed batch exists but finalization failed, the next run
+        can finalize it before opening JDBC again.
+        """
+        self._ensure_utc_session()
+
+        SQLInputValidator.identifier(source_system_id)
+        SQLInputValidator.identifier(schema_name)
+        SQLInputValidator.identifier(table_name)
+
+        query = f"""
+            SELECT
+                run_id,
+                watermark_value,
+                row_count,
+                status,
+                created_at
+            FROM {self.table_name}
+            WHERE source_system_id = {sql_literal(source_system_id)}
+              AND schema_name = {sql_literal(schema_name)}
+              AND table_name = {sql_literal(table_name)}
+              AND status = 'landed_not_committed'
+            ORDER BY created_at DESC, run_id DESC
+            LIMIT 1
+        """
+        result = self.spark.sql(query).collect()
+        if not result:
+            return None
+
+        row = result[0]
+        recoverable = {
+            "run_id": row["run_id"],
+            "watermark_value": row["watermark_value"],
+            "row_count": row["row_count"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+        }
+        logger.warning(
+            "Recoverable landed run found for %s.%s.%s: run_id=%s",
+            source_system_id,
+            schema_name,
+            table_name,
+            recoverable["run_id"],
+        )
+        return recoverable
 
     def insert_new(
         self,
@@ -517,6 +571,45 @@ class WatermarkManager:
             duration_ms,
         )
 
+    def mark_landed(
+        self,
+        run_id: str,
+        watermark_value: Union[str, int, Decimal],
+        row_count: int,
+    ) -> None:
+        """Persist that files were durably landed but not yet finalized."""
+        self._ensure_utc_session()
+        start_time = time.time()
+
+        SQLInputValidator.uuid_or_job_run_id(run_id)
+        SQLInputValidator.numeric(row_count)
+
+        wm_val_sql = _render_watermark_literal(watermark_value)
+        run_id_lit = sql_literal(run_id)
+
+        landed_sql = f"""
+            UPDATE {self.table_name}
+            SET status = 'landed_not_committed',
+                watermark_value = {wm_val_sql},
+                row_count = {sql_numeric_literal(row_count)}
+            WHERE run_id = {run_id_lit}
+              AND status = 'running'
+        """
+        affected = self._update_with_affected_rows(landed_sql)
+
+        if affected == 0:
+            current_status = self._read_back_status(run_id_lit)
+            raise TerminalStateGuardError(run_id=run_id, current_status=current_status)
+
+        duration_ms = (time.time() - start_time) * 1000
+        logger.info(
+            "Run marked as landed_not_committed: run_id=%s, value=%s, rows=%d (%.1f ms)",
+            run_id,
+            watermark_value,
+            row_count,
+            duration_ms,
+        )
+
     def mark_bronze_complete(self, run_id: str) -> None:
         """
         Mark bronze stage complete; auto-promote status if silver is already done.
@@ -604,8 +697,8 @@ class WatermarkManager:
         Wired into the extraction notebook outside the try/except per L2
         §5.3, so a failure here does not re-enter the failure path. The
         SQL ``WHERE`` clause carries the FR-L-06 terminal-failure guard:
-        the UPDATE refuses to overwrite ``failed`` / ``timed_out`` /
-        ``landed_not_committed`` rows. Zero affected rows triggers a
+        the UPDATE only accepts ``running`` or ``landed_not_committed`` rows.
+        Zero affected rows triggers a
         read-back of the current status and raises
         ``TerminalStateGuardError`` (LHP-WM-002).
 
@@ -636,7 +729,7 @@ class WatermarkManager:
                 row_count = {sql_numeric_literal(row_count)},
                 completed_at = {ts_literal}
             WHERE run_id = {run_id_lit}
-              AND status NOT IN ('failed', 'timed_out', 'landed_not_committed')
+              AND status IN ('running', 'landed_not_committed')
         """
         affected = self._update_with_affected_rows(complete_sql)
 

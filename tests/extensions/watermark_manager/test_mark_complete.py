@@ -2,8 +2,8 @@
 
 Covers AC-SA-01..03, AC-SA-23, AC-SA-24:
 - watermark_value is a required, validated parameter
-- UPDATE WHERE clause refuses terminal-failure rows
-  (status NOT IN ('failed','timed_out','landed_not_committed'))
+- UPDATE WHERE clause accepts only recoverable rows
+  (status IN ('running','landed_not_committed'))
 - zero-affected → TerminalStateGuardError(run_id, current_status) where
   current_status is read back from the table
 - completed_at is a UTC ISO-8601 microsecond literal (FR-L-07)
@@ -107,14 +107,14 @@ def test_mark_complete_emits_terminal_failure_guard_in_where() -> None:
     wm.mark_complete(**_kwargs())
 
     update = next(s for s in spark.statements if "UPDATE" in s.upper())
-    # Guard must exclude all terminal-failure statuses.
+    # Guard must accept only running + landed_not_committed rows.
     pattern = re.compile(
-        r"status\s+NOT\s+IN\s*\(\s*'failed'\s*,\s*'timed_out'\s*,\s*'landed_not_committed'\s*\)",
+        r"status\s+IN\s*\(\s*'running'\s*,\s*'landed_not_committed'\s*\)",
         re.IGNORECASE,
     )
     assert pattern.search(
         update
-    ), f"missing terminal-failure guard in UPDATE WHERE; SQL: {update}"
+    ), f"missing recoverable-state guard in UPDATE WHERE; SQL: {update}"
 
 
 def test_mark_complete_writes_utc_iso8601_microsecond_completed_at() -> None:

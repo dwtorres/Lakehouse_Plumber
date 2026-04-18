@@ -238,13 +238,23 @@ Check the generated resource file:
 .. code-block:: bash
 
    # Validate bundle configuration
-   databricks bundle validate --target dev
+   databricks bundle validate --target dev --profile <profile>
 
    # Deploy bundle to Databricks
-   databricks bundle deploy --target dev
+   databricks bundle deploy --target dev --profile <profile>
 
    # Verify deployment
-   databricks bundle status --target dev
+   databricks bundle status --target dev --profile <profile>
+
+.. note::
+   Use an explicit Databricks CLI profile for bundle verification and deployment.
+   A single workspace host can match multiple local profiles, so relying on
+   implicit profile selection can fail even when the bundle is otherwise valid.
+   You can also run the read-only helper:
+
+.. code-block:: bash
+
+   python scripts/verify_databricks_bundle.py --target dev --profile <profile>
 
 Bundle Resource Synchronization
 -------------------------------

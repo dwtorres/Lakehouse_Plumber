@@ -16,7 +16,6 @@ import yaml
 
 from lhp.core.orchestrator import ActionOrchestrator
 
-
 FLOWGROUP_YAML = """\
 pipeline: crm_bronze
 flowgroup: product_ingestion
@@ -60,9 +59,7 @@ def v2_project(tmp_path):
     project = tmp_path / "v2_project"
     project.mkdir()
 
-    (project / "lhp.yaml").write_text(
-        "name: v2_test_project\nversion: '1.0'\n"
-    )
+    (project / "lhp.yaml").write_text("name: v2_test_project\nversion: '1.0'\n")
     for d in ("presets", "templates", "substitutions", "generated"):
         (project / d).mkdir()
 
@@ -108,6 +105,10 @@ class TestJDBCWatermarkV2Integration:
         generated, _ = self._generate(v2_project)
         code = generated["product_ingestion.py"]
         assert "/Volumes/bronze_catalog/bronze/landing/product" in code
+        assert (
+            "/Volumes/bronze_catalog/bronze/landing/_lhp_schema/load_product_jdbc"
+            in code
+        )
 
     def test_dlt_stub_has_streaming_table_write(self, v2_project):
         generated, _ = self._generate(v2_project)
@@ -121,36 +122,48 @@ class TestJDBCWatermarkV2Integration:
     def test_extraction_notebook_written_to_disk(self, v2_project):
         """Auxiliary extraction notebook is written to generated/{pipeline}/."""
         _, output_dir = self._generate(v2_project)
-        notebook = output_dir / "crm_bronze_extract" / "__lhp_extract_load_product_jdbc.py"
+        notebook = (
+            output_dir / "crm_bronze_extract" / "__lhp_extract_load_product_jdbc.py"
+        )
         assert notebook.exists(), f"Extraction notebook not found at {notebook}"
 
     def test_extraction_notebook_has_watermark_manager(self, v2_project):
         _, output_dir = self._generate(v2_project)
-        notebook = output_dir / "crm_bronze_extract" / "__lhp_extract_load_product_jdbc.py"
+        notebook = (
+            output_dir / "crm_bronze_extract" / "__lhp_extract_load_product_jdbc.py"
+        )
         content = notebook.read_text()
         assert "WatermarkManager" in content
         assert "get_latest_watermark(" in content
         assert "insert_new(" in content
+        assert "get_recoverable_landed_run(" in content
+        assert "mark_landed(" in content
         assert '["watermark_value"]' in content  # dict access pattern
         assert "watermark_column_name=" in content  # required kwarg
         assert '"ModifiedDate"' in content  # WHERE clause quotes column for JDBC
 
     def test_extraction_notebook_has_jdbc_read(self, v2_project):
         _, output_dir = self._generate(v2_project)
-        notebook = output_dir / "crm_bronze_extract" / "__lhp_extract_load_product_jdbc.py"
+        notebook = (
+            output_dir / "crm_bronze_extract" / "__lhp_extract_load_product_jdbc.py"
+        )
         content = notebook.read_text()
         assert 'format("jdbc")' in content
 
     def test_extraction_notebook_has_parquet_write(self, v2_project):
         _, output_dir = self._generate(v2_project)
-        notebook = output_dir / "crm_bronze_extract" / "__lhp_extract_load_product_jdbc.py"
+        notebook = (
+            output_dir / "crm_bronze_extract" / "__lhp_extract_load_product_jdbc.py"
+        )
         content = notebook.read_text()
         assert 'format("parquet")' in content
 
     def test_extraction_notebook_no_dlt_decorators(self, v2_project):
         """Extraction notebook must NOT contain DLT-specific code."""
         _, output_dir = self._generate(v2_project)
-        notebook = output_dir / "crm_bronze_extract" / "__lhp_extract_load_product_jdbc.py"
+        notebook = (
+            output_dir / "crm_bronze_extract" / "__lhp_extract_load_product_jdbc.py"
+        )
         content = notebook.read_text()
         assert "@dp." not in content
         assert "dlt." not in content
@@ -239,9 +252,7 @@ actions:
         project = tmp_path / "secret_project"
         project.mkdir()
 
-        (project / "lhp.yaml").write_text(
-            "name: secret_test\nversion: '1.0'\n"
-        )
+        (project / "lhp.yaml").write_text("name: secret_test\nversion: '1.0'\n")
         for d in ("presets", "templates", "substitutions", "generated"):
             (project / d).mkdir()
 
@@ -300,7 +311,9 @@ actions:
             output_dir=output_dir,
         )
 
-        notebook = output_dir / "crm_bronze_extract" / "__lhp_extract_load_product_jdbc.py"
+        notebook = (
+            output_dir / "crm_bronze_extract" / "__lhp_extract_load_product_jdbc.py"
+        )
         assert notebook.exists(), f"Extraction notebook not found at {notebook}"
         content = notebook.read_text()
 
@@ -310,6 +323,6 @@ actions:
         assert "jdbc_user" in content
 
         # Negative: no surviving placeholders
-        assert "__SECRET_" not in content, (
-            f"Unresolved secret placeholder found in notebook:\n{content}"
-        )
+        assert (
+            "__SECRET_" not in content
+        ), f"Unresolved secret placeholder found in notebook:\n{content}"

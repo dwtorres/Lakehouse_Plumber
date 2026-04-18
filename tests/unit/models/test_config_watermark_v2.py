@@ -17,8 +17,9 @@ class TestLoadSourceTypeV2:
     def test_jdbc_watermark_v2_from_string(self):
         assert LoadSourceType("jdbc_watermark_v2") is LoadSourceType.JDBC_WATERMARK_V2
 
-    def test_v1_jdbc_watermark_unchanged(self):
-        assert LoadSourceType("jdbc_watermark") is LoadSourceType.JDBC_WATERMARK
+    def test_v1_jdbc_watermark_removed(self):
+        with pytest.raises(ValueError):
+            LoadSourceType("jdbc_watermark")
 
     def test_cloudfiles_unchanged(self):
         assert LoadSourceType("cloudfiles") is LoadSourceType.CLOUDFILES

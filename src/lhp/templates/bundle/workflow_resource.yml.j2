@@ -16,11 +16,17 @@ resources:
           environment_key: lhp_env
           notebook_task:
             notebook_path: {{ task.notebook_path }}
+{% if task.depends_on %}
+          depends_on:
+{% for task_name in task.depends_on %}
+            - task_key: {{ task_name }}
+{% endfor %}
+{% endif %}
 {% endfor %}
         - task_key: {{ dlt_task_name }}
           pipeline_task:
             pipeline_id: {{ dlt_pipeline_ref }}
           depends_on:
-{% for task_name in extraction_task_names %}
+{% for task_name in dlt_depends_on %}
             - task_key: {{ task_name }}
 {% endfor %}

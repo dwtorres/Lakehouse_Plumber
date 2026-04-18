@@ -153,3 +153,23 @@ class TestWorkflowResourceGenerator:
         dep_keys = [d["task_key"] for d in pipeline_task["depends_on"]]
         assert len(dep_keys) == 2
 
+    def test_serial_extraction_chains_notebook_tasks(self):
+        action1 = _make_v2_action(name="load_product", target="v_product_raw")
+        action2 = _make_v2_action(name="load_order", target="v_order_raw")
+        fg = FlowGroup(
+            pipeline="my_pipeline",
+            flowgroup="test_flowgroup",
+            workflow={"extraction_mode": "serial"},
+            actions=[action1, action2, _make_write_action()],
+        )
+        gen = WorkflowResourceGenerator()
+        result = gen.generate(fg, {})
+        parsed = yaml.safe_load(result)
+        tasks = parsed["resources"]["jobs"]["my_pipeline_workflow"]["tasks"]
+        first_notebook = tasks[0]
+        second_notebook = tasks[1]
+        pipeline_task = tasks[-1]
+
+        assert "depends_on" not in first_notebook
+        assert second_notebook["depends_on"] == [{"task_key": "extract_load_product"}]
+        assert pipeline_task["depends_on"] == [{"task_key": "extract_load_order"}]

@@ -3,7 +3,7 @@
 import logging
 from typing import Any, Dict, Optional, Set
 
-from ..utils.error_formatter import ErrorCategory, LHPError
+from ..utils.error_formatter import ErrorCategory, LHPError, LHPValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -45,19 +45,6 @@ class ConfigFieldValidator:
             },
             "sql": {"type", "sql", "sql_path"},
             "jdbc": {"type", "url", "user", "password", "driver", "query", "table"},
-            "jdbc_watermark": {
-                "type",
-                "url",
-                "user",
-                "password",
-                "driver",
-                "table",
-                "schema_name",
-                "num_partitions",
-                "partition_column",
-                "lower_bound",
-                "upper_bound",
-            },
             "jdbc_watermark_v2": {
                 "type",
                 "url",
@@ -71,6 +58,17 @@ class ConfigFieldValidator:
                 "partition_column",
                 "lower_bound",
                 "upper_bound",
+                "options",
+                "reader_options",
+                "format_options",
+                "schema",
+                "schema_file",
+                "readMode",
+                "schema_location",
+                "schema_infer_column_types",
+                "max_files_per_trigger",
+                "schema_evolution_mode",
+                "rescue_data_column",
             },
             "python": {"type", "module_path", "function_name", "parameters"},
             "kafka": {
@@ -231,6 +229,22 @@ class ConfigFieldValidator:
                 f"Skipping field validation for action '{action_name}': no source type specified"
             )
             return  # No type specified, will be caught by other validation
+
+        if source_type == "jdbc_watermark":
+            raise LHPValidationError(
+                category=ErrorCategory.VALIDATION,
+                code_number="041",
+                title="Removed load source type",
+                details=(
+                    "Load source type 'jdbc_watermark' has been removed. "
+                    "Use 'jdbc_watermark_v2' instead."
+                ),
+                suggestions=[
+                    "Change source.type to 'jdbc_watermark_v2'",
+                    "Add landing_path and watermark.source_system_id for the v2 flow",
+                ],
+                context={"Action": action_name, "Removed Type": source_type},
+            )
 
         if source_type not in self.load_source_fields:
             logger.debug(

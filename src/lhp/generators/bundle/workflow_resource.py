@@ -30,6 +30,11 @@ class WorkflowResourceGenerator(BaseActionGenerator):
 
         # Collect v2 extraction tasks
         extraction_tasks: List[Dict[str, str]] = []
+        serial_extraction = bool(
+            isinstance(flowgroup.workflow, dict)
+            and flowgroup.workflow.get("extraction_mode") == "serial"
+        )
+        previous_task_name = None
         for action in flowgroup.actions:
             if not isinstance(action.source, dict):
                 continue
@@ -45,20 +50,32 @@ class WorkflowResourceGenerator(BaseActionGenerator):
                     f"/{pipeline_name}_extract/{aux_filename}"
                 )
                 extraction_tasks.append(
-                    {"task_name": task_name, "notebook_path": notebook_path}
+                    {
+                        "task_name": task_name,
+                        "notebook_path": notebook_path,
+                        "depends_on": (
+                            [previous_task_name]
+                            if previous_task_name and serial_extraction
+                            else []
+                        ),
+                    }
                 )
+                previous_task_name = task_name
 
         template_context: Dict[str, Any] = {
             "pipeline_name": pipeline_name,
             "extraction_tasks": extraction_tasks,
-            "extraction_task_names": [t["task_name"] for t in extraction_tasks],
+            "dlt_depends_on": (
+                [extraction_tasks[-1]["task_name"]]
+                if serial_extraction and extraction_tasks
+                else [t["task_name"] for t in extraction_tasks]
+            ),
             "dlt_task_name": f"dlt_{pipeline_name}",
             "dlt_pipeline_ref": (
                 f"${{resources.pipelines.{pipeline_name}_pipeline.id}}"
             ),
             "lhp_whl_path": "${var.lhp_whl_path}",
+            "serial_extraction": serial_extraction,
         }
 
-        return self.render_template(
-            "bundle/workflow_resource.yml.j2", template_context
-        )
+        return self.render_template("bundle/workflow_resource.yml.j2", template_context)

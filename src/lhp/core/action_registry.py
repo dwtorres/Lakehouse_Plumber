@@ -12,7 +12,6 @@ from ..generators.load import (
     DeltaLoadGenerator,
     JDBCLoadGenerator,
     JDBCWatermarkJobGenerator,
-    JDBCWatermarkLoadGenerator,
     KafkaLoadGenerator,
     PythonLoadGenerator,
     SQLLoadGenerator,
@@ -47,6 +46,8 @@ from ..utils.error_formatter import (
 
 logger = logging.getLogger(__name__)
 
+_REMOVED_LOAD_TYPES = {"jdbc_watermark": "jdbc_watermark_v2"}
+
 
 class ActionRegistry:
     """Registry for action generators."""
@@ -73,7 +74,6 @@ class ActionRegistry:
             LoadSourceType.PYTHON: PythonLoadGenerator,
             LoadSourceType.CUSTOM_DATASOURCE: CustomDataSourceLoadGenerator,
             LoadSourceType.KAFKA: KafkaLoadGenerator,
-            LoadSourceType.JDBC_WATERMARK: JDBCWatermarkLoadGenerator,
             LoadSourceType.JDBC_WATERMARK_V2: JDBCWatermarkJobGenerator,
         }
 
@@ -150,6 +150,23 @@ class ActionRegistry:
     source:
       type: cloudfiles
       path: /path/to/files""",
+                )
+
+            if isinstance(sub_type, str) and sub_type in _REMOVED_LOAD_TYPES:
+                replacement = _REMOVED_LOAD_TYPES[sub_type]
+                raise LHPValidationError(
+                    category=ErrorCategory.VALIDATION,
+                    code_number="041",
+                    title="Removed load source type",
+                    details=(
+                        f"Load source type '{sub_type}' has been removed. "
+                        f"Use '{replacement}' instead."
+                    ),
+                    suggestions=[
+                        f"Change source.type to '{replacement}'",
+                        "Add landing_path plus watermark.source_system_id for the v2 path",
+                    ],
+                    context={"Removed Type": sub_type, "Replacement": replacement},
                 )
 
             # Convert string to enum if needed
@@ -366,6 +383,8 @@ class ActionRegistry:
         """Check if a generator is available for the given action and sub type."""
         try:
             if action_type == ActionType.LOAD:
+                if sub_type in _REMOVED_LOAD_TYPES:
+                    return False
                 sub_type_enum = LoadSourceType(sub_type)
                 return sub_type_enum in self._load_generators
             elif action_type == ActionType.TRANSFORM:

@@ -10,6 +10,12 @@ from .base_validator import BaseActionValidator, ValidationError
 
 logger = logging.getLogger(__name__)
 
+_REMOVED_WATERMARK_SOURCE = "jdbc_watermark"
+_REMOVED_WATERMARK_MESSAGE = (
+    "jdbc_watermark has been removed; use jdbc_watermark_v2 instead "
+    "(requires landing_path and watermark.source_system_id)"
+)
+
 
 class LoadActionValidator(BaseActionValidator):
     """Validator for load actions."""
@@ -39,6 +45,10 @@ class LoadActionValidator(BaseActionValidator):
         source_type = action.source.get("type")
         if not source_type:
             errors.append(f"{prefix}: Load action source must have a 'type' field")
+            return errors
+
+        if source_type == _REMOVED_WATERMARK_SOURCE:
+            errors.append(f"{prefix}: {_REMOVED_WATERMARK_MESSAGE}")
             return errors
 
         # Validate source type is supported
@@ -85,12 +95,8 @@ class LoadActionValidator(BaseActionValidator):
                 errors.extend(self._validate_python_source(action, prefix))
             elif load_type == LoadSourceType.KAFKA:
                 errors.extend(self._validate_kafka_source(action, prefix))
-            elif load_type == LoadSourceType.JDBC_WATERMARK:
-                errors.extend(self._validate_jdbc_watermark_source(action, prefix))
             elif load_type == LoadSourceType.JDBC_WATERMARK_V2:
-                errors.extend(
-                    self._validate_jdbc_watermark_v2_source(action, prefix)
-                )
+                errors.extend(self._validate_jdbc_watermark_v2_source(action, prefix))
 
         except ValueError as e:
             logger.debug(f"Unrecognized load source type for '{action.name}': {e}")
@@ -169,53 +175,6 @@ class LoadActionValidator(BaseActionValidator):
 
     # SQL identifier pattern: letters, digits, underscores — no special chars
     _SQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
-    def _validate_jdbc_watermark_source(self, action: Action, prefix: str) -> List[str]:
-        """Validate JDBC watermark source configuration."""
-        errors = []
-
-        # Watermark config is required for jdbc_watermark source type
-        if not action.watermark:
-            errors.append(
-                f"{prefix}: JDBC watermark source requires a 'watermark' configuration"
-            )
-        else:
-            if not action.watermark.column:
-                errors.append(
-                    f"{prefix}: watermark.column is required for jdbc_watermark source"
-                )
-            elif not self._SQL_IDENTIFIER_RE.match(action.watermark.column):
-                errors.append(
-                    f"{prefix}: watermark.column '{action.watermark.column}' "
-                    "must be a valid SQL identifier "
-                    "(letters, digits, underscores only)"
-                )
-
-        # jdbc_watermark requires 'table' — 'query' alone is not supported
-        # because the template constructs its own filtered query from the table name
-        if not action.source.get("table"):
-            errors.append(
-                f"{prefix}: JDBC watermark source requires 'table' "
-                "(query-only mode is not supported for watermark loads)"
-            )
-
-        # Warn when >= operator may produce duplicates without Silver dedup
-        if (
-            action.watermark
-            and getattr(action.watermark, "operator", ">=") == ">="
-        ):
-            logger.warning(
-                f"Action '{action.name}': watermark operator is '>=' which "
-                "re-reads rows matching the high-water mark on each run. "
-                "Ensure the downstream Silver layer uses "
-                "create_auto_cdc_flow() with sequence_by to deduplicate, "
-                "or set operator to '>' if the watermark column has no ties."
-            )
-
-        # Reuse standard JDBC field validation for url, user, password, driver
-        errors.extend(self._validate_jdbc_source(action, prefix))
-
-        return errors
 
     def _validate_jdbc_watermark_v2_source(
         self, action: Action, prefix: str

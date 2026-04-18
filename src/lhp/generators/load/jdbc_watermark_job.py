@@ -9,6 +9,7 @@ Produces two artifacts from a single jdbc_watermark_v2 action:
 
 import logging
 import re
+from pathlib import PurePosixPath
 from typing import Any, Dict
 
 import black
@@ -17,6 +18,20 @@ from ...core.base_generator import BaseActionGenerator
 from ...models.config import Action
 
 logger = logging.getLogger(__name__)
+
+_CLOUDFILES_PASSTHROUGH_KEYS = {
+    "options",
+    "reader_options",
+    "format_options",
+    "schema",
+    "schema_file",
+    "readMode",
+    "schema_location",
+    "schema_infer_column_types",
+    "max_files_per_trigger",
+    "schema_evolution_mode",
+    "rescue_data_column",
+}
 
 # Pattern to match ${secret:scope/key} references
 _SECRET_REF_RE = re.compile(r"\$\{secret:([^/]+)/([^}]+)\}")
@@ -32,6 +47,30 @@ def _resolve_secret_refs(value: str) -> str:
         scope, key = match.group(1), match.group(2)
         return f'dbutils.secrets.get(scope="{scope}", key="{key}")'
     return f'"{value}"'
+
+
+def _default_schema_location(landing_path: str, action_name: str) -> str:
+    """Build a stable Auto Loader schemaLocation sibling to the landing path."""
+    landing = PurePosixPath(landing_path)
+    parent = (
+        str(landing.parent) if str(landing.parent) not in ("", ".") else landing_path
+    )
+    return f"{parent.rstrip('/')}/_lhp_schema/{action_name}"
+
+
+def _has_schema_location(source_config: Dict[str, Any]) -> bool:
+    """True when any supported CloudFiles schemaLocation surface is already set."""
+    if source_config.get("schema_location"):
+        return True
+    options = source_config.get("options")
+    if isinstance(options, dict) and options.get("cloudFiles.schemaLocation"):
+        return True
+    reader_options = source_config.get("reader_options")
+    if isinstance(reader_options, dict) and reader_options.get(
+        "cloudFiles.schemaLocation"
+    ):
+        return True
+    return False
 
 
 class JDBCWatermarkJobGenerator(BaseActionGenerator):
@@ -57,9 +96,7 @@ class JDBCWatermarkJobGenerator(BaseActionGenerator):
 
         # Derive context values
         source_system_id = (
-            getattr(watermark, "source_system_id", None)
-            if watermark
-            else None
+            getattr(watermark, "source_system_id", None) if watermark else None
         )
         if not source_system_id:
             # Derive from JDBC URL host
@@ -133,9 +170,7 @@ class JDBCWatermarkJobGenerator(BaseActionGenerator):
         if flowgroup:
             aux_key = f"__lhp_extract_{action.name}.py"
             flowgroup._auxiliary_files[aux_key] = extraction_code
-            logger.debug(
-                f"Stored extraction notebook as auxiliary file '{aux_key}'"
-            )
+            logger.debug(f"Stored extraction notebook as auxiliary file '{aux_key}'")
 
         # Delegate CloudFiles stub to CloudFilesLoadGenerator
         from .cloudfiles import CloudFilesLoadGenerator
@@ -145,17 +180,31 @@ class JDBCWatermarkJobGenerator(BaseActionGenerator):
         # Build a synthetic cloudfiles action pointing at the landing path
         from ...models.config import Action as ActionModel
 
+        cloudfiles_source = {
+            key: value
+            for key, value in source_config.items()
+            if key in _CLOUDFILES_PASSTHROUGH_KEYS
+        }
+        cloudfiles_source.update(
+            {
+                "type": "cloudfiles",
+                "path": action.landing_path or "",
+                "format": "parquet",
+            }
+        )
+        if not _has_schema_location(cloudfiles_source):
+            cloudfiles_source["schema_location"] = _default_schema_location(
+                action.landing_path or "", action.name
+            )
+
         cloudfiles_action = ActionModel(
             name=action.name,
             type="load",
             target=action.target,
-            source={
-                "type": "cloudfiles",
-                "path": action.landing_path or "",
-                "format": "parquet",
-            },
+            source=cloudfiles_source,
             description=action.description
             or f"CloudFiles load from landing zone: {action.name}",
+            readMode=action.readMode,
         )
 
         return cloudfiles_gen.generate(cloudfiles_action, context)

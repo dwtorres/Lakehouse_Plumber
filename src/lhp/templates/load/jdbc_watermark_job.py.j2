@@ -10,6 +10,7 @@
 #   4. try: JDBC read → aggregate → Parquet write (FR-L-02)
 #   5. except: mark_failed(type(e).__name__, str(e)[:4096]) then raise
 #   6. mark_complete OUTSIDE and AFTER the try/except (FR-L-01 / FR-L-06a)
+import json
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -50,6 +51,49 @@ hwm_result = wm.get_latest_watermark(
     table_name=table_name,
 )
 hwm_value = hwm_result["watermark_value"] if hwm_result else None
+landing_root = {{ landing_path|tojson }}
+logged_action_name = {{ action_name|tojson }}
+
+
+def _log_phase(phase: str, **payload):
+    event = {"phase": phase, "action": logged_action_name, "run_id": run_id}
+    event.update(payload)
+    print(json.dumps(event, default=str, sort_keys=True))
+
+
+def _run_landing_path(root: str, current_run_id: str) -> str:
+    return f"{root.rstrip('/')}/_lhp_runs/{current_run_id}"
+
+
+recoverable = wm.get_recoverable_landed_run(
+    source_system_id=source_system_id,
+    schema_name=schema_name,
+    table_name=table_name,
+)
+if recoverable:
+    recovered_value = recoverable["watermark_value"] or ""
+    recovered_count = int(recoverable["row_count"] or 0)
+    _log_phase(
+        "recovery_finalize_start",
+        recoverable_run_id=recoverable["run_id"],
+        recoverable_landing_path=_run_landing_path(landing_root, recoverable["run_id"]),
+        row_count=recovered_count,
+        watermark_value=recovered_value,
+    )
+    wm.mark_complete(
+        run_id=recoverable["run_id"],
+        watermark_value=recovered_value,
+        row_count=recovered_count,
+    )
+    _log_phase(
+        "recovery_finalize_complete",
+        recoverable_run_id=recoverable["run_id"],
+        row_count=recovered_count,
+        watermark_value=recovered_value,
+    )
+    dbutils.notebook.exit(
+        f"Recovered landed batch {recoverable['run_id']} without reopening JDBC"
+    )
 
 
 def _ansi_quote_identifier(value: str) -> str:
@@ -120,8 +164,18 @@ wm.insert_new(
 extraction_succeeded = False
 row_count = 0
 new_hwm = None
+run_landing_path = _run_landing_path(landing_root, run_id)
+
+
+def _landing_has_parquet(path: str) -> bool:
+    try:
+        entries = dbutils.fs.ls(path)
+    except Exception:
+        return False
+    return any(entry.path.endswith(".parquet") for entry in entries)
 
 try:
+    _log_phase("jdbc_read_start", extraction_type=extraction_type)
     df = (
         spark.read.format("jdbc")
         .option("url", {{ jdbc_url }})
@@ -132,21 +186,28 @@ try:
         .option("queryTimeout", 3600)
         .load()
     )
+    _log_phase("jdbc_read_complete", extraction_type=extraction_type)
 
-    agg_result = df.agg(
-        F.count("*").alias("row_count"),
-        F.max(F.col(watermark_column)).alias("max_hwm"),
-    ).first()
-    row_count = agg_result["row_count"]
-    new_hwm = agg_result["max_hwm"]
+    _log_phase("landing_write_start", landing_path=run_landing_path)
+    df.write.mode("overwrite").format("parquet").save(run_landing_path)
 
-    if row_count > 0:
-        if row_count < 1_000_000:
-            df = df.repartition(1)
-        else:
-            df = df.repartition(4)
-        landing_path = {{ landing_path|tojson }}
-        df.write.mode("append").format("parquet").save(landing_path)
+    if _landing_has_parquet(run_landing_path):
+        landed_df = spark.read.format("parquet").load(run_landing_path)
+        agg_result = landed_df.agg(
+            F.count("*").alias("row_count"),
+            F.max(F.col(watermark_column)).alias("max_hwm"),
+        ).first()
+        row_count = agg_result["row_count"]
+        new_hwm = agg_result["max_hwm"]
+    else:
+        row_count = 0
+        new_hwm = hwm_value
+    _log_phase(
+        "landing_write_complete",
+        landing_path=run_landing_path,
+        row_count=row_count,
+        new_hwm=new_hwm,
+    )
 
     extraction_succeeded = True
 except Exception as e:
@@ -171,10 +232,31 @@ if extraction_succeeded:
         str(completion_value) if completion_value is not None else ""
     )
     try:
+        _log_phase(
+            "finalization_prepare",
+            landing_path=run_landing_path,
+            row_count=row_count,
+            watermark_value=completion_value_sql,
+        )
+        wm.mark_landed(
+            run_id=run_id,
+            watermark_value=completion_value_sql,
+            row_count=row_count,
+        )
+        _log_phase(
+            "finalization_commit_start",
+            row_count=row_count,
+            watermark_value=completion_value_sql,
+        )
         wm.mark_complete(
             run_id=run_id,
             watermark_value=completion_value_sql,
             row_count=row_count,
+        )
+        _log_phase(
+            "finalization_commit_complete",
+            row_count=row_count,
+            watermark_value=completion_value_sql,
         )
     except TerminalStateGuardError:
         # Row was moved to terminal failure upstream; leave it, propagate.

@@ -115,7 +115,9 @@ class TestJDBCWatermarkJobGenerator:
             and n.module == "lhp.extensions.watermark_manager"
             and any(alias.name == "WatermarkManager" for alias in n.names)
         ]
-        assert wm_imports, "WatermarkManager must be imported from lhp.extensions.watermark_manager"
+        assert (
+            wm_imports
+        ), "WatermarkManager must be imported from lhp.extensions.watermark_manager"
 
     def test_extraction_notebook_passes_spark_to_watermark_manager(self):
         """WatermarkManager constructor must receive spark as first arg."""
@@ -124,7 +126,10 @@ class TestJDBCWatermarkJobGenerator:
         gen = JDBCWatermarkJobGenerator()
         gen.generate(action, {"flowgroup": fg})
         notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
-        assert "WatermarkManager(\n    spark," in notebook or "WatermarkManager(spark," in notebook
+        assert (
+            "WatermarkManager(\n    spark," in notebook
+            or "WatermarkManager(spark," in notebook
+        )
 
     def test_extraction_notebook_has_get_latest_watermark(self):
         action = _make_v2_action()
@@ -177,13 +182,17 @@ class TestJDBCWatermarkJobGenerator:
 
     def test_numeric_watermark_value_unquoted_column_quoted(self):
         """Numeric watermark: HWM value unquoted, column identifier double-quoted in WHERE."""
-        action = _make_v2_action(watermark_type="numeric", watermark_column="product_id")
+        action = _make_v2_action(
+            watermark_type="numeric", watermark_column="product_id"
+        )
         fg = _make_flowgroup_with_write(action)
         gen = JDBCWatermarkJobGenerator()
         gen.generate(action, {"flowgroup": fg})
         notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
         # The numeric branch should use unquoted format
-        assert "numeric" in notebook.lower() or "})" in notebook or "format(" in notebook
+        assert (
+            "numeric" in notebook.lower() or "})" in notebook or "format(" in notebook
+        )
         assert '"product_id"' in notebook
 
     def test_custom_operator_gt(self):
@@ -194,7 +203,7 @@ class TestJDBCWatermarkJobGenerator:
         gen.generate(action, {"flowgroup": fg})
         notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
         # The operator should be in the WHERE clause template
-        assert '> ' in notebook or '>"' in notebook or "> '" in notebook
+        assert "> " in notebook or '>"' in notebook or "> '" in notebook
 
     def test_extraction_notebook_contains_jdbc_format(self):
         action = _make_v2_action()
@@ -219,6 +228,38 @@ class TestJDBCWatermarkJobGenerator:
         gen.generate(action, {"flowgroup": fg})
         notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
         assert "/Volumes/cat/sch/landing/prod" in notebook
+        assert "_lhp_runs" in notebook
+
+    def test_extraction_notebook_contains_recovery_hooks(self):
+        action = _make_v2_action()
+        fg = _make_flowgroup_with_write(action)
+        gen = JDBCWatermarkJobGenerator()
+        gen.generate(action, {"flowgroup": fg})
+        notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
+        assert "get_recoverable_landed_run(" in notebook
+        assert "mark_landed(" in notebook
+        assert "dbutils.notebook.exit(" in notebook
+
+    def test_cloudfiles_options_are_preserved_for_bronze_stub(self):
+        action = _make_v2_action(
+            source_overrides={
+                "options": {
+                    "cloudFiles.schemaEvolutionMode": "addNewColumns",
+                    "cloudFiles.rescueDataColumn": "_rescued_data",
+                }
+            }
+        )
+        _, code = self._generate(action=action)
+        assert 'cloudFiles.schemaEvolutionMode", "addNewColumns"' in code
+        assert 'cloudFiles.rescueDataColumn", "_rescued_data"' in code
+
+    def test_cloudfiles_schema_location_is_auto_generated(self):
+        action = _make_v2_action(landing_path="/Volumes/catalog/schema/landing/product")
+        _, code = self._generate(action=action)
+        assert (
+            'cloudFiles.schemaLocation", "/Volumes/catalog/schema/landing/_lhp_schema/load_product_jdbc"'
+            in code
+        )
 
     def test_secret_ref_renders_as_dbutils(self):
         """Secret references should render as dbutils.secrets.get() calls."""
@@ -284,7 +325,10 @@ class TestJDBCWatermarkJobGenerator:
         gen2 = JDBCWatermarkJobGenerator()
         gen2.generate(_make_v2_action(), {"flowgroup": fg2})
 
-        assert fg._auxiliary_files[f"__lhp_extract_{action.name}.py"] == fg2._auxiliary_files[f"__lhp_extract_{action.name}.py"]
+        assert (
+            fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
+            == fg2._auxiliary_files[f"__lhp_extract_{action.name}.py"]
+        )
 
     def test_secret_resolution_idempotent(self):
         """Applying secret resolution twice produces same result."""
@@ -308,7 +352,9 @@ class TestJDBCWatermarkJobGenerator:
         notebook_first = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
 
         # Apply SecretCodeGenerator again
-        notebook_second = SecretCodeGenerator().generate_python_code(notebook_first, refs)
+        notebook_second = SecretCodeGenerator().generate_python_code(
+            notebook_first, refs
+        )
         assert notebook_first == notebook_second
         assert "__SECRET_" not in notebook_second
 
@@ -388,9 +434,9 @@ class TestJDBCWatermarkJobGenerator:
         ), "All __lhp_extract_ aux keys must end with .py"
 
         bare_extract_keys = [k for k in aux_keys if k.startswith("extract_")]
-        assert not bare_extract_keys, (
-            f"Bare 'extract_' aux keys found (missing __lhp_ prefix): {bare_extract_keys}"
-        )
+        assert (
+            not bare_extract_keys
+        ), f"Bare 'extract_' aux keys found (missing __lhp_ prefix): {bare_extract_keys}"
 
     def test_non_extract_aux_files_stay_at_root(self):
         """Non-extraction aux files must remain at pipeline root (not in _extract/ sibling).
@@ -408,24 +454,36 @@ class TestJDBCWatermarkJobGenerator:
         fg._auxiliary_files["jobs_stats_loader.py"] = "# monitoring helper\n"
 
         extract_keys = [
-            k for k in fg._auxiliary_files if k.startswith("__lhp_extract_") and k.endswith(".py")
+            k
+            for k in fg._auxiliary_files
+            if k.startswith("__lhp_extract_") and k.endswith(".py")
         ]
         non_extract_keys = [
-            k for k in fg._auxiliary_files if not (k.startswith("__lhp_extract_") and k.endswith(".py"))
+            k
+            for k in fg._auxiliary_files
+            if not (k.startswith("__lhp_extract_") and k.endswith(".py"))
         ]
 
-        assert extract_keys, "Should have at least one __lhp_extract_ key for routing test"
-        assert non_extract_keys, "Should have at least one non-extract key for routing test"
+        assert (
+            extract_keys
+        ), "Should have at least one __lhp_extract_ key for routing test"
+        assert (
+            non_extract_keys
+        ), "Should have at least one non-extract key for routing test"
 
         # Simulate routing logic from orchestrator: extract keys → _extract/ sibling, others → root
         extract_destinations = {k: f"pipeline_extract/{k}" for k in extract_keys}
         non_extract_destinations = {k: k for k in non_extract_keys}
 
         for key, dest in extract_destinations.items():
-            assert "_extract/" in dest, f"Extract key '{key}' should route to _extract/ sibling dir"
+            assert (
+                "_extract/" in dest
+            ), f"Extract key '{key}' should route to _extract/ sibling dir"
 
         for key, dest in non_extract_destinations.items():
-            assert "_extract/" not in dest, f"Non-extract key '{key}' should stay at root"
+            assert (
+                "_extract/" not in dest
+            ), f"Non-extract key '{key}' should stay at root"
 
         # The two sets must be disjoint
         assert set(extract_keys).isdisjoint(set(non_extract_keys))
@@ -468,7 +526,7 @@ class TestJDBCWatermarkJobGenerator:
         # The Python source-level form of the validated literal (Black may
         # render the embedded " via escape or as a single-quoted string).
         assert (
-            'SQLInputValidator.string(\'Col"Name\')' in notebook
+            "SQLInputValidator.string('Col\"Name')" in notebook
             or 'SQLInputValidator.string("Col\\"Name")' in notebook
         ), notebook
         # Runtime ANSI-quoting helper is present — that's what doubles " at
