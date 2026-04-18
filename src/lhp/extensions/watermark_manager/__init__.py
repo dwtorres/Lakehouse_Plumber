@@ -11,6 +11,13 @@ from lhp.extensions.watermark_manager.exceptions import (
     WatermarkConcurrencyError,
     WatermarkValidationError,
 )
+from lhp.extensions.watermark_manager.sql_safety import (
+    SQLInputValidator,
+    sql_identifier,
+    sql_literal,
+    sql_numeric_literal,
+    sql_timestamp_literal,
+)
 
 __all__ = [
     "WatermarkManager",
@@ -18,4 +25,9 @@ __all__ = [
     "TerminalStateGuardError",
     "WatermarkValidationError",
     "WatermarkConcurrencyError",
+    "SQLInputValidator",
+    "sql_literal",
+    "sql_numeric_literal",
+    "sql_timestamp_literal",
+    "sql_identifier",
 ]
