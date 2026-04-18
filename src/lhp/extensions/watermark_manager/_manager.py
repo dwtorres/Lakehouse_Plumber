@@ -156,8 +156,7 @@ class WatermarkManager:
         self._validate_identifier(schema_name, "schema_name")
         self._validate_identifier(table_name, "table_name")
 
-        result = self.spark.sql(
-            f"""
+        result = self.spark.sql(f"""
             SELECT
                 run_id,
                 watermark_value,
@@ -178,8 +177,7 @@ class WatermarkManager:
                   AND table_name = '{table_name}'
               )
             LIMIT 1
-        """
-        ).collect()
+        """).collect()
 
         duration_ms = (time.time() - start_time) * 1000
 
