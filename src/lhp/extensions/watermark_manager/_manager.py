@@ -19,6 +19,7 @@ from pyspark.sql import SparkSession
 
 from lhp.extensions.watermark_manager.exceptions import (
     DuplicateRunError,
+    TerminalStateGuardError,
     WatermarkConcurrencyError,
 )
 from lhp.extensions.watermark_manager.sql_safety import (
@@ -551,38 +552,54 @@ class WatermarkManager:
     def mark_complete(
         self,
         run_id: str,
-        watermark_value: Optional[str],
+        watermark_value: Union[str, int, Decimal],
         row_count: int,
     ) -> None:
         """
-        Mark a run as completed with the final watermark value.
+        Transition a run from ``status='running'`` to ``status='completed'``.
 
-        Only succeeds when both bronze_stage_complete and silver_stage_complete
-        are true. Acts as a force-complete guard.
+        Wired into the extraction notebook outside the try/except per L2
+        §5.3, so a failure here does not re-enter the failure path. The
+        SQL ``WHERE`` clause carries the FR-L-06 terminal-failure guard:
+        the UPDATE refuses to overwrite ``failed`` / ``timed_out`` /
+        ``landed_not_committed`` rows. Zero affected rows triggers a
+        read-back of the current status and raises
+        ``TerminalStateGuardError`` (LHP-WM-002).
 
         Args:
             run_id: Run identifier.
-            watermark_value: Final watermark value from landed data.
+            watermark_value: Final watermark value from the landed batch
+                (str / int / Decimal). ``float`` is rejected.
             row_count: Number of rows extracted.
+
+        Raises:
+            WatermarkValidationError: An input failed validation.
+            TerminalStateGuardError: Row is in a terminal-failure state.
         """
         self._ensure_utc_session()
         start_time = time.time()
-        self._validate_identifier(run_id, "run_id")
 
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        watermark_val_sql = f"'{watermark_value}'" if watermark_value else "NULL"
+        SQLInputValidator.uuid_or_job_run_id(run_id)
+        SQLInputValidator.numeric(row_count)
+
+        wm_val_sql = _render_watermark_literal(watermark_value)
+        ts_literal = sql_timestamp_literal(datetime.now(tz=timezone.utc))
+        run_id_lit = sql_literal(run_id)
 
         complete_sql = f"""
             UPDATE {self.table_name}
             SET status = 'completed',
-                watermark_value = {watermark_val_sql},
-                row_count = {row_count},
-                completed_at = TIMESTAMP'{current_time}'
-            WHERE run_id = '{run_id}'
-              AND bronze_stage_complete = true
-              AND silver_stage_complete = true
+                watermark_value = {wm_val_sql},
+                row_count = {sql_numeric_literal(row_count)},
+                completed_at = {ts_literal}
+            WHERE run_id = {run_id_lit}
+              AND status NOT IN ('failed', 'timed_out', 'landed_not_committed')
         """
-        self.spark.sql(complete_sql)
+        affected = self._update_with_affected_rows(complete_sql)
+
+        if affected == 0:
+            current_status = self._read_back_status(run_id_lit)
+            raise TerminalStateGuardError(run_id=run_id, current_status=current_status)
 
         duration_ms = (time.time() - start_time) * 1000
         logger.info(
@@ -592,6 +609,41 @@ class WatermarkManager:
             row_count,
             duration_ms,
         )
+
+    def _update_with_affected_rows(self, sql: str) -> int:
+        """Execute an UPDATE / MERGE and return ``num_affected_rows``.
+
+        Mocks and older Spark versions may omit the metric; treat that as
+        success (1) so behaviour-only tests do not need to fabricate a
+        result row. The terminal-guard semantics depend on an explicit
+        zero, which Databricks does emit for UPDATE.
+        """
+        result = self.spark.sql(sql)
+        row = result.first() if result is not None else None
+        if row is None:
+            return 1
+        try:
+            return int(row["num_affected_rows"])
+        except (KeyError, IndexError, TypeError):
+            return 1
+
+    def _read_back_status(self, run_id_lit: str) -> Optional[str]:
+        """Best-effort read of the current status for a TerminalStateGuardError.
+
+        ``run_id_lit`` must already be SQL-quoted via ``sql_literal``.
+        Returns ``None`` if the row has been deleted between the UPDATE
+        and the read-back.
+        """
+        result = self.spark.sql(
+            f"SELECT status FROM {self.table_name} WHERE run_id = {run_id_lit} LIMIT 1"
+        )
+        row = result.first() if result is not None else None
+        if row is None:
+            return None
+        try:
+            return row["status"]
+        except (KeyError, IndexError, TypeError):
+            return None
 
     @staticmethod
     def _validate_date(value: str, field_name: str) -> None:
