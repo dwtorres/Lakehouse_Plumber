@@ -379,9 +379,9 @@ The template **must not**:
 
 | ID | Principle | Scope | Reason | Expiry |
 |---|---|---|---|---|
-| W-A-01 | **P6 (Retry safety by construction)** | Slice A only. Extraction landing remains shared append-only; retries can duplicate files. | Slice A is scoped to lifecycle + SQL safety + concurrency. Landing retry safety is a materially larger change (run-scoped paths, metadata columns, DLT-side dedupe verification) and ships in Slice B. | Expires when Slice B (Tasks #2, #3, #9) merges. Slice A **must not** ship to any production environment without Slice B also scheduled and owned. |
+| ~~W-A-01~~ | ~~**P6 (Retry safety by construction)**~~ | ~~Slice A only. Extraction landing remains shared append-only; retries can duplicate files.~~ | ~~Slice A is scoped to lifecycle + SQL safety + concurrency. Landing retry safety ships in Slice B.~~ | **DISCHARGED 2026-04-18**. Phase 2 ROADMAP plan 02-02 shipped run-scoped landing paths (`{landing_root}/_lhp_runs/{run_id}/`) plus `mark_landed` / `get_recoverable_landed_run` recovery semantics. Empirically validated end-to-end on Databricks serverless Jobs via the TD-007 Phase B harness (`scripts/validation/td007_phase_b_evidence.md`, run `281471321334282`). Decision and rationale captured in **ADR-001**. Constitution P6 is now satisfied by construction. |
 
-The waiver is explicit so that reviewers and operators know retry-safety is partially delivered and must not rely on Slice A alone in production. No other principle is waived.
+No active waivers remain. Slice A is ship-ready on P6 grounds; operational gates unchanged from Slice A exit criterion.
 
 ---
 

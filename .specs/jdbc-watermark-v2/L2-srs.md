@@ -74,23 +74,40 @@ The extraction notebook **must** construct and execute a JDBC read using `spark.
 
 The comparison operator **must** default to `>=`. The YAML config **may** override it to `>` via `watermark.operator`.
 
-### FR-05: Parquet Landing Write
+### FR-05: Parquet Landing Write (amended by ADR-001, 2026-04-18)
 
-The extraction notebook **must** write the JDBC result DataFrame as Parquet files to the path specified in `landing_path` using `df.write.mode("append").format("parquet").save(landing_path)`. The notebook **must not** truncate or overwrite existing landing files.
+The extraction notebook **must** write the JDBC result DataFrame as Parquet files to a **run-scoped subdirectory** under the configured `landing_path`:
 
-### FR-06: WatermarkManager Watermark Insert
+```python
+run_landing_path = f"{landing_path.rstrip('/')}/_lhp_runs/{run_id}"
+df.write.mode("overwrite").format("parquet").save(run_landing_path)
+```
 
-After a successful Parquet write, the extraction notebook **must** call `WatermarkManager.insert_new()` with:
-- `run_id`: a unique string derived from the pipeline name, action name, and current UTC timestamp formatted as `{pipeline}_{action_name}_{YYYYMMDD_HHMMSS}`
-- `source_system_id`: from `watermark.source_system_id` in the YAML config
-- `schema_name`: from `source.schema_name` in the YAML config (the JDBC source schema)
-- `table_name`: from `source.table_name` in the YAML config (the JDBC source table, unqualified)
-- `watermark_column_name`: from `watermark.column`
-- `watermark_value`: `str(df.agg({watermark_column: "max"}).collect()[0][0])` — computed from the landed DataFrame before write
-- `row_count`: `df.count()` — computed before write
-- `extraction_type`: `"incremental"` if HWM was present; `"full"` if HWM was None
+The notebook **must** use `mode("overwrite")` scoped to the per-run subdirectory. It **must not** write to `landing_path` directly; landing path is a logical root, never a destination Spark writes to. Distinct `run_id` values (per FR-L-09) produce distinct subdirectories, so sibling runs never collide and `overwrite` is bounded to the owning run.
 
-`WatermarkManager.insert_new()` **must** be called only after the Parquet write completes without error.
+**Rationale**: Satisfies Constitution P6 (retry safety by construction). Also enables post-write stats derivation per FR-06.
+
+**Supersedes**: prior `df.write.mode("append").format("parquet").save(landing_path)` into a shared path. The prior contract violated P6 and was discharged by Slice A waiver W-A-01, now discharged by this amendment.
+
+### FR-06: WatermarkManager Watermark Lifecycle (amended by ADR-001, 2026-04-18)
+
+The generated extraction notebook **must** commit the run lifecycle in the order `insert_new` → (JDBC read + landing write) → `mark_landed` → `mark_complete`. Slice A hardening (FR-L-01 through FR-L-09) adds the lifecycle control-flow contract (`insert_new` outside the try block, `mark_complete` outside the try block, `mark_failed` inside the except branch). This amendment pins the stats-derivation step:
+
+1. Call `WatermarkManager.insert_new()` **before** the extraction try block with `run_count=0` and `watermark_value=<previous HWM or None>`. `run_id` is supplied by `derive_run_id(dbutils)` (FR-L-09), not built from pipeline/action/timestamp strings.
+2. Inside the try block, read from JDBC, write the DataFrame to `run_landing_path` per FR-05.
+3. Read the **landed Parquet** back and derive stats from it:
+   ```python
+   landed = spark.read.format("parquet").load(run_landing_path)
+   stats = landed.agg(F.count("*").alias("row_count"), F.max(F.col(watermark_column)).alias("max_hwm")).first()
+   row_count = int(stats["row_count"])
+   new_hwm = stats["max_hwm"]
+   ```
+4. Call `WatermarkManager.mark_landed(run_id, watermark_value=str(new_hwm_or_previous), row_count=row_count)` to record the landed-not-committed intermediate state. This happens inside the post-write success branch.
+5. Call `WatermarkManager.mark_complete(run_id, watermark_value=str(new_hwm_or_previous), row_count=row_count)` **outside** the try block to finalize (per FR-L-01).
+
+On a subsequent run, the notebook **must** first call `WatermarkManager.get_recoverable_landed_run(source_system_id, schema_name, table_name)`. If it returns a non-None row, the notebook **must** finalize that prior run via `mark_complete` and exit via `dbutils.notebook.exit(...)` **without** reopening JDBC. This is the LANDED_NOT_COMMITTED recovery path required by Constitution P6.
+
+**Supersedes**: prior requirement that `watermark_value` and `row_count` be computed via `df.agg({watermark_column: "max"}).collect()[0][0]` and `df.count()` **before** the write. Those pre-write aggregations issued independent JDBC queries and produced values that did not describe the landed bytes. See ADR-001 for the full analysis.
 
 ### FR-07: DLT Pipeline Generation (Autoloader)
 
@@ -162,9 +179,11 @@ Validation failures **must** be reported as `LHPValidationError` with an `LHP-VA
 
 The generated extraction notebook **must** set `.option("queryTimeout", 3600)` on the JDBC reader. This caps a single JDBC read at one hour. Workflows exceeding this limit require manual partitioned-read configuration, which is out of scope for v2.
 
-### NFR-02: Performance — Landing File Size
+### NFR-02: Performance — Landing File Size (amended by ADR-001, 2026-04-18)
 
-The extraction notebook **must** call `df.repartition(1)` before writing Parquet when `row_count` is below 1,000,000, to avoid generating excessive small files that degrade Autoloader checkpoint performance. For `row_count` >= 1,000,000, the notebook **must** call `df.repartition(4)`. These are fixed defaults; dynamic tuning is deferred to v3.
+Under the run-scoped post-write-stats contract (FR-05, FR-06), the notebook does not have a pre-write `row_count` to branch on — stats derive from the landed Parquet after the write completes. The extraction notebook **should** default to a single repartition choice appropriate to the typical JDBC read shape (single connection → single partition → few output files). Dynamic repartition based on row-count thresholds is deferred to v3 and requires either a sampling step or a declarative hint from YAML.
+
+**Supersedes**: prior rule that branched `df.repartition(1)` vs `df.repartition(4)` on pre-write `row_count < 1,000,000`. That branch relied on a pre-write count that FR-06 no longer computes.
 
 ### NFR-03: Reliability — Idempotency
 
@@ -276,5 +295,5 @@ The Workflow resource YAML **must** be valid DAB YAML compatible with Databricks
 | A2 | Databricks Volume paths are accessible from both Job cluster and DLT pipeline cluster under the same service principal | Permission errors at runtime | Verify IAM / Volume grants in devtest |
 | A3 | `WatermarkManager._ensure_table_exists()` is idempotent and safe to call on every Job run | Table creation errors on concurrent first runs | Review `CREATE TABLE IF NOT EXISTS` DDL |
 | A4 | DAB `${resources.pipelines.X.id}` reference resolves correctly when Workflow and Pipeline are in the same bundle | Broken pipeline_task link at deploy time | `bundle validate` in integration test |
-| A5 | `df.count()` before write does not trigger a second full JDBC fetch (Spark caches the DataFrame after first action) | Double JDBC read, 2× source load | Verify with `.cache()` before `count()` + `write` |
+| A5 | ~~`df.count()` before write does not trigger a second full JDBC fetch (Spark caches the DataFrame after first action)~~ — **SUPERSEDED 2026-04-18 by ADR-001**. The assumption was materially wrong: uncached Spark DataFrames re-evaluate on every action, so any pre-write `df.count()` or `df.agg(...)` issued an independent JDBC query that could diverge from the eventual `df.write`. ADR-001 removes the assumption's load-bearing role by moving stats derivation to a post-write Parquet read. Retained here only for traceability. | N/A (assumption retired) | N/A (assumption retired) |
 | A6 | `WatermarkManager` identifier validation (alphanumeric + underscore + dot + hyphen) permits typical JDBC schema and table names | `insert_new()` raises `ValueError` for names with spaces or special chars | Validate against real source table names in devtest |
