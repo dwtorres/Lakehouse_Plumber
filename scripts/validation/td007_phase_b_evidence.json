@@ -1,0 +1,87 @@
+{
+  "meta": {
+    "timestamp": "2026-04-18T14:59:04+00:00",
+    "catalog": "main",
+    "schema": "orchestration",
+    "landing_root": "/Volumes/main/bronze/landing/td007_validation",
+    "source_system_id": "td007_validation"
+  },
+  "invariants": {
+    "V5": {
+      "verdict": "PASS",
+      "duration_s": 28.638898230999985,
+      "details": {
+        "tracked_runs": [
+          "local-3d8f656c-b1e6-4e48-a0b6-efaa8bd1503d",
+          "local-8f2d83ee-196f-45c7-b4dd-c917c0173644",
+          "local-7cedc466-0748-4374-a8e2-513cdae697d7"
+        ],
+        "distinct_subdirs_observed": [
+          "local-3d8f656c-b1e6-4e48-a0b6-efaa8bd1503d",
+          "local-7cedc466-0748-4374-a8e2-513cdae697d7",
+          "local-8f2d83ee-196f-45c7-b4dd-c917c0173644"
+        ],
+        "covered_by_this_test": [
+          "local-3d8f656c-b1e6-4e48-a0b6-efaa8bd1503d",
+          "local-7cedc466-0748-4374-a8e2-513cdae697d7",
+          "local-8f2d83ee-196f-45c7-b4dd-c917c0173644"
+        ],
+        "subdir_row_counts": {
+          "local-3d8f656c-b1e6-4e48-a0b6-efaa8bd1503d": 100,
+          "local-8f2d83ee-196f-45c7-b4dd-c917c0173644": 250,
+          "local-7cedc466-0748-4374-a8e2-513cdae697d7": 50
+        },
+        "ok": true
+      },
+      "error": null
+    },
+    "V6": {
+      "verdict": "PASS",
+      "duration_s": 34.530094220000024,
+      "details": {
+        "run_id": "local-07154aaa-d1bf-4cd8-8149-07d7c6cd3a77",
+        "observed_status": "completed",
+        "observed_row_count": 500,
+        "observed_watermark_value": "2023-11-16 02:08:19",
+        "expected_row_count": 500,
+        "expected_watermark_value": "2023-11-16 02:08:19",
+        "ok": true
+      },
+      "error": null
+    },
+    "V7": {
+      "verdict": "PASS",
+      "duration_s": 20.364991371999963,
+      "details": {
+        "run_id": "local-fa20ab9a-a9d0-4460-aea0-ffefcd02b2e7",
+        "recovered_run_id": "local-fa20ab9a-a9d0-4460-aea0-ffefcd02b2e7",
+        "recovered_row_count": 300,
+        "recovered_watermark_value": "2023-11-17 05:51:39",
+        "final_status": "completed",
+        "ok": true
+      },
+      "error": null
+    },
+    "V8": {
+      "verdict": "PASS",
+      "duration_s": 8.644516631999977,
+      "details": {
+        "tracked_runs": [
+          "local-364ffb70-6efb-418a-8353-b95cdf317a13",
+          "local-b9226a9e-5b7f-47a9-a2ac-d573d8058834"
+        ],
+        "expected_total": 200,
+        "observed_recursive_total_gte_expected": true,
+        "observed_recursive_total": 200,
+        "per_run_counts": {
+          "local-364ffb70-6efb-418a-8353-b95cdf317a13": 120,
+          "local-b9226a9e-5b7f-47a9-a2ac-d573d8058834": 80
+        },
+        "ok": true
+      },
+      "error": null
+    }
+  },
+  "overall_verdict": "PASS",
+  "failed_invariants": []
+}
