@@ -209,7 +209,17 @@ class WatermarkManager:
         table_name: str,
     ) -> Optional[Dict[str, Any]]:
         """
-        Get latest watermark for a table.
+        Return the most recent terminal-success watermark, or ``None``.
+
+        Filters strictly by ``status='completed'`` so non-terminal rows
+        (``running``, ``failed``, ``timed_out``, future ``landed_not_committed``)
+        cannot be picked up as the "latest" — that was the pre-Slice-A bug
+        FR-L-04 fixes. Same-second collisions tie-break deterministically by
+        ``run_id`` lexicographic descending.
+
+        Pre-migration tables that contain only orphan ``running`` rows
+        return ``None`` and emit a WARNING so the operator sees the
+        impending full-reload (FR-L-04 migration hazard / FR-L-M1).
 
         Args:
             source_system_id: Source system identifier.
@@ -217,16 +227,21 @@ class WatermarkManager:
             table_name: Table name.
 
         Returns:
-            Dictionary with watermark details or None if no watermark exists.
+            Dict with watermark details or ``None``.
         """
         self._ensure_utc_session()
         start_time = time.time()
 
-        self._validate_identifier(source_system_id, "source_system_id")
-        self._validate_identifier(schema_name, "schema_name")
-        self._validate_identifier(table_name, "table_name")
+        # source_system_id / schema_name / table_name form the watermark
+        # composite key; they are identifier-shaped data values stored in
+        # the table. Use the stricter identifier validator (which rejects
+        # ';', whitespace, control chars, and embedded quotes) so a
+        # malformed key cannot reach SQL even by accident.
+        SQLInputValidator.identifier(source_system_id)
+        SQLInputValidator.identifier(schema_name)
+        SQLInputValidator.identifier(table_name)
 
-        result = self.spark.sql(f"""
+        query = f"""
             SELECT
                 run_id,
                 watermark_value,
@@ -236,24 +251,21 @@ class WatermarkManager:
                 bronze_stage_complete,
                 silver_stage_complete
             FROM {self.table_name}
-            WHERE source_system_id = '{source_system_id}'
-              AND schema_name = '{schema_name}'
-              AND table_name = '{table_name}'
-              AND watermark_time = (
-                SELECT MAX(watermark_time)
-                FROM {self.table_name}
-                WHERE source_system_id = '{source_system_id}'
-                  AND schema_name = '{schema_name}'
-                  AND table_name = '{table_name}'
-              )
+            WHERE source_system_id = {sql_literal(source_system_id)}
+              AND schema_name = {sql_literal(schema_name)}
+              AND table_name = {sql_literal(table_name)}
+              AND status = 'completed'
+            ORDER BY watermark_time DESC, run_id DESC
             LIMIT 1
-        """).collect()
+        """
+        result = self.spark.sql(query).collect()
 
         duration_ms = (time.time() - start_time) * 1000
 
         if not result:
-            logger.info(
-                "No watermark found for %s.%s.%s (%.1f ms)",
+            logger.warning(
+                "No completed watermark for %s.%s.%s; next run will perform "
+                "a full load (pre-migration orphan or first run) (%.1f ms)",
                 source_system_id,
                 schema_name,
                 table_name,
