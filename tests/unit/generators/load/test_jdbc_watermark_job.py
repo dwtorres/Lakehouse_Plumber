@@ -102,7 +102,20 @@ class TestJDBCWatermarkJobGenerator:
         gen = JDBCWatermarkJobGenerator()
         gen.generate(action, {"flowgroup": fg})
         notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
-        assert "from lhp.extensions.watermark_manager import WatermarkManager" in notebook
+        # The L2 §5.3 restructure imports WatermarkManager + TerminalStateGuardError
+        # as a tuple; Black may wrap it across lines. Assert the import resolves
+        # WatermarkManager from the package, not the exact single-line form.
+        import ast
+
+        tree = ast.parse(notebook)
+        wm_imports = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.ImportFrom)
+            and n.module == "lhp.extensions.watermark_manager"
+            and any(alias.name == "WatermarkManager" for alias in n.names)
+        ]
+        assert wm_imports, "WatermarkManager must be imported from lhp.extensions.watermark_manager"
 
     def test_extraction_notebook_passes_spark_to_watermark_manager(self):
         """WatermarkManager constructor must receive spark as first arg."""
@@ -141,14 +154,25 @@ class TestJDBCWatermarkJobGenerator:
         assert "temporary_view" not in notebook
 
     def test_timestamp_watermark_quotes_hwm(self):
-        """Timestamp watermark WHERE clause should quote the HWM value and double-quote the column identifier."""
+        """Timestamp watermark branch quotes the HWM literal for the JDBC query.
+
+        The L2 §5.3 restructure builds the JDBC WHERE clause at notebook
+        runtime (not at Jinja render time). The timestamp branch must
+        therefore compose a single-quoted SQL literal from the validated
+        datetime; we assert the composition pattern is present rather than
+        a specific f-string shape.
+        """
         action = _make_v2_action(watermark_type="timestamp")
         fg = _make_flowgroup_with_write(action)
         gen = JDBCWatermarkJobGenerator()
         gen.generate(action, {"flowgroup": fg})
         notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
-        # Template should have a branch that quotes timestamp values
-        assert "'{" in notebook  # HWM value is single-quoted in the SQL WHERE clause
+        # Runtime single-quote wrap of the UTC ISO literal.
+        assert "hwm_literal" in notebook
+        assert "isoformat" in notebook
+        # The watermark column name survives into the Python source as a
+        # validated string literal (used by F.col at runtime and the JDBC
+        # identifier quoting helper).
         assert '"ModifiedDate"' in notebook
 
     def test_numeric_watermark_value_unquoted_column_quoted(self):
@@ -407,23 +431,46 @@ class TestJDBCWatermarkJobGenerator:
         assert set(extract_keys).isdisjoint(set(non_extract_keys))
 
     def test_watermark_column_unquoted_in_pyspark_and_metadata(self):
-        """F.col() and metadata kwarg use raw column name, not SQL-quoted."""
+        """Column name lives in a single validated variable used by F.col + kwarg.
+
+        The L2 §5.3 restructure threads the column name through a single
+        ``watermark_column = SQLInputValidator.string("...")`` binding; PySpark
+        receives it as ``F.col(watermark_column)`` and WatermarkManager
+        receives it as ``watermark_column_name=watermark_column``. That keeps
+        the raw identifier in exactly one place.
+        """
         action = _make_v2_action()
         fg = _make_flowgroup_with_write(action)
         gen = JDBCWatermarkJobGenerator()
         gen.generate(action, {"flowgroup": fg})
         notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
-        # PySpark F.col() should have raw column name (no SQL double-quotes)
-        assert 'F.col("ModifiedDate")' in notebook
-        # Metadata kwarg should have raw column name
-        assert 'watermark_column_name="ModifiedDate"' in notebook
+        # Validated binding contains the raw identifier as a Python literal.
+        assert 'SQLInputValidator.string("ModifiedDate")' in notebook
+        # PySpark uses the variable, not a repeated string literal.
+        assert "F.col(watermark_column)" in notebook
+        # insert_new receives the same validated variable.
+        assert "watermark_column_name=watermark_column" in notebook
 
     def test_column_with_embedded_quote_escaped(self):
-        """Column name containing double-quote is escaped per SQL standard (" → "")."""
+        """Column name with an embedded double-quote survives as Python-escaped literal.
+
+        Under the L2 §5.3 runtime-SQL model, the template no longer hand-rolls
+        the SQL identifier escape. Instead it emits the raw column as a Python
+        string literal; ``SQLInputValidator.string`` accepts the value and
+        ``_ansi_quote_identifier`` doubles embedded quotes at runtime before
+        splicing into the JDBC subquery.
+        """
         action = _make_v2_action(watermark_column='Col"Name')
         fg = _make_flowgroup_with_write(action)
         gen = JDBCWatermarkJobGenerator()
         gen.generate(action, {"flowgroup": fg})
         notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
-        # SQL WHERE clause: " in column name doubled per SQL standard
-        assert '\\"Col""Name\\"' in notebook
+        # The Python source-level form of the validated literal (Black may
+        # render the embedded " via escape or as a single-quoted string).
+        assert (
+            'SQLInputValidator.string(\'Col"Name\')' in notebook
+            or 'SQLInputValidator.string("Col\\"Name")' in notebook
+        ), notebook
+        # Runtime ANSI-quoting helper is present — that's what doubles " at
+        # execution time when composing the JDBC WHERE clause.
+        assert "_ansi_quote_identifier" in notebook
