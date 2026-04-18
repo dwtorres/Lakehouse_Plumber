@@ -185,6 +185,7 @@ class WatermarkManager:
                     bronze_stage_complete BOOLEAN NOT NULL,
                     silver_stage_complete BOOLEAN NOT NULL,
                     status STRING NOT NULL,
+                    error_class STRING,
                     error_message STRING,
                     created_at TIMESTAMP NOT NULL,
                     completed_at TIMESTAMP,
@@ -451,37 +452,68 @@ class WatermarkManager:
     def mark_failed(
         self,
         run_id: str,
+        error_class: str,
         error_message: str,
     ) -> None:
         """
-        Mark a run as failed.
+        Transition a run to ``status='failed'`` with truncated error fields.
+
+        Idempotent on ``failed`` → ``failed`` (latest-wins on
+        ``error_class`` / ``error_message`` / ``completed_at``). Refuses to
+        overwrite a row already in ``status='completed'``: zero affected
+        rows triggers a read-back and ``TerminalStateGuardError``
+        (FR-L-06a / LHP-WM-002).
 
         Args:
             run_id: Run identifier.
-            error_message: Error description.
+            error_class: Exception class name (e.g. ``type(e).__name__``);
+                stored verbatim, length-validated.
+            error_message: Error description; truncated at 4096 characters.
+
+        Raises:
+            WatermarkValidationError: Inputs failed validation.
+            TerminalStateGuardError: Row is in status='completed'.
         """
         self._ensure_utc_session()
         start_time = time.time()
 
-        self._validate_identifier(run_id, "run_id")
+        SQLInputValidator.uuid_or_job_run_id(run_id)
+        SQLInputValidator.string(error_class, max_len=512)
+        # error_message can legitimately contain quotes and longer text; the
+        # 4096-char cap (FR-L-02) is the only validation. Normalise control
+        # chars defensively by replacing them with spaces so the validator
+        # accepts the truncated form.
+        truncated = error_message[:4096]
+        sanitised = "".join(
+            (ch if (0x20 <= ord(ch) < 0x7F or ord(ch) > 0x7F) else " ")
+            for ch in truncated
+        )
+        SQLInputValidator.string(sanitised, max_len=4096)
 
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        error_message_escaped = error_message.replace("'", "''")
+        ts_literal = sql_timestamp_literal(datetime.now(tz=timezone.utc))
+        run_id_lit = sql_literal(run_id)
 
         fail_sql = f"""
             UPDATE {self.table_name}
             SET status = 'failed',
-                error_message = '{error_message_escaped}',
-                completed_at = TIMESTAMP'{current_time}'
-            WHERE run_id = '{run_id}'
+                error_class = {sql_literal(error_class)},
+                error_message = {sql_literal(sanitised)},
+                completed_at = {ts_literal}
+            WHERE run_id = {run_id_lit}
+              AND status IN ('running', 'failed', 'timed_out')
         """
-        self.spark.sql(fail_sql)
+        affected = self._update_with_affected_rows(fail_sql)
+
+        if affected == 0:
+            current_status = self._read_back_status(run_id_lit)
+            raise TerminalStateGuardError(run_id=run_id, current_status=current_status)
 
         duration_ms = (time.time() - start_time) * 1000
         logger.error(
-            "Run marked as failed: run_id=%s, error=%s (%.1f ms)",
+            "Run marked as failed: run_id=%s, class=%s, error=%s (%.1f ms)",
             run_id,
-            error_message,
+            error_class,
+            sanitised,
             duration_ms,
         )
 

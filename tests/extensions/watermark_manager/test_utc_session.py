@@ -119,7 +119,11 @@ def test_helper_is_idempotent() -> None:
         (
             "mark_failed",
             (),
-            dict(run_id="job-1-task-1-attempt-1", error_message="boom"),
+            dict(
+                run_id="job-1-task-1-attempt-1",
+                error_class="RuntimeError",
+                error_message="boom",
+            ),
         ),
         (
             "mark_bronze_complete",
