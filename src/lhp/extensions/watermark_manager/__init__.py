@@ -11,6 +11,7 @@ from lhp.extensions.watermark_manager.exceptions import (
     WatermarkConcurrencyError,
     WatermarkValidationError,
 )
+from lhp.extensions.watermark_manager.runtime import derive_run_id
 from lhp.extensions.watermark_manager.sql_safety import (
     SQLInputValidator,
     sql_identifier,
@@ -30,4 +31,5 @@ __all__ = [
     "sql_numeric_literal",
     "sql_timestamp_literal",
     "sql_identifier",
+    "derive_run_id",
 ]
