@@ -519,67 +519,78 @@ class WatermarkManager:
 
     def mark_bronze_complete(self, run_id: str) -> None:
         """
-        Mark bronze stage as complete for a run.
+        Mark bronze stage complete; auto-promote status if silver is already done.
 
-        Sets bronze_stage_complete=true and auto-completes the run
-        (status='completed') if silver stage is already done.
+        Adds the FR-L-06 terminal-failure guard: refuses to overwrite a row
+        in ``failed`` / ``timed_out`` / ``landed_not_committed`` and raises
+        ``TerminalStateGuardError`` (LHP-WM-002) when the UPDATE matches
+        zero rows.
 
         Args:
             run_id: Run identifier.
+
+        Raises:
+            WatermarkValidationError: ``run_id`` failed validation.
+            TerminalStateGuardError: Row is in a terminal-failure state.
         """
-        self._ensure_utc_session()
-        start_time = time.time()
-        self._validate_identifier(run_id, "run_id")
-
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        update_sql = f"""
-            UPDATE {self.table_name}
-            SET bronze_stage_complete = true,
-                status = CASE WHEN silver_stage_complete = true THEN 'completed' ELSE status END,
-                completed_at = CASE WHEN silver_stage_complete = true THEN TIMESTAMP'{current_time}' ELSE completed_at END
-            WHERE run_id = '{run_id}'
-        """
-        self.spark.sql(update_sql)
-
-        duration_ms = (time.time() - start_time) * 1000
-        logger.info(
-            "Bronze stage marked complete: run_id=%s (%.1f ms)",
-            run_id,
-            duration_ms,
+        self._stage_complete(
+            run_id=run_id,
+            stage_flag="bronze_stage_complete",
+            other_flag="silver_stage_complete",
+            log_msg="Bronze stage marked complete",
         )
 
     def mark_silver_complete(self, run_id: str) -> None:
         """
-        Mark silver stage as complete for a run.
+        Mark silver stage complete; auto-promote status if bronze is already done.
 
-        Sets silver_stage_complete=true and auto-completes the run
-        (status='completed') if bronze stage is already done.
+        See ``mark_bronze_complete`` for the shared semantics + guards.
+        """
+        self._stage_complete(
+            run_id=run_id,
+            stage_flag="silver_stage_complete",
+            other_flag="bronze_stage_complete",
+            log_msg="Silver stage marked complete",
+        )
 
-        Args:
-            run_id: Run identifier.
+    def _stage_complete(
+        self,
+        *,
+        run_id: str,
+        stage_flag: str,
+        other_flag: str,
+        log_msg: str,
+    ) -> None:
+        """Shared implementation for bronze/silver stage-complete UPDATE.
+
+        ``stage_flag`` is the column to set TRUE; ``other_flag`` is the
+        sibling whose value triggers status auto-promotion to 'completed'.
+        Both are internal column names — never user input — so they are
+        not interpolated through SQLInputValidator.
         """
         self._ensure_utc_session()
         start_time = time.time()
-        self._validate_identifier(run_id, "run_id")
 
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        SQLInputValidator.uuid_or_job_run_id(run_id)
+        run_id_lit = sql_literal(run_id)
+        ts_literal = sql_timestamp_literal(datetime.now(tz=timezone.utc))
 
         update_sql = f"""
             UPDATE {self.table_name}
-            SET silver_stage_complete = true,
-                status = CASE WHEN bronze_stage_complete = true THEN 'completed' ELSE status END,
-                completed_at = CASE WHEN bronze_stage_complete = true THEN TIMESTAMP'{current_time}' ELSE completed_at END
-            WHERE run_id = '{run_id}'
+            SET {stage_flag} = true,
+                status = CASE WHEN {other_flag} = true THEN 'completed' ELSE status END,
+                completed_at = CASE WHEN {other_flag} = true THEN {ts_literal} ELSE completed_at END
+            WHERE run_id = {run_id_lit}
+              AND status NOT IN ('failed', 'timed_out', 'landed_not_committed')
         """
-        self.spark.sql(update_sql)
+        affected = self._update_with_affected_rows(update_sql)
+
+        if affected == 0:
+            current_status = self._read_back_status(run_id_lit)
+            raise TerminalStateGuardError(run_id=run_id, current_status=current_status)
 
         duration_ms = (time.time() - start_time) * 1000
-        logger.info(
-            "Silver stage marked complete: run_id=%s (%.1f ms)",
-            run_id,
-            duration_ms,
-        )
+        logger.info("%s: run_id=%s (%.1f ms)", log_msg, run_id, duration_ms)
 
     def mark_complete(
         self,
