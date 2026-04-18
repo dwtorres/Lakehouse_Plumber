@@ -5,5 +5,17 @@ use ``from lhp.extensions.watermark_manager import WatermarkManager`` unchanged.
 """
 
 from lhp.extensions.watermark_manager._manager import WatermarkManager
+from lhp.extensions.watermark_manager.exceptions import (
+    DuplicateRunError,
+    TerminalStateGuardError,
+    WatermarkConcurrencyError,
+    WatermarkValidationError,
+)
 
-__all__ = ["WatermarkManager"]
+__all__ = [
+    "WatermarkManager",
+    "DuplicateRunError",
+    "TerminalStateGuardError",
+    "WatermarkValidationError",
+    "WatermarkConcurrencyError",
+]

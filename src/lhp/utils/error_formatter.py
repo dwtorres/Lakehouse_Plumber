@@ -17,6 +17,7 @@ class ErrorCategory(Enum):
     DEPENDENCY = "DEP"  # Dependency errors
     ACTION = "ACT"  # Action type errors
     GENERAL = "GEN"  # General errors
+    WATERMARK = "WM"  # Watermark manager errors (LHP-WM-*)
 
 
 class LHPError(Exception):
@@ -46,7 +47,8 @@ class LHPError(Exception):
         self.example = example
         self.context = context or {}
         self.doc_link = (
-            doc_link or "https://lakehouse-plumber.readthedocs.io/en/latest/errors_reference.html"
+            doc_link
+            or "https://lakehouse-plumber.readthedocs.io/en/latest/errors_reference.html"
         )
 
         # Format the complete error message
