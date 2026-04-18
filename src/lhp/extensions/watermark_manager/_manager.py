@@ -83,6 +83,18 @@ class WatermarkManager:
                 "Only alphanumeric characters, underscores, dots, and hyphens are allowed."
             )
 
+    def _ensure_utc_session(self) -> None:
+        """
+        Set ``spark.sql.session.timeZone`` to UTC on the active Spark session.
+
+        Watermark TIMESTAMP literals are normalised to UTC by
+        ``sql_timestamp_literal``; the readback path must interpret them in
+        the same timezone or round-trips drift by the local UTC offset.
+        Idempotent: repeated calls with the same value are no-ops in Spark.
+        See FR-L-07 / AC-SA-28.
+        """
+        self.spark.conf.set("spark.sql.session.timeZone", "UTC")
+
     def _ensure_table_exists(self) -> None:
         """
         Ensure watermarks table exists with proper schema.
@@ -90,6 +102,7 @@ class WatermarkManager:
         Creates the Delta table with liquid clustering if it does not exist.
         Unity Catalog DDL only.
         """
+        self._ensure_utc_session()
         start_time = time.time()
 
         namespace = f"{self.catalog}.{self.schema}"
@@ -150,6 +163,7 @@ class WatermarkManager:
         Returns:
             Dictionary with watermark details or None if no watermark exists.
         """
+        self._ensure_utc_session()
         start_time = time.time()
 
         self._validate_identifier(source_system_id, "source_system_id")
@@ -241,6 +255,7 @@ class WatermarkManager:
         Raises:
             ValueError: If run_id already exists or identifiers are invalid.
         """
+        self._ensure_utc_session()
         start_time = time.time()
 
         self._validate_identifier(run_id, "run_id")
@@ -323,6 +338,7 @@ class WatermarkManager:
             run_id: Run identifier.
             error_message: Error description.
         """
+        self._ensure_utc_session()
         start_time = time.time()
 
         self._validate_identifier(run_id, "run_id")
@@ -357,6 +373,7 @@ class WatermarkManager:
         Args:
             run_id: Run identifier.
         """
+        self._ensure_utc_session()
         start_time = time.time()
         self._validate_identifier(run_id, "run_id")
 
@@ -388,6 +405,7 @@ class WatermarkManager:
         Args:
             run_id: Run identifier.
         """
+        self._ensure_utc_session()
         start_time = time.time()
         self._validate_identifier(run_id, "run_id")
 
@@ -426,6 +444,7 @@ class WatermarkManager:
             watermark_value: Final watermark value from landed data.
             row_count: Number of rows extracted.
         """
+        self._ensure_utc_session()
         start_time = time.time()
         self._validate_identifier(run_id, "run_id")
 
@@ -480,6 +499,7 @@ class WatermarkManager:
         Returns:
             Number of runs marked as timed_out.
         """
+        self._ensure_utc_session()
         start_time = time.time()
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         timeout_hours = int(stale_timeout_hours)
