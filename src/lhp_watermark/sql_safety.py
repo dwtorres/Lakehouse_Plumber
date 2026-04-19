@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Union
 
-from lhp.extensions.watermark_manager.exceptions import WatermarkValidationError
+from lhp_watermark.exceptions import WatermarkValidationError
 
 # Bare identifier:  word [ . word ]*   where word matches Python-ident-like rules.
 _IDENT_BARE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")

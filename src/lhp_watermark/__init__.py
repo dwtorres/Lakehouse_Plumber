@@ -1,18 +1,18 @@
 """LHP watermark manager package.
 
 Re-exports the public API from internal submodules so callers can continue to
-use ``from lhp.extensions.watermark_manager import WatermarkManager`` unchanged.
+use ``from lhp_watermark import WatermarkManager`` unchanged.
 """
 
-from lhp.extensions.watermark_manager._manager import WatermarkManager
-from lhp.extensions.watermark_manager.exceptions import (
+from lhp_watermark.watermark_manager import WatermarkManager
+from lhp_watermark.exceptions import (
     DuplicateRunError,
     TerminalStateGuardError,
     WatermarkConcurrencyError,
     WatermarkValidationError,
 )
-from lhp.extensions.watermark_manager.runtime import derive_run_id
-from lhp.extensions.watermark_manager.sql_safety import (
+from lhp_watermark.runtime import derive_run_id
+from lhp_watermark.sql_safety import (
     SQLInputValidator,
     sql_identifier,
     sql_literal,

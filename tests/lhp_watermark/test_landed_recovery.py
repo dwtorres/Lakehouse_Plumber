@@ -48,7 +48,7 @@ class _ScriptedSpark:
 
 
 def _make_wm(spark: _ScriptedSpark) -> Any:
-    from lhp.extensions.watermark_manager import WatermarkManager
+    from lhp_watermark import WatermarkManager
 
     pending = list(spark.script)
     spark.script.clear()

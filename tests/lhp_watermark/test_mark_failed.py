@@ -65,7 +65,7 @@ class _ScriptedSpark:
 
 
 def _make_wm(spark: _ScriptedSpark) -> Any:
-    from lhp.extensions.watermark_manager import WatermarkManager
+    from lhp_watermark import WatermarkManager
 
     pending = list(spark.script)
     spark.script.clear()
@@ -79,7 +79,7 @@ def _make_wm(spark: _ScriptedSpark) -> Any:
 
 
 def test_signature_carries_error_class_required_param() -> None:
-    from lhp.extensions.watermark_manager import WatermarkManager
+    from lhp_watermark import WatermarkManager
 
     sig = inspect.signature(WatermarkManager.mark_failed)
     assert "error_class" in sig.parameters
@@ -148,7 +148,7 @@ def test_error_message_is_truncated_at_4096_characters() -> None:
 
 def test_zero_affected_on_completed_raises_terminal_state_guard_error() -> None:
     """Caller invoked mark_failed on a row already in status='completed'."""
-    from lhp.extensions.watermark_manager import TerminalStateGuardError
+    from lhp_watermark import TerminalStateGuardError
 
     spark = _ScriptedSpark(script=[0, {"status": "completed"}])
     wm = _make_wm(spark)
@@ -182,7 +182,7 @@ def test_idempotent_on_failed_to_failed_with_latest_wins() -> None:
 
 
 def test_rejects_invalid_run_id_before_any_sql() -> None:
-    from lhp.extensions.watermark_manager import WatermarkValidationError
+    from lhp_watermark import WatermarkValidationError
 
     spark = _ScriptedSpark(script=[])
     wm = _make_wm(spark)
@@ -196,7 +196,7 @@ def test_rejects_invalid_run_id_before_any_sql() -> None:
 
 
 def test_rejects_error_class_with_control_chars() -> None:
-    from lhp.extensions.watermark_manager import WatermarkValidationError
+    from lhp_watermark import WatermarkValidationError
 
     spark = _ScriptedSpark(script=[])
     wm = _make_wm(spark)

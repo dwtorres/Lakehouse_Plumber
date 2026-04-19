@@ -39,7 +39,7 @@ class _RecordingSpark:
 
 
 def _make_wm(spark: _RecordingSpark) -> Any:
-    from lhp.extensions.watermark_manager import WatermarkManager
+    from lhp_watermark import WatermarkManager
 
     wm = WatermarkManager(spark, catalog="metadata", schema="orchestration")
     spark.statements.clear()
@@ -126,7 +126,7 @@ def test_returns_none_when_no_completed_row(caplog: Any) -> None:
     spark = _RecordingSpark(rows=[])
     wm = _make_wm(spark)
     with caplog.at_level(
-        logging.WARNING, logger="lhp.extensions.watermark_manager._manager"
+        logging.WARNING, logger="lhp_watermark.watermark_manager"
     ):
         result = wm.get_latest_watermark(**_kwargs())
     assert result is None
@@ -153,7 +153,7 @@ def test_returns_none_when_no_completed_row(caplog: Any) -> None:
 def test_rejects_adversarial_inputs_before_any_spark_sql(
     field: str, bad_value: str
 ) -> None:
-    from lhp.extensions.watermark_manager import WatermarkValidationError
+    from lhp_watermark import WatermarkValidationError
 
     spark = _RecordingSpark(rows=[])
     wm = _make_wm(spark)

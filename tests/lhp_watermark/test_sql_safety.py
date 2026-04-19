@@ -14,8 +14,8 @@ from decimal import Decimal
 
 import pytest
 
-from lhp.extensions.watermark_manager import WatermarkValidationError
-from lhp.extensions.watermark_manager.sql_safety import (
+from lhp_watermark import WatermarkValidationError
+from lhp_watermark.sql_safety import (
     SQLInputValidator,
     sql_identifier,
     sql_literal,

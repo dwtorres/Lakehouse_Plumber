@@ -20,7 +20,7 @@ from lhp.utils.error_formatter import LHPError
 
 
 def test_all_four_exception_classes_importable_from_package_root() -> None:
-    from lhp.extensions.watermark_manager import (  # noqa: F401
+    from lhp_watermark import (  # noqa: F401
         DuplicateRunError,
         TerminalStateGuardError,
         WatermarkValidationError,
@@ -38,7 +38,7 @@ def test_all_four_exception_classes_importable_from_package_root() -> None:
     ],
 )
 def test_error_code_is_class_attribute(class_name: str, expected_code: str) -> None:
-    import lhp.extensions.watermark_manager as wm
+    import lhp_watermark as wm
 
     cls = getattr(wm, class_name)
     assert (
@@ -56,14 +56,14 @@ def test_error_code_is_class_attribute(class_name: str, expected_code: str) -> N
     ],
 )
 def test_inherits_lhp_error(class_name: str) -> None:
-    import lhp.extensions.watermark_manager as wm
+    import lhp_watermark as wm
 
     cls = getattr(wm, class_name)
     assert issubclass(cls, LHPError), f"{class_name} must inherit LHPError"
 
 
 def test_duplicate_run_error_carries_run_id_and_single_line_str() -> None:
-    from lhp.extensions.watermark_manager import DuplicateRunError
+    from lhp_watermark import DuplicateRunError
 
     exc = DuplicateRunError(run_id="job-1-task-2-attempt-3")
     assert exc.run_id == "job-1-task-2-attempt-3"
@@ -74,7 +74,7 @@ def test_duplicate_run_error_carries_run_id_and_single_line_str() -> None:
 
 
 def test_terminal_state_guard_error_carries_run_id_and_status() -> None:
-    from lhp.extensions.watermark_manager import TerminalStateGuardError
+    from lhp_watermark import TerminalStateGuardError
 
     exc = TerminalStateGuardError(run_id="r1", current_status="completed")
     assert exc.run_id == "r1"
@@ -86,7 +86,7 @@ def test_terminal_state_guard_error_carries_run_id_and_status() -> None:
 
 
 def test_watermark_validation_error_carries_field_value_reason() -> None:
-    from lhp.extensions.watermark_manager import WatermarkValidationError
+    from lhp_watermark import WatermarkValidationError
 
     exc = WatermarkValidationError(
         field="run_id",
@@ -103,7 +103,7 @@ def test_watermark_validation_error_carries_field_value_reason() -> None:
 
 
 def test_watermark_concurrency_error_carries_run_id_and_attempts() -> None:
-    from lhp.extensions.watermark_manager import WatermarkConcurrencyError
+    from lhp_watermark import WatermarkConcurrencyError
 
     exc = WatermarkConcurrencyError(run_id="r1", attempts=5)
     assert exc.run_id == "r1"
@@ -120,7 +120,7 @@ def test_str_form_is_safe_for_mark_failed_truncation() -> None:
     Asserts that str() is short and printable so the truncation slice
     does not produce mojibake or split a multi-byte sequence at the boundary.
     """
-    from lhp.extensions.watermark_manager import (
+    from lhp_watermark import (
         DuplicateRunError,
         TerminalStateGuardError,
         WatermarkConcurrencyError,

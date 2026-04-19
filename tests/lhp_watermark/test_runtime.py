@@ -1,4 +1,4 @@
-"""Tests for ``lhp.extensions.watermark_manager.runtime.derive_run_id``.
+"""Tests for ``lhp_watermark.runtime.derive_run_id``.
 
 Covers FR-L-09 / L3 §4.2.4 / AC-SA-32..34:
 
@@ -20,10 +20,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from lhp.extensions.watermark_manager import derive_run_id
-from lhp.extensions.watermark_manager.exceptions import WatermarkValidationError
+from lhp_watermark import derive_run_id
+from lhp_watermark.exceptions import WatermarkValidationError
 
-_RUNTIME_LOGGER = "lhp.extensions.watermark_manager.runtime"
+_RUNTIME_LOGGER = "lhp_watermark.runtime"
 _LOCAL_UUID_RE = re.compile(r"^local-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
@@ -157,7 +157,7 @@ class TestFallbackPath:
         assert _LOCAL_UUID_RE.match(result), result
 
     def test_fallback_result_matches_uuid_or_job_run_id_validator(self):
-        from lhp.extensions.watermark_manager import SQLInputValidator
+        from lhp_watermark import SQLInputValidator
 
         dbutils = _make_dbutils(widget_raises=True, context_raises=True)
         result = derive_run_id(dbutils)
