@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import pytest
 
-from lhp.utils.error_formatter import LHPError
+from lhp_watermark.exceptions import LHPError
 
 
 def test_all_four_exception_classes_importable_from_package_root() -> None:
