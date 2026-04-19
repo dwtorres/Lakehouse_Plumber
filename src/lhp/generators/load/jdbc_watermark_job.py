@@ -16,6 +16,7 @@ import black
 
 from ...core.base_generator import BaseActionGenerator
 from ...models.config import Action
+from ...utils.error_formatter import ErrorCategory, LHPConfigError
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,9 @@ _CLOUDFILES_PASSTHROUGH_KEYS = {
 
 # Pattern to match ${secret:scope/key} references
 _SECRET_REF_RE = re.compile(r"\$\{secret:([^/]+)/([^}]+)\}")
+
+# Matches UC managed volume paths: /Volumes/<catalog>/<schema>/...
+_UC_VOLUME_RE = re.compile(r"^/Volumes/([^/]+)/([^/]+)/")
 
 
 def _resolve_secret_refs(value: str) -> str:
@@ -105,6 +109,72 @@ def _has_schema_location(source_config: Dict[str, Any]) -> bool:
     return False
 
 
+def _check_landing_schema_overlap(
+    action: Action, flowgroup: object
+) -> None:
+    """Raise LHPConfigError when landing_path shares catalog+schema with bronze write target.
+
+    Only applies to UC managed volume paths (/Volumes/<catalog>/<schema>/...).
+    Cross-catalog placements are unusual but legitimate; emit a warning only.
+    """
+    landing_path = (action.landing_path or "").strip()
+    volume_match = _UC_VOLUME_RE.match(landing_path)
+    if not volume_match:
+        return
+
+    landing_catalog = volume_match.group(1)
+    landing_schema = volume_match.group(2)
+
+    write_action = next(
+        (
+            a
+            for a in getattr(flowgroup, "actions", [])
+            if getattr(a, "type", None) == "write"
+            and getattr(a, "write_target", None) is not None
+        ),
+        None,
+    )
+    if write_action is None:
+        return
+
+    write_catalog = getattr(write_action.write_target, "catalog", None) or ""
+    write_schema = getattr(write_action.write_target, "schema", None) or ""
+
+    if landing_catalog != write_catalog:
+        logger.warning(
+            f"Action '{action.name}': landing_path catalog '{landing_catalog}' differs "
+            f"from bronze write catalog '{write_catalog}' — cross-catalog landing is "
+            f"unusual; verify this is intentional for the {'{env}_edp_{medallion}'} shape."
+        )
+        return
+
+    if landing_schema == write_schema:
+        raise LHPConfigError(
+            category=ErrorCategory.CONFIG,
+            code_number="018",
+            title="landing_path overlaps bronze write schema",
+            details=(
+                f"Action '{action.name}' writes landing Parquet to "
+                f"'/Volumes/{landing_catalog}/{landing_schema}/...' which is the same "
+                f"Unity Catalog schema as its bronze write target "
+                f"('{write_catalog}.{write_schema}'). "
+                "AutoLoader and managed Delta tables must not share a UC schema — "
+                "this causes LOCATION_OVERLAP errors at pipeline startup."
+            ),
+            context={
+                "action": action.name,
+                "landing_path": landing_path,
+                "landing_schema": f"{landing_catalog}.{landing_schema}",
+                "bronze_schema": f"{write_catalog}.{write_schema}",
+            },
+            suggestions=[
+                f"Move landing_path to a dedicated schema, e.g. "
+                f"'/Volumes/{landing_catalog}/landing_{landing_schema}/...'",
+                "Or use an external location (abfss://) for the landing zone.",
+            ],
+        )
+
+
 class JDBCWatermarkJobGenerator(BaseActionGenerator):
     """Generator for jdbc_watermark_v2 source type.
 
@@ -125,6 +195,8 @@ class JDBCWatermarkJobGenerator(BaseActionGenerator):
         source_config = action.source if isinstance(action.source, dict) else {}
         watermark = action.watermark
         flowgroup = context.get("flowgroup")
+
+        _check_landing_schema_overlap(action, flowgroup)
 
         # Derive context values
         source_system_id = (
