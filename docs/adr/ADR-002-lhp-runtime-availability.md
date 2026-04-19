@@ -1,7 +1,8 @@
-# ADR-002: LHP Runtime Availability via Namespace Extraction + Git Folder Deploy
+# ADR-002: LHP Runtime Availability via Namespace Extraction + DAB Workspace File Sync
 
 **Status**: Proposed
 **Date**: 2026-04-18
+**Amended**: 2026-04-19 — deploy mechanism simplified from Databricks Git Folder (`databricks repos update`) to DAB workspace-file sync (`databricks bundle deploy` alone). Rationale: `databricks bundle deploy` already syncs repo contents including `src/lhp_watermark/` to `${workspace.file_path}/src/…`; no reason to layer a second deploy mechanism. Single-mechanism deploy keeps watermark-branch parity and drops ~40 test/fixture changes that a git-folder anchor would have required across `pipeline_resource.yml.j2`. Title, Decision, Deployment shape, Consequences, Risks, Open Questions below reflect the amendment. Alternatives table and Constitution compliance unchanged.
 **Deciders**: Fork maintainer (David Torres), to be reviewed
 **Supersedes**: none
 **Superseded-by**: none
@@ -68,20 +69,20 @@ The fork's `WatermarkManager` Python class plus wheel-dependency deployment viol
 
 ## Decision
 
-**Adopt Path 5: Namespace extraction + Git folder deploy.**
+**Adopt Path 5: Namespace extraction + DAB workspace-file sync.**
 
 1. Rename `src/lhp/extensions/watermark_manager/` → `src/lhp_watermark/` — a **distinct top-level Python package**, sibling to `src/lhp/`, *not* a submodule of it.
 2. LHP (`src/lhp/`) reverts to pure code generator. Zero runtime role.
-3. Generated extraction notebooks import the runtime from the external library: `from lhp_watermark.watermark_manager import WatermarkManager`.
-4. Runtime deploys via Databricks Git Folder synced by CI/CD (`databricks repos update … --branch <deploy-branch>`), not via a Python wheel attached to the workflow.
-5. The generated DAB workflow resource drops its `environments` / `dependencies` block and references notebook paths resolvable inside the synced git folder.
+3. Generated extraction notebooks import the runtime from the external library: `from lhp_watermark import WatermarkManager` (package-level re-export; sub-module form also valid).
+4. Runtime deploys via the existing DAB workspace-file sync (`databricks bundle deploy`). `src/lhp_watermark/` ships as a regular workspace file alongside generated notebooks; no Python wheel, no separate `databricks repos update` step.
+5. The generated DAB workflow resource drops its `environments` / `dependencies` block (wheel attachment) but keeps the existing `${workspace.file_path}/generated/${bundle.target}/…` notebook_path anchor. Only the wheel block and `environment_key` are removed; `source: WORKSPACE` is added.
 
 ### Concrete deployment shape
 
 Repo layout (post-Path-5):
 
 ```
-Lakehouse_Plumber/                     ← Databricks Git Folder root
+Lakehouse_Plumber/                     ← DAB bundle root (also git repo)
 ├── src/
 │   ├── lhp/                            ← pure code generator (no runtime role)
 │   └── lhp_watermark/                  ← runtime library (distinct package)
@@ -90,8 +91,8 @@ Lakehouse_Plumber/                     ← Databricks Git Folder root
 │       ├── sql_safety.py
 │       ├── exceptions.py
 │       └── runtime.py
-├── generated/${env}/                   ← pushed per CI run (ephemeral branch)
-│   └── {pipeline}/__lhp_extract_{action}.py
+├── generated/${bundle.target}/         ← written by `lhp generate`; synced by `databricks bundle deploy`
+│   └── {pipeline}_extract/__lhp_extract_{action}.py
 └── resources/lhp/                      ← DAB resource YAMLs
 ```
 
@@ -99,17 +100,12 @@ CI pipeline per environment:
 
 ```bash
 lhp generate --env ${env}
-git add generated/${env}/ resources/lhp/${env}/
-git commit -m "deploy(${env}): regen for ${COMMIT_SHA}"
-git push origin deploy/${env}/${COMMIT_SHA}
-
-databricks --profile ${PROFILE} repos update \
-  /Workspace/${env}/Lakehouse_Plumber --branch deploy/${env}/${COMMIT_SHA}
-
 databricks --profile ${PROFILE} bundle deploy -t ${env}
 ```
 
-Generated workflow resource YAML (post-change):
+Single command. DAB syncs the repo (including `src/lhp_watermark/` and `generated/${bundle.target}/`) to the workspace under `${workspace.file_path}/…` and registers the workflow + DLT resources. No separate git-folder step, no ephemeral-branch git push.
+
+Generated workflow resource YAML (post-change — minimal diff from watermark branch):
 
 ```yaml
 resources:
@@ -119,14 +115,21 @@ resources:
       tasks:
         - task_key: extract_{{ action_name }}
           notebook_task:
-            notebook_path: /Workspace/${var.env}/Lakehouse_Plumber/generated/${var.env}/{{ pipeline_name }}/__lhp_extract_{{ action_name }}
+            notebook_path: ${workspace.file_path}/generated/${bundle.target}/{{ pipeline_name }}_extract/__lhp_extract_{{ action_name }}
             source: WORKSPACE
 ```
+
+Only three diffs from watermark branch template:
+1. The entire `environments:` block (wheel attachment) is removed.
+2. `environment_key: lhp_env` is removed from each extraction task.
+3. `source: WORKSPACE` is added under each extraction task's `notebook_task`.
+
+The `notebook_path` anchor (`${workspace.file_path}/generated/${bundle.target}/…`) is **unchanged** — matching the `pipeline_resource.yml.j2` convention app-wide.
 
 Generated extraction notebook (only the import lines change from current template):
 
 ```python
-from lhp_watermark.watermark_manager import (
+from lhp_watermark import (
     TerminalStateGuardError,
     WatermarkManager,
 )
@@ -134,7 +137,7 @@ from lhp_watermark.runtime import derive_run_id
 from lhp_watermark.sql_safety import SQLInputValidator
 ```
 
-Databricks Runtime adds the synced Git Folder root to `sys.path` for notebook-task execution; `src/lhp_watermark/` is reachable as the top-level `lhp_watermark` package *if the anchor is `…/Lakehouse_Plumber/src/`*. If the anchor is `…/Lakehouse_Plumber/` only, a one-line `sys.path.insert(0, "/Workspace/${env}/Lakehouse_Plumber/src")` prelude is emitted by the template. Resolved empirically in Phase 4 probe (see Open Questions Q1).
+`src/lhp_watermark/` lands at `${workspace.file_path}/src/lhp_watermark/` via DAB workspace-file sync. Databricks Runtime's `sys.path` for notebook-task execution may or may not include `${workspace.file_path}/src/` automatically. Resolved empirically in Phase 4 probe (see Open Questions Q1). If the anchor is `${workspace.file_path}` only, a one-line `sys.path.insert(0, "${workspace.file_path}/src")` prelude is emitted in the generated notebook template.
 
 ### Why `lhp_watermark` (not `watermark_runtime`, not `cnh_watermark`)
 
@@ -164,11 +167,11 @@ Databricks Runtime adds the synced Git Folder root to `sys.path` for notebook-ta
 | All six safety features preserved | ❌ rebuilt in orchestrator | ✅ | ✅ | ✅ |
 | Upstream issue #65 scope compatible | ✅ | ✅ | ⚠️ | ✅ |
 | User-sunk runtime code preserved | ❌ rewrite | ✅ | ✅ | ✅ (mechanical rename) |
-| Git folder deploy (no wheel) | N/A | ✅ | ✅ | ✅ |
-| One runtime instance per workspace | N/A | ❌ (per bundle) | ✅ | ✅ |
+| Deploy without wheel | N/A | ✅ | ✅ | ✅ (via DAB workspace-file sync; amended 2026-04-19) |
+| One runtime instance per bundle/workspace | N/A | ❌ (per bundle) | one per workspace (git folder) | **one per bundle** (workspace files; simpler, matches watermark branch) |
 | Future upstream contribution path | Direct | Hard | Unlikely | Mode-A additive contribution possible |
 | Constitution P2 literal text | ✅ | ✅ | ⚠️ conflict | ✅ (with amendment §Compliance) |
-| Migration cost | Complete rewrite | Big refactor | CI change only | **Mechanical rename + CI change** |
+| Migration cost | Complete rewrite | Big refactor | CI change only | **Mechanical rename; minimal template/generator diff** |
 
 ---
 
@@ -178,45 +181,45 @@ Databricks Runtime adds the synced Git Folder root to `sys.path` for notebook-ta
 
 - **Upstream alignment**: generated code contains no `lhp.*` imports; LHP reverts to upstream's stated role of pure code generator.
 - **Safety features preserved**: all six `WatermarkManager` safety features remain intact through a mechanical rename; no behavior change.
-- **One runtime per workspace**: upgrades propagate via `databricks repos update`, not via rebuild-and-redeploy of every bundle's wheel.
+- **Single-mechanism deploy**: `databricks bundle deploy` handles both runtime library and generated notebooks. No separate `databricks repos update` step, no ephemeral deploy branches, no bootstrap `repos create`. Matches watermark-branch operational model.
 - **Wheel lifecycle eliminated**: no wheel build step, no wheel hosting (UC Volume, PyPI, workspace_file), no `environments.dependencies` block. Surface area reduced.
 - **Upstream contribution path opens**: Mode-A (simple inline SQL implementation of issue #65's narrower scope) becomes additive upstream contribution, independent of this fork's `lhp_watermark` package.
+- **Minimal test/fixture churn**: keeping the `${workspace.file_path}/generated/${bundle.target}` anchor avoids touching `pipeline_resource.yml.j2` and ~40 bundle tests/fixtures/docs that assert that shape app-wide.
 
 ### Negative
 
-- **Deployment topology change**: CI/CD must orchestrate `databricks repos update` alongside `databricks bundle deploy`. Platform engineers need runbook access.
 - **Constitution amendment required**: P2 bullet 1 wording must change from `lhp.extensions.*` / `lhp.runtime.*` to a broader "runtime libraries (e.g., `lhp_watermark.*`)" formulation. See §Compliance.
-- **User bundle migration**: existing bundles declaring `var.lhp_whl_path` must drop the variable and update `notebook_path`. One-release grace window enforced via deprecation warning (Constitution P1).
-- **First-deploy bootstrap**: first deployment per environment needs `databricks repos create`; subsequent deploys use `repos update`. CI treats "folder already exists" as success. Documented in runbook.
+- **User bundle migration**: existing bundles declaring `var.lhp_whl_path` must drop the variable. One-release grace window enforced via deprecation warning (Constitution P1).
+- **Runtime lib lives per-bundle, not per-workspace**: each bundle ships its own `src/lhp_watermark/` under `${workspace.file_path}`. Concurrent bundles using different `lhp_watermark` versions coexist without contention but also without cross-bundle sharing. Acceptable: upgrade propagation is a normal bundle redeploy.
+- **`sys.path` anchor uncertainty**: Databricks Runtime may or may not auto-add `${workspace.file_path}/src/` to `sys.path` for notebook-task execution. Phase 4 probe resolves empirically; template emits a conditional one-line prelude if needed.
 
 ### Risks
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| Databricks Runtime `sys.path` anchor is repo-root, not `…/src/` | M | H | Probe notebook in Phase 4 resolves empirically; template emits `sys.path.insert` prelude conditionally |
-| `databricks repos update` rejects branch names with slashes (`deploy/${env}/${SHA}`) | L | M | Verify in Phase 4; fallback to flat branch naming (`deploy-${env}-${SHA}`) if needed |
-| Race between `repos update` and `bundle deploy` | L | M | Sequential execution in CI; fail-fast on first error |
-| Constitution amendment rejected in review | L | H | Pre-circulate amendment wording; this ADR documents the exact change |
+| Databricks Runtime `sys.path` does not include `${workspace.file_path}/src/` for notebook-task execution | M | H | Phase 4 probe resolves empirically; generated template emits `sys.path.insert(0, "${workspace.file_path}/src")` prelude conditionally |
+| DAB workspace-file sync omits `src/` (e.g., due to `sync.exclude` in bundle config) | L | H | Audit `databricks.yml` of representative bundles in Phase 4; document exclude/include patterns required for `src/` inclusion in runbook |
+| Constitution amendment rejected in review | L | H | Pre-circulated; already committed in Phase 0 |
 | `lhp_watermark` name collides with future upstream naming | L | L | Coordinate via issue #65 thread; rename feasible pre-merge |
 
 ---
 
 ## Open Questions (with recommendations)
 
-1. **`sys.path` anchor point** — Does Databricks Runtime auto-add `/Workspace/${env}/Lakehouse_Plumber` or `/Workspace/${env}/Lakehouse_Plumber/src` to `sys.path` for notebook-task execution?
-   **Recommendation**: Resolve empirically via probe notebook (Phase 4 T4.1). Plan emits `sys.path.insert(0, "/Workspace/${var.env}/Lakehouse_Plumber/src")` prelude conditionally based on probe result.
+1. **`sys.path` anchor point** — Does Databricks Runtime auto-add `${workspace.file_path}` or `${workspace.file_path}/src` to `sys.path` for notebook-task execution?
+   **Recommendation**: Resolve empirically via probe notebook (Phase 4 T4.1). Template emits `sys.path.insert(0, "${workspace.file_path}/src")` prelude conditionally based on probe result.
 
-2. **Git folder path convention** — `/Workspace/${env}/Lakehouse_Plumber` (edp pattern) vs `/Workspace/Shared/lhp/${env}/…` vs `/Workspace/Repos/<sp>/…`?
-   **Recommendation**: Default `/Workspace/${var.env}/Lakehouse_Plumber` (matches edp, maximizes pattern reuse). Parameterize via DAB variable `lhp_git_folder_root` so users can override without template changes.
+2. ~~**Git folder path convention**~~ — **Resolved by 2026-04-19 amendment**: no git folder in deploy path. DAB workspace-file sync handles delivery.
 
-3. **Generated artifacts branching** — Commit `generated/${env}/**` to persistent `release/${env}` branch vs ephemeral `deploy/${env}/${COMMIT_SHA}` per CI run?
-   **Recommendation**: **Ephemeral** `deploy/${env}/${COMMIT_SHA}`. Rationale: upstream LHP convention is regenerate-in-CI (no artifacts in source control); ephemeral branches are deterministic per commit, avoid branch accumulation, and survive parallel CI runs.
+3. ~~**Generated artifacts branching**~~ — **Resolved by 2026-04-19 amendment**: no deploy branches. `lhp generate` + `databricks bundle deploy` per environment.
 
-4. **Notebook path shape** — `${var.env}` vs `${bundle.target}` in the emitted `notebook_path`?
-   **Recommendation**: **`${var.env}`**. `bundle.target` is the DAB target name, which may or may not equal the environment name. Using `var.env` keeps the notebook path consistent with the git folder path (also `var.env`-anchored).
+4. ~~**Notebook path shape `${var.env}` vs `${bundle.target}`**~~ — **Resolved by 2026-04-19 amendment**: keep `${bundle.target}` (existing app-wide convention in `pipeline_resource.yml.j2`); no new anchor introduced.
 
 5. **Constitution P2 amendment wording** — Narrow edit to bullet 1, or broader pattern documentation?
-   **Recommendation**: **Narrow**. Amend only P2 bullet 1 (see §Compliance for exact wording). ADR-002 itself serves as the pattern documentation; constitution churn stays minimal.
+   **Recommendation (applied in Phase 0 commit `0bc88d28`)**: **Narrow**. Amended only P2 bullet 1 — see §Compliance for exact wording. ADR-002 itself serves as the pattern documentation; constitution churn stays minimal.
+
+6. **Should a user `sync.exclude` override ever hide `src/` from the DAB bundle sync?**
+   **Recommendation**: No. Phase 5 runbook must call this out. If a bundle excludes `src/`, the runtime library won't land in the workspace and imports fail. Detectable at `databricks bundle validate` time via a check the generator can suggest in its migration notes.
 
 ---
 

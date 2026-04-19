@@ -74,7 +74,6 @@ class WorkflowResourceGenerator(BaseActionGenerator):
             "dlt_pipeline_ref": (
                 f"${{resources.pipelines.{pipeline_name}_pipeline.id}}"
             ),
-            "lhp_whl_path": "${var.lhp_whl_path}",
             "serial_extraction": serial_extraction,
         }
 
