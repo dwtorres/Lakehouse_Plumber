@@ -154,6 +154,18 @@ Service principal credentials via OIDC federation are preferred over static clie
   - If `sync.paths` in `databricks.yml` points to a directory outside the bundle root (e.g. a sibling LHP checkout), DAB sets its sync root to the lowest common parent of the bundle and the external path. Every `sync.include` pattern then needs the bundle-directory prefix.
   - Avoid this shape — vendor `lhp_watermark/` into the bundle instead.
 
+**`INVALID_PARAMETER_VALUE.LOCATION_OVERLAP` during DLT streaming query**
+  - Symptom (full error): `Input path url 's3://.../volumes/<vol_id>/<table>/_lhp_runs/<uuid>/part-*.parquet' overlaps with managed storage within 'CheckPathAccess' call`.
+  - Root cause: Unity Catalog rejects AutoLoader reads from a volume whose storage root overlaps with the managed storage of a table in the same schema. Co-locating the landing volume with bronze streaming_tables in one schema (e.g. `main.bronze.landing` alongside `main.bronze.<table>`) triggers this.
+  - Fix: move the landing volume into a dedicated schema (`main._landing.landing`) that hosts **no managed tables**. Update the bundle's `landing_path` substitution accordingly. No LHP code change; user-bundle YAML only.
+  - Production-shape recommendation: use external Unity Catalog volumes (backed by user-controlled ADLS / S3 / GCS) per environment × medallion. External volumes sit outside the catalog's managed-storage root, so the overlap check does not apply. One external volume per `{env}_edp_{medallion}` catalog is the reference pattern.
+  - Reference evidence: Wumbo PR #2 (2026-04-19), DLT update `338e767a-18d5-4d55-a030-587ba6a8de0e`.
+
+**Same `LOCATION_OVERLAP` but against the *old* volume even after you moved the landing path**
+  - Symptom: error cites an S3 URL for the previous landing volume (`volumes/<old_vol_id>/...`), even though `databricks.yml` and generated notebooks now point at the new path.
+  - Root cause: the DLT pipeline's `_dlt_metadata/checkpoints/<stream>/` retains AutoLoader source state from the prior run. When the source path changes, the streaming query replays the old path from checkpoint.
+  - Fix: `databricks bundle run -t <target> --full-refresh-all <pipeline_name>` — resets DLT checkpoints and runs a full backfill from the new source. After success, subsequent runs can drop `--full-refresh-all`.
+
 ## Related
 
 - [ADR-002](../adr/ADR-002-lhp-runtime-availability.md) — decision record (amended 2026-04-19)

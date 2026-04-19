@@ -73,6 +73,37 @@ Three concrete shapes are on the table:
 
 Each changes different invariants. Decide against §Success Criteria below.
 
+### Q5 — Where does the landing volume live relative to bronze tables? (surfaced 2026-04-19)
+
+After Path ③ shipped (LHP PR #3) the Wumbo E2E run reached AutoLoader schema inference successfully but the DLT streaming query failed with:
+
+```
+ErrorClass=INVALID_PARAMETER_VALUE.LOCATION_OVERLAP
+Input path url 's3://.../volumes/<vol_id>/<table>/_lhp_runs/<uuid>/part-*.parquet'
+overlaps with managed storage within 'CheckPathAccess' call
+```
+
+Unity Catalog's `CheckPathAccess` rejects reads from a volume whose storage root overlaps with any managed entity in the same schema. Our initial Wumbo setup co-located the landing volume (`main.bronze.landing`) with bronze streaming_tables (`main.bronze.<table>`) in the same `main.bronze` schema. On managed-catalog defaults the volume's physical S3 prefix lives inside the same `__unitystorage/catalogs/<cid>/` tree as the managed-table storage, which is exactly what the overlap check forbids.
+
+**Empirical fix** (Wumbo PR #2): move landing to a dedicated `main._landing` schema (`main._landing.landing` volume). Identical catalog, different schema, no shared managed-storage overlap. E2E validated: DLT update `338e767a-18d5-4d55-a030-587ba6a8de0e` — all 14 bronze flows COMPLETED, all 14 tables populated.
+
+**Operational consequences that scale this question**:
+
+- **Schema proliferation**: per-environment landing schema adds a schema-per-env (dev/qa/prod), but only one per env, and it isolates a real UC rule.
+- **External ADLS volume pattern**: the reference target. One external volume per environment×medallion backed by user-controlled storage. External volumes don't participate in managed-storage overlap checks because their storage location is outside the catalog's managed root. This is the production shape. Wumbo PR #2's `landing_schema` substitution is forward-compatible — map `landing_schema` to an external-volume-backed schema per env with no YAML change.
+- **Per-env catalog pattern**: future production convention for this fork is `{env}_edp_{medallion}` catalogs (e.g. `devtest_edp_bronze`, `devtest_edp_silver`, `devtest_edp_gold`). A dedicated `{env}_edp_landing` catalog or an external volume inside bronze becomes the production equivalent of `main._landing`.
+- **DLT checkpoint migration**: when landing volume paths change, the DLT pipeline's `_dlt_metadata/checkpoints/<stream>/` retains state tied to the old source path and raises `LOCATION_OVERLAP` against the old volume's files on replay. Resolution requires `databricks bundle run -t <target> --full-refresh-all <pipeline_name>` to reset checkpoints. Document this explicitly in the runbook (§LOCATION_OVERLAP recovery).
+
+**Operator contract this ADR should ratify**:
+
+Landing volumes MUST NOT share a schema with managed tables that LHP also writes to. Mechanism of enforcement:
+
+- **Short-term**: `lhp generate` validates `landing_path` does not resolve inside a schema that also hosts a write-action target, warning on conflict.
+- **Medium-term**: generator emits `cloudFiles.schemaLocation` into a landing-schema-relative path (not into a managed-table-bearing schema).
+- **Long-term**: `lhp init` / project scaffolding creates the `_landing` schema automatically and wires the substitution token.
+
+**Status**: this Q is the first ADR-003 question with empirical evidence (Wumbo PR #2). It is **not** closed in this ADR — the scale question (per-env catalog pattern, external volume integration) remains open. Mark as "partially answered" once Wumbo PR #2 merges; full closure requires the generator-side validation work above.
+
 ## Alternatives
 
 | ID | Alternative | Scope | ADR-001 impact |
@@ -94,9 +125,10 @@ Current status: the codebase remains on Alternative A (Path ③-fixed). No migra
 - [ ] Q2 retention policy ratified with operator contract + enforcement mechanism + benchmark at ≥10k subdirs.
 - [ ] Q3 empty-batch case verified end-to-end (Phase B-style run with zero-row JDBC result reaches DLT bronze without `CF_EMPTY_DIR_FOR_SCHEMA_INFERENCE`).
 - [ ] A second batch-loader source type (API, CDC, or flat-file) is implemented, validating whether Alternative A generalizes or Alternative B/D is required.
+- [~] Q5 partially answered by Wumbo PR #2 (2026-04-19): dedicated landing schema sidesteps UC `LOCATION_OVERLAP`. Full closure requires the generator-side validation work (landing-path-in-same-schema-as-write-target warning) and the production external-ADLS-volume pattern being ratified.
 - [ ] Final decision between A/B/C/D recorded in this ADR; if B or C, superseding sections added to ADR-001.
 
-Until all five boxes are ticked, this ADR stays Proposed / Investigating. No shape change will be made ad-hoc.
+Until all five boxes are ticked (and Q5 is fully closed), this ADR stays Proposed / Investigating. No shape change will be made ad-hoc.
 
 ## Out of Scope
 
