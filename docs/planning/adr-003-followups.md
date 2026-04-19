@@ -58,6 +58,7 @@ Goal: close the research questions that don't require building new components. G
 - `tests/templates/test_jdbc_watermark_template.py` — render test.
 **Success**: JDBC extract with `WHERE 1=0` (force-empty) lands in Databricks, DLT AutoLoader reads it, no `CF_EMPTY_DIR`. Evidence: Wumbo workflow run with a mock empty-source extraction.
 **Effort**: ~2h code + 1h test + 30min Wumbo validation.
+**Status (2026-04-19)**: code + tests landed on `feature/adr-003-a2-empty-batch-hardening`. Template now branches on `_landing_has_parquet(...)`; the empty-batch path emits `_log_phase("landing_empty_schema_fallback", ...)` and writes a coalesced 0-row parquet built from the live JDBC `df.schema`. Approach #2 (generator-side `cloudFiles.schemaHints`) deferred — primary fix #1 closes the failure mode the bronze AutoLoader was hitting; hints become a hardening item once we have a per-source schema-drift signal. Wumbo dev-workspace validation (force-empty `WHERE 1=0` extract → bronze `streaming_table` populates without `CF_EMPTY_DIR`) is the remaining checkbox under Phase A exit criteria.
 
 ### A3 — Q5 (partial) — generator-side landing-schema validation
 

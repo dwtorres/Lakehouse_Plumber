@@ -553,6 +553,32 @@ class TestJDBCWatermarkJobGenerator:
         # insert_new receives the same validated variable.
         assert "watermark_column_name=watermark_column" in notebook
 
+    def test_extraction_notebook_writes_schema_bearing_parquet_on_empty_batch(self):
+        """ADR-003 §Q3 / A2: empty incremental batch must still leave a
+        schema-bearing parquet at the run-scoped landing path.
+
+        Without this fallback, AutoLoader on the bronze side fails the
+        next run with ``CF_EMPTY_DIR_FOR_SCHEMA_INFERENCE`` because plain
+        ``df.write.parquet`` on an empty DataFrame writes only a
+        ``_SUCCESS`` marker. The extractor must construct an empty
+        DataFrame from the JDBC ``df.schema`` and write that as parquet
+        when the natural write produced no part file.
+        """
+        action = _make_v2_action()
+        fg = _make_flowgroup_with_write(action)
+        gen = JDBCWatermarkJobGenerator()
+        gen.generate(action, {"flowgroup": fg})
+        notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
+        assert "createDataFrame([], df.schema)" in notebook, (
+            "Extraction notebook must write a schema-bearing 0-row parquet "
+            "when the JDBC read returned no rows."
+        )
+        # The fallback is observable in the run log.
+        assert (
+            "landing_empty_schema_fallback" in notebook
+            or "empty_schema_fallback" in notebook
+        )
+
     def test_column_with_embedded_quote_escaped(self):
         """Column name with an embedded double-quote survives as Python-escaped literal.
 
