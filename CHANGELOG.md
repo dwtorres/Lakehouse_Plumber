@@ -4,6 +4,10 @@ All notable changes to LHP (this fork).
 
 ## [Unreleased]
 
+### Fixed
+- **DLT schema inference on `jdbc_watermark_v2` landing paths** — `CloudFilesLoadGenerator` dispatch in `src/lhp/generators/load/jdbc_watermark_job.py` now emits `.load("{landing_path}/_lhp_runs/*")` instead of the bare `.load("{landing_path}")`. The extraction template writes Parquet at `{root}/_lhp_runs/{run_id}/` (ADR-001 §Decision); the bare-root load caused `CF_EMPTY_DIR_FOR_SCHEMA_INFERENCE` because AutoLoader's schema-inference listing does not recurse into the `_lhp_runs/` subtree. Implements the CloudFilesLoadGenerator spot-check flagged as outstanding in ADR-001 §Consequences §Negative; validated by Phase B V8 evidence (ADR-001 Evidence table). The generator also now defaults `cloudFiles.useStrictGlobber: "false"` for jdbc_watermark_v2 loads so the `*` wildcard matches across directory separators on Unity Catalog volumes; user-supplied overrides via `action.source.options` still win.
+- See [ADR-003](docs/adr/ADR-003-landing-zone-shape.md) for the longer-term landing-shape investigation opened alongside this fix.
+
 ### Added
 - `lhp sync-runtime` CLI subcommand — vendors the installed `lhp_watermark` package into the current bundle directory. Automates ADR-002 Path 5 Option A vendoring; replaces the manual `cp -r ../Lakehouse_Plumber/src/lhp_watermark ./lhp_watermark` step.
 - `lhp_watermark` distinct top-level Python package (sibling to `lhp/`) carrying the watermark runtime (`WatermarkManager`, `SQLInputValidator`, `derive_run_id`, exception taxonomy). See [ADR-002](docs/adr/ADR-002-lhp-runtime-availability.md).

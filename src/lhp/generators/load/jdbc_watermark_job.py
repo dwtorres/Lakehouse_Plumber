@@ -58,6 +58,38 @@ def _default_schema_location(landing_path: str, action_name: str) -> str:
     return f"{parent.rstrip('/')}/_lhp_schema/{action_name}"
 
 
+# ADR-001 §Decision: the extraction template writes Parquet at
+# ``{landing_path}/_lhp_runs/{run_id}/`` (see
+# ``src/lhp/templates/load/jdbc_watermark_job.py.j2`` helper
+# ``_run_landing_path``). AutoLoader's schema-inference listing on the bare
+# landing path does not recurse into ``_lhp_runs/`` — Phase B V8 evidence
+# recorded ``UNABLE_TO_INFER_SCHEMA`` with ``recursiveFileLookup=true`` at
+# the bare root but confirmed that the explicit ``{root}/_lhp_runs/*`` glob
+# reads all runs correctly on Unity Catalog volumes. The suffix below is the
+# narrow read-side fix ADR-001 §Consequences §Negative flagged as an
+# outstanding ``CloudFilesLoadGenerator`` spot-check.
+#
+# ADR-003 tracks the long-term question of whether the run-scoped directory
+# should remain ``_lhp_runs/`` (hidden-prefixed) or migrate to a different
+# shape (e.g. Hive-style ``run_id=<uuid>/``). If that ADR changes the
+# contract, update ``_LANDING_READ_SUFFIX`` alongside the extractor template
+# helper — they must stay synchronized.
+_LANDING_READ_SUFFIX = "_lhp_runs/*"
+
+
+def _cloudfiles_read_path(landing_path: str) -> str:
+    """Return the AutoLoader ``.load(...)`` path for a jdbc_watermark_v2 landing.
+
+    Appends the run-scoped glob that matches how the extraction template
+    structures its Parquet writes. Returns an empty string for an empty
+    ``landing_path`` so downstream validation can surface the missing field.
+    """
+    landing = (landing_path or "").rstrip("/")
+    if not landing:
+        return ""
+    return f"{landing}/{_LANDING_READ_SUFFIX}"
+
+
 def _has_schema_location(source_config: Dict[str, Any]) -> bool:
     """True when any supported CloudFiles schemaLocation surface is already set."""
     if source_config.get("schema_location"):
@@ -188,10 +220,19 @@ class JDBCWatermarkJobGenerator(BaseActionGenerator):
         cloudfiles_source.update(
             {
                 "type": "cloudfiles",
-                "path": action.landing_path or "",
+                "path": _cloudfiles_read_path(action.landing_path or ""),
                 "format": "parquet",
             }
         )
+
+        # ADR-001 read-path fix: the landing glob uses an explicit ``*`` wildcard.
+        # AutoLoader's default ``useStrictGlobber=true`` can mis-match across
+        # directory separators on Unity Catalog volumes, so ensure it is
+        # disabled unless the user bundle has explicitly opted back in.
+        existing_options = dict(cloudfiles_source.get("options") or {})
+        existing_options.setdefault("cloudFiles.useStrictGlobber", "false")
+        cloudfiles_source["options"] = existing_options
+
         if not _has_schema_location(cloudfiles_source):
             cloudfiles_source["schema_location"] = _default_schema_location(
                 action.landing_path or "", action.name
