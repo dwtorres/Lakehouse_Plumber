@@ -83,7 +83,7 @@ def _make_wm(spark: _ScriptedSpark) -> Any:
     test. Reset both lists after construction so test assertions see a
     clean slate.
     """
-    from lhp.extensions.watermark_manager import WatermarkManager
+    from lhp_watermark import WatermarkManager
 
     pending_script = list(spark.script)
     spark.script.clear()  # __init__ DDL takes the no-op default path
@@ -141,7 +141,7 @@ def test_insert_new_issues_a_merge_and_returns_none_on_success() -> None:
 
 
 def test_insert_new_raises_duplicate_run_error_when_merge_affects_zero_rows() -> None:
-    from lhp.extensions.watermark_manager import DuplicateRunError
+    from lhp_watermark import DuplicateRunError
 
     spark = _ScriptedSpark(script=[0])  # MERGE matched, no insert
     wm = _make_wm(spark)
@@ -220,7 +220,7 @@ def test_insert_new_retries_on_py4j_wrapped_concurrent_exception(
 def test_insert_new_raises_watermark_concurrency_error_on_budget_exhaustion(
     monkeypatch: Any,
 ) -> None:
-    from lhp.extensions.watermark_manager import WatermarkConcurrencyError
+    from lhp_watermark import WatermarkConcurrencyError
 
     monkeypatch.setattr("time.sleep", lambda s: None)
     final = _delta_concurrent_append()
@@ -269,7 +269,7 @@ def test_insert_new_does_not_retry_on_unrelated_exception(monkeypatch: Any) -> N
 def test_insert_new_rejects_adversarial_input_before_any_spark_sql(
     field: str, bad_value: str
 ) -> None:
-    from lhp.extensions.watermark_manager import WatermarkValidationError
+    from lhp_watermark import WatermarkValidationError
 
     spark = _ScriptedSpark(script=[])
     wm = _make_wm(spark)
@@ -285,7 +285,7 @@ def test_insert_new_rejects_adversarial_input_before_any_spark_sql(
 
 
 def test_insert_new_rejects_float_watermark_value() -> None:
-    from lhp.extensions.watermark_manager import WatermarkValidationError
+    from lhp_watermark import WatermarkValidationError
 
     spark = _ScriptedSpark(script=[])
     wm = _make_wm(spark)
@@ -317,6 +317,6 @@ def test_run_id_is_emitted_via_sql_literal_with_doubled_quotes() -> None:
     values containing apostrophes — but pins the contract that future
     refactors must preserve.
     """
-    from lhp.extensions.watermark_manager.sql_safety import sql_literal
+    from lhp_watermark.sql_safety import sql_literal
 
     assert sql_literal("o'reilly") == "'o''reilly'"

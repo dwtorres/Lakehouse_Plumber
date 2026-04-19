@@ -45,7 +45,7 @@ class _RecordingSpark:
 
 
 def _make_manager(spark: _RecordingSpark) -> Any:
-    from lhp.extensions.watermark_manager import WatermarkManager
+    from lhp_watermark import WatermarkManager
 
     # __init__ may itself emit DDL via _ensure_table_exists; that is allowed
     # but must also be preceded by the UTC guard. Tests below assert this.
@@ -67,7 +67,7 @@ def _first_sql_index(calls: List[Tuple[str, Any]]) -> int:
 
 
 def test_ensure_utc_session_helper_exists() -> None:
-    from lhp.extensions.watermark_manager._manager import WatermarkManager
+    from lhp_watermark.watermark_manager import WatermarkManager
 
     assert hasattr(
         WatermarkManager, "_ensure_utc_session"

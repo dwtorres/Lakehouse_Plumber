@@ -1,21 +1,21 @@
 {# task_key (extract_*) is decoupled from notebook filename (__lhp_extract_*)
-   to keep DAB UI clean while preventing DLT glob collision. #}
+   to keep DAB UI clean while preventing DLT glob collision.
+
+   ADR-002 (2026-04-19): `environments` / `environment_key` (wheel attachment)
+   removed. Runtime library `lhp_watermark` ships via DAB workspace-file sync
+   at `${workspace.file_path}/src/lhp_watermark/`; generated notebooks import
+   it via PYTHONPATH. `source: WORKSPACE` on each notebook_task is required
+   because extraction notebooks live at workspace paths, not bundle paths. #}
 resources:
   jobs:
     {{ pipeline_name }}_workflow:
       name: {{ pipeline_name }}_workflow
-      environments:
-        - environment_key: lhp_env
-          spec:
-            environment_version: "2"
-            dependencies:
-              - {{ lhp_whl_path }}
       tasks:
 {% for task in extraction_tasks %}
         - task_key: {{ task.task_name }}
-          environment_key: lhp_env
           notebook_task:
             notebook_path: {{ task.notebook_path }}
+            source: WORKSPACE
 {% if task.depends_on %}
           depends_on:
 {% for task_name in task.depends_on %}

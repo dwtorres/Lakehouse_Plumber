@@ -15,13 +15,19 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
-_SCRIPT_PATH = (
-    Path(__file__).resolve().parents[2] / "scripts" / "benchmark_slice_a.py"
-)
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_SCRIPT_PATH = _REPO_ROOT / "scripts" / "benchmark_slice_a.py"
+_SUBPROCESS_ENV = {
+    **os.environ,
+    "PYTHONPATH": os.pathsep.join(
+        [str(_REPO_ROOT / "src"), os.environ.get("PYTHONPATH", "")]
+    ),
+}
 
 
 def _load_harness():
@@ -99,6 +105,7 @@ class TestCLI:
             capture_output=True,
             text=True,
             check=False,
+            env=_SUBPROCESS_ENV,
         )
         assert proc.returncode == 0, proc.stderr
         payload = json.loads(proc.stdout)
@@ -111,6 +118,7 @@ class TestCLI:
             capture_output=True,
             text=True,
             check=False,
+            env=_SUBPROCESS_ENV,
         )
         assert proc.returncode == 0, proc.stderr
         out = proc.stdout

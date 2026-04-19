@@ -77,7 +77,7 @@ class _ScriptedSpark:
 
 
 def _make_wm(spark: _ScriptedSpark) -> Any:
-    from lhp.extensions.watermark_manager import WatermarkManager
+    from lhp_watermark import WatermarkManager
 
     pending = list(spark.script)
     spark.script.clear()
@@ -146,7 +146,7 @@ def test_mark_complete_raises_terminal_state_guard_error_when_no_rows_affected()
     None
 ):
     """Row was already in a terminal-failure state; UPDATE matches zero rows."""
-    from lhp.extensions.watermark_manager import TerminalStateGuardError
+    from lhp_watermark import TerminalStateGuardError
 
     # Script: UPDATE returns 0, then read-back SELECT returns the current
     # status so the exception can carry it.
@@ -162,7 +162,7 @@ def test_mark_complete_raises_terminal_state_guard_error_when_no_rows_affected()
 
 def test_mark_complete_carries_current_status_none_when_row_missing() -> None:
     """Zero-affected with no row found in read-back: current_status=None."""
-    from lhp.extensions.watermark_manager import TerminalStateGuardError
+    from lhp_watermark import TerminalStateGuardError
 
     spark = _ScriptedSpark(script=[0, "noop"])
     wm = _make_wm(spark)
@@ -181,7 +181,7 @@ def test_mark_complete_does_not_raise_on_one_row_affected() -> None:
 
 
 def test_mark_complete_rejects_invalid_run_id_before_any_sql() -> None:
-    from lhp.extensions.watermark_manager import WatermarkValidationError
+    from lhp_watermark import WatermarkValidationError
 
     spark = _ScriptedSpark(script=[])
     wm = _make_wm(spark)
@@ -191,7 +191,7 @@ def test_mark_complete_rejects_invalid_run_id_before_any_sql() -> None:
 
 
 def test_mark_complete_rejects_float_watermark_value() -> None:
-    from lhp.extensions.watermark_manager import WatermarkValidationError
+    from lhp_watermark import WatermarkValidationError
 
     spark = _ScriptedSpark(script=[])
     wm = _make_wm(spark)
@@ -215,7 +215,7 @@ def test_mark_complete_signature_requires_watermark_value() -> None:
     """L3 §4.2.1: watermark_value is required (was Optional)."""
     import inspect
 
-    from lhp.extensions.watermark_manager import WatermarkManager
+    from lhp_watermark import WatermarkManager
 
     sig = inspect.signature(WatermarkManager.mark_complete)
     param = sig.parameters["watermark_value"]

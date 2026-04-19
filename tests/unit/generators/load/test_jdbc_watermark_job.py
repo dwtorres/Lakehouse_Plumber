@@ -112,12 +112,12 @@ class TestJDBCWatermarkJobGenerator:
             n
             for n in ast.walk(tree)
             if isinstance(n, ast.ImportFrom)
-            and n.module == "lhp.extensions.watermark_manager"
+            and n.module == "lhp_watermark"
             and any(alias.name == "WatermarkManager" for alias in n.names)
         ]
         assert (
             wm_imports
-        ), "WatermarkManager must be imported from lhp.extensions.watermark_manager"
+        ), "WatermarkManager must be imported from lhp_watermark"
 
     def test_extraction_notebook_passes_spark_to_watermark_manager(self):
         """WatermarkManager constructor must receive spark as first arg."""

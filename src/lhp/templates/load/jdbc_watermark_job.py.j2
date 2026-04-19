@@ -11,17 +11,42 @@
 #   5. except: mark_failed(type(e).__name__, str(e)[:4096]) then raise
 #   6. mark_complete OUTSIDE and AFTER the try/except (FR-L-01 / FR-L-06a)
 import json
+import os
+import sys
 from datetime import datetime, timezone
 from decimal import Decimal
 
 from pyspark.sql import functions as F
 
-from lhp.extensions.watermark_manager import (
+# ADR-002 T4.1 resolution — Databricks serverless notebook tasks (runtime
+# client.5.1) do not auto-add the workspace.file_path root to sys.path, so
+# the vendored lhp_watermark package is not importable by default. Infer
+# the bundle files root from the running notebook path and prepend it
+# before the lhp_watermark imports below. Guarded so static import of the
+# file (e.g. template render tests) does not raise when dbutils is absent.
+def _lhp_watermark_bootstrap_syspath() -> None:
+    try:
+        nb_path = (
+            dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
+        )
+        if "/files/" in nb_path:
+            ws_root = nb_path.split("/files/")[0] + "/files"
+            if not ws_root.startswith("/Workspace"):
+                ws_root = "/Workspace" + ws_root
+            if ws_root not in sys.path:
+                sys.path.insert(0, ws_root)
+    except Exception:  # noqa: BLE001 — bootstrap must never crash the task
+        pass
+
+
+_lhp_watermark_bootstrap_syspath()
+
+from lhp_watermark import (  # noqa: E402  — import follows sys.path bootstrap
     TerminalStateGuardError,
     WatermarkManager,
 )
-from lhp.extensions.watermark_manager.runtime import derive_run_id
-from lhp.extensions.watermark_manager.sql_safety import SQLInputValidator
+from lhp_watermark.runtime import derive_run_id  # noqa: E402
+from lhp_watermark.sql_safety import SQLInputValidator  # noqa: E402
 
 # FR-L-07: DML against the watermark table must run in UTC.
 spark.conf.set("spark.sql.session.timeZone", "UTC")

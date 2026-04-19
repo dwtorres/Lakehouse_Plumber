@@ -24,7 +24,7 @@ import logging
 import uuid
 from typing import Any, Optional
 
-from lhp.extensions.watermark_manager.sql_safety import SQLInputValidator
+from lhp_watermark.sql_safety import SQLInputValidator
 
 logger = logging.getLogger(__name__)
 

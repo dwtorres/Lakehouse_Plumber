@@ -17,12 +17,12 @@ from typing import Any, Dict, Optional, Union
 
 from pyspark.sql import SparkSession
 
-from lhp.extensions.watermark_manager.exceptions import (
+from lhp_watermark.exceptions import (
     DuplicateRunError,
     TerminalStateGuardError,
     WatermarkConcurrencyError,
 )
-from lhp.extensions.watermark_manager.sql_safety import (
+from lhp_watermark.sql_safety import (
     SQLInputValidator,
     sql_literal,
     sql_numeric_literal,

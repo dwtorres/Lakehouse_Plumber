@@ -39,13 +39,13 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-from lhp.extensions.watermark_manager import WatermarkManager
+from lhp_watermark import WatermarkManager
 
 # The manager emits INFO/ERROR per DML call (context-useful in production,
 # noise in a benchmark that calls each method thousands of times). Silence
 # the extensions package for the duration of the process; callers who need
 # the logs can restore the level after importing.
-logging.getLogger("lhp.extensions.watermark_manager").setLevel(logging.CRITICAL)
+logging.getLogger("lhp_watermark").setLevel(logging.CRITICAL)
 logging.getLogger("lhp.extensions").setLevel(logging.CRITICAL)
 
 

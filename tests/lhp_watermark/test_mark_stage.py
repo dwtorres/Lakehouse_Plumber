@@ -67,7 +67,7 @@ class _ScriptedSpark:
 
 
 def _make_wm(spark: _ScriptedSpark) -> Any:
-    from lhp.extensions.watermark_manager import WatermarkManager
+    from lhp_watermark import WatermarkManager
 
     pending = list(spark.script)
     spark.script.clear()
@@ -108,7 +108,7 @@ def test_method_emits_terminal_failure_guard_in_where(method_name: str) -> None:
 def test_method_raises_terminal_state_guard_error_on_zero_affected(
     method_name: str,
 ) -> None:
-    from lhp.extensions.watermark_manager import TerminalStateGuardError
+    from lhp_watermark import TerminalStateGuardError
 
     spark = _ScriptedSpark(script=[0, {"status": "failed"}])
     wm = _make_wm(spark)
@@ -137,7 +137,7 @@ def test_method_succeeds_on_one_affected(method_name: str) -> None:
 def test_signature_takes_run_id_only(method_name: str) -> None:
     import inspect
 
-    from lhp.extensions.watermark_manager import WatermarkManager
+    from lhp_watermark import WatermarkManager
 
     sig = inspect.signature(getattr(WatermarkManager, method_name))
     # self + run_id
@@ -154,7 +154,7 @@ def test_signature_takes_run_id_only(method_name: str) -> None:
     "method_name", ["mark_bronze_complete", "mark_silver_complete"]
 )
 def test_method_rejects_invalid_run_id_before_any_sql(method_name: str) -> None:
-    from lhp.extensions.watermark_manager import WatermarkValidationError
+    from lhp_watermark import WatermarkValidationError
 
     spark = _ScriptedSpark(script=[])
     wm = _make_wm(spark)

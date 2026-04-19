@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, List, Optional, Tuple
 
-from lhp.extensions.watermark_manager.sql_safety import (
+from lhp_watermark.sql_safety import (
     SQLInputValidator,
     sql_literal,
     sql_timestamp_literal,

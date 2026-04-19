@@ -14,9 +14,73 @@ in observability dashboards.
 
 from __future__ import annotations
 
-from typing import Optional
+import textwrap
+from enum import Enum
+from typing import Any, Dict, List, Optional
 
-from lhp.utils.error_formatter import ErrorCategory, LHPError
+
+# ADR-002 Path 5: lhp_watermark is a distinct top-level package with no
+# dependency on `lhp.*`. LHPError below is a standalone minimal copy of
+# the generator-side class in lhp/utils/error_formatter.py — kept inline
+# so this runtime library imports cleanly in Databricks task environments
+# where only lhp_watermark/ is delivered (not lhp/).
+
+
+class ErrorCategory(Enum):
+    """Watermark-manager scoped error categories."""
+
+    WATERMARK = "WM"
+
+
+class LHPError(Exception):
+    """User-friendly error with formatting support (standalone copy)."""
+
+    def __init__(
+        self,
+        category: ErrorCategory,
+        code_number: str,
+        title: str,
+        details: str,
+        context: Optional[Dict[str, Any]] = None,
+        suggestions: Optional[List[str]] = None,
+        example: Optional[str] = None,
+        doc_link: Optional[str] = None,
+    ) -> None:
+        self.category = category
+        self.code = f"LHP-{category.value}-{code_number}"
+        self.title = title
+        self.details = details
+        self.context = context or {}
+        self.suggestions = suggestions or []
+        self.example = example
+        self.doc_link = (
+            doc_link
+            or "https://lakehouse-plumber.readthedocs.io/en/latest/errors_reference.html"
+        )
+        super().__init__(self._format_message())
+
+    def _format_message(self) -> str:
+        lines = [f"\n❌ Error [{self.code}]: {self.title}", "=" * 70]
+        if self.details:
+            lines.extend(["", textwrap.fill(self.details, width=70)])
+        if self.context:
+            lines.append("\n📍 Context:")
+            for key, value in self.context.items():
+                lines.append(f"   • {key}: {value}")
+        if self.suggestions:
+            lines.append("\n💡 How to fix:")
+            for i, suggestion in enumerate(self.suggestions, 1):
+                wrapped = textwrap.fill(
+                    suggestion, width=66, subsequent_indent="      "
+                )
+                lines.append(f"   {i}. {wrapped}")
+        if self.example:
+            lines.append("\n📝 Example:")
+            for line in self.example.strip().split("\n"):
+                lines.append(f"   {line}")
+        lines.append(f"\n📚 More info: {self.doc_link}")
+        lines.append("=" * 70)
+        return "\n".join(lines)
 
 
 class _WatermarkError(LHPError):
