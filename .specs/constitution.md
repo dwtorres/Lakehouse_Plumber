@@ -1,9 +1,13 @@
 # Lakehouse Plumber — Constitution
 
 **Status**: Active
-**Version**: 1.0
-**Date**: 2026-04-17
+**Version**: 1.1
+**Date**: 2026-04-19
 **Governs**: All specs under `.specs/` and all code under `src/lhp/`.
+
+**Change log**:
+- 1.1 (2026-04-19): P2 bullet 1 amended per ADR-002 to permit distinct top-level runtime packages (e.g., `lhp_watermark.*`) in addition to `lhp.*` submodules.
+- 1.0 (2026-04-17): initial.
 
 These principles are immutable for the duration of the current milestone. Every L1-L5 spec and every generated artifact must conform. Violations require explicit, documented waiver with user sign-off.
 
@@ -25,7 +29,7 @@ Extend existing types, actions, and APIs rather than introducing parallel versio
 
 Runtime deploys as workspace files or production Git folder synced by Databricks Asset Bundles or an admin-managed service principal. A Python wheel is introduced only when reuse, versioning, or rollback operationally requires it.
 
-- Generated notebooks import `lhp.extensions.*` and `lhp.runtime.*` from PYTHONPATH, not from an installed wheel.
+- Generated notebooks import runtime libraries (e.g., `lhp_watermark.*`, `lhp.extensions.*`, `lhp.runtime.*`) from PYTHONPATH, not from an installed wheel. Runtime libraries live as distinct top-level Python packages sibling to `lhp/`; submodules of `lhp/` (e.g., `lhp.extensions.*`) remain permitted for backward compatibility during migration windows.
 - JDBC driver JARs are attached at task/job level in the bundle resource, never bundled in the wheel.
 - Personal Git folders are never the production runtime path.
 
