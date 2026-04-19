@@ -206,8 +206,11 @@ from lhp_watermark.sql_safety import SQLInputValidator
 
 ## Open Questions (with recommendations)
 
-1. **`sys.path` anchor point** — Does Databricks Runtime auto-add `${workspace.file_path}` or `${workspace.file_path}/src` to `sys.path` for notebook-task execution?
-   **Recommendation**: Resolve empirically via probe notebook (Phase 4 T4.1). Template emits `sys.path.insert(0, "${workspace.file_path}/src")` prelude conditionally based on probe result.
+1. ~~**`sys.path` anchor point**~~ — **RESOLVED 2026-04-19 via Phase 4 T4.1 probe** (Databricks Runtime `client.5.1`, serverless). Probe job `sys_path_probe_job` in the `scooty_puff_junior` Wumbo bundle showed:
+   - Plain `import lhp_watermark` FAILS (`${workspace.file_path}` not on `sys.path`; only the notebook's own directory is)
+   - `sys.path.insert(0, "<workspace_file_root>")` + import SUCCEEDS
+   - `<workspace_file_root>` derived from the running notebook path by splitting on `/files/` — robust against bundle-specific root prefixes
+   **Implementation (commit `a1c12852`)**: generated `jdbc_watermark_job.py.j2` template emits a `_lhp_watermark_bootstrap_syspath()` helper (wrapped in a `def` + module-level call, not a top-level `try:`, so template-contract tests that locate the extraction try block continue to resolve correctly). Helper is a no-op when `dbutils` is absent (static template-render tests); in Databricks it prepends the bundle files root to `sys.path` before the `lhp_watermark.*` imports.
 
 2. ~~**Git folder path convention**~~ — **Resolved by 2026-04-19 amendment**: no git folder in deploy path. DAB workspace-file sync handles delivery.
 
@@ -275,6 +278,44 @@ See [`tasks/plan.md`](../../tasks/plan.md) and [`tasks/todo.md`](../../tasks/tod
 Six checkpoints (C0–C5), each requiring explicit human approval per P10.
 
 Target branch: `feature/adr-002-runtime-availability` (current branch). Single atomic PR targeting `watermark`.
+
+---
+
+## Phase 4 Evidence (2026-04-19)
+
+End-to-end smoke proved Path 5 Option A operational on Databricks serverless runtime `client.5.1`.
+
+**Test bundle**: `scooty_puff_junior` at [`github.com/dwtorres/Wumbo`](https://github.com/dwtorres/Wumbo). AdventureWorks source data on Supabase Postgres via JDBC.
+
+**Workspace**: `https://dbc-8e058692-373e.cloud.databricks.com`, profile `lhp-deploy-sp` (service principal).
+
+**T4.1 — `sys.path` probe** (run `135873449992972`, `561719421793073`):
+- Plain `import lhp_watermark` fails — `${workspace.file_path}` not on `sys.path` for notebook-task execution.
+- `sys.path.insert(0, "<workspace_file_root>")` then import succeeds; `<workspace_file_root>` derived by splitting `notebookPath()` on `/files/`.
+- Verdict: prelude required. Implemented in template commit `a1c12852`.
+
+**T4.2 — bundle deploy sequence**:
+```
+databricks --profile lhp-deploy-sp bundle validate -t dev  # → Validation OK!
+databricks --profile lhp-deploy-sp bundle deploy   -t dev  # → Deployment complete!
+```
+Single-mechanism deploy confirmed — no `databricks repos update` step; DAB workspace-file sync delivers both `lhp_watermark/` (vendored at bundle root) and the generated extraction notebooks under `${workspace.file_path}/`.
+
+**T4.3 — end-to-end extraction workflow** (run `517674443949620`, duration 4m 19s):
+```
+databricks --profile lhp-deploy-sp bundle run -t dev jdbc_ingestion_workflow
+```
+Result: `TERMINATED SUCCESS`. Four extraction tasks executed (`load_sales_order_header_jdbc`, `load_product_jdbc`, `load_transaction_history_jdbc`, `load_sales_order_detail_jdbc`) followed by the DLT pipeline task. Each extraction task:
+- Imported `lhp_watermark.*` via the `sys.path` prelude
+- Exercised `WatermarkManager` safety features: `insert_new`, `mark_landed`, `mark_complete` terminal-state guards, `SQLInputValidator`, UTC session enforcement, JDBC→Parquet write
+- Advanced the watermark row to a terminal success state
+
+**User-bundle vendoring** (for Option A under user-bundle semantics, where the bundle repo is separate from the LHP repo):
+- Runtime delivery: copy `src/lhp_watermark/` from the LHP repo into the user-bundle repo root as `lhp_watermark/`. DAB sync uploads it to `${workspace.file_path}/lhp_watermark/` alongside `generated/` notebooks.
+- Requires the user bundle to be a git repo or have explicit `sync.include` patterns so DAB knows which files to upload (Wumbo case: `git init` + populated `.gitignore` resolved the "no files to sync" warning).
+- Follow-up: `lhp sync-runtime` CLI subcommand to automate vendoring from an installed `lhp_watermark` distribution (Phase 5 backlog).
+
+**Constitution compliance verified**: P1 (additive — wheel still permitted via `environments.dependencies` in bundles that opt in), P2 (wheel not required), P3 (runtime in importable package; notebook thin), P5/P6/P9 (safety features preserved through mechanical rename).
 
 ---
 

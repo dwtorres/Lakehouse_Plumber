@@ -1,9 +1,38 @@
-# Plan — ADR-002 LHP Runtime Availability (Path 5: Namespace Extraction + Git Folder Deploy)
+# Plan — ADR-002 LHP Runtime Availability (Path 5: Namespace Extraction + DAB Workspace-File Sync)
 
-**Status**: Draft plan, pending human review.
-**Source**: `docs/adr/inputs/adr-002-runtime-availability.md` (ADR input artifact; formal ADR-002 not yet authored).
+**Status**: Phases 0–4 complete; Phase 5 in progress. On branch `feature/adr-002-runtime-availability`.
+**Source**: `docs/adr/inputs/adr-002-runtime-availability.md` → formalized in `docs/adr/ADR-002-lhp-runtime-availability.md` (amended 2026-04-19 to replace Git Folder deploy with DAB workspace-file sync — see §Amendment below).
 **Skill**: `agent-skills:planning-and-task-breakdown`.
-**Governing**: `.specs/constitution.md` (P1, P2, P3, P5, P6, P9, P10 are load-bearing).
+**Governing**: `.specs/constitution.md` v1.1 (P1, P2, P3, P5, P6, P9, P10 load-bearing).
+**Live status**: see [`tasks/todo.md`](todo.md) for checkbox state.
+
+## Amendment summary (2026-04-19)
+
+The 2026-04-18 plan scoped Phase 2 around a Databricks Git Folder deploy mechanism (`databricks repos update` + ephemeral deploy branches). During Phase 4 reconnaissance it became clear that:
+
+1. `databricks bundle deploy` already syncs all bundle-root files to `${workspace.file_path}/`, including `src/lhp_watermark/` — no second deploy mechanism needed.
+2. User bundles (distinct from the LHP repo itself) cannot rely on `sync.paths` pointing at a sibling LHP checkout, because DAB rebases sync to the common parent and breaks include-pattern portability.
+3. The simplest, watermark-branch-compatible shape: drop the `environments.dependencies` wheel block from `workflow_resource.yml.j2`, keep the existing `${workspace.file_path}/generated/${bundle.target}/…` anchor, add `source: WORKSPACE` on each notebook task, and **vendor** `lhp_watermark/` into each user bundle.
+
+ADR-002 was amended accordingly. Open Qs 2, 3, 4 became moot; Q1 (sys.path anchor) was resolved empirically by the T4.1 probe — prelude required. The original phase structure (P0–P5) and vertical slicing are preserved; only the Phase 2 deploy shape and the Phase 5 runbook body reflect the amendment.
+
+## Phase completion summary
+
+| Phase | State | Key commits |
+|---|---|---|
+| 0 — Decision docs | ✅ | `0bc88d28` |
+| 1 — Namespace extraction | ✅ | `bdaeeaa3` + `717d4e25` (fixup) |
+| 2 — Bundle refactor | ✅ (Option A) | `33d1b0b6` |
+| 2.5 — Runtime-lib decoupling (discovered during Phase 4) | ✅ | `0e7c1126` |
+| 3 — Packaging | ✅ (no-op; already auto-discovered) | — |
+| 4 — Databricks smoke | ✅ (Wumbo E2E green) | `a1c12852` (template bootstrap) |
+| 5 — Rollout docs | partial | (this commit — ADR-002 evidence + runbook body + plan/todo updates) |
+
+Evidence: ADR-002 §Phase 4 Evidence + commit `517674443949620` job run on `dbc-8e058692-373e.cloud.databricks.com`.
+
+---
+
+Original planning narrative preserved below for audit.
 
 ---
 

@@ -1,48 +1,161 @@
-# Runbook: LHP Runtime Deploy (Git Folder + Bundle)
+# Runbook: LHP Runtime Deploy (DAB Workspace-File Sync)
 
-**Status**: Stub (Phase 0 T0.3). Body populated in Phase 5 T5.1.
+**Status**: Active (Phase 5 T5.1, post-ADR-002 amendment 2026-04-19).
 **Owner**: Platform engineering.
-**Scope**: Deploys the `lhp_watermark` runtime library + generated extraction notebooks + DAB resources to a Databricks workspace via git-folder sync + bundle deploy.
+**Scope**: Deploys the `lhp_watermark` runtime library + LHP-generated DLT + extraction resources to a Databricks workspace via `databricks bundle deploy`.
 
 ---
 
 ## Purpose
 
-Deploy the LHP fork's runtime + generated artifacts to a Databricks workspace per ADR-002 (Path 5). Replaces the prior wheel-based deployment (pre-ADR-002).
+Deploy an LHP-managed Databricks project end-to-end against a target environment. The runtime library travels as workspace files alongside generated notebooks — no wheel, no Databricks Git Folder, no `databricks repos update` step.
 
 ## Prerequisites
 
-- Databricks CLI installed + authenticated (profile: project-specific, e.g., `dbc-8e058692-373e`)
-- Git credentials for pushing to the deploy branch pattern `deploy/${env}/${COMMIT_SHA}`
-- DAB bundle configured with variables: `env`, `lhp_git_folder_root` (default `/Workspace/${env}/Lakehouse_Plumber`)
-- First-time setup: workspace admin has created the Git Folder via `databricks repos create` (or CI handles bootstrap)
+- Databricks CLI installed and authenticated against the target workspace. Recommend a service principal profile (e.g. `lhp-deploy-sp`) for CI and a PAT profile for ad-hoc use.
+- Project repo layout:
+  - `databricks.yml` — DAB bundle spec with at least one target (e.g. `dev`, `tst`, `prod`)
+  - `lhp.yaml` — LHP project config
+  - `pipelines/` — source YAML
+  - `resources/lhp/` — LHP-generated resource files
+  - `lhp_watermark/` — **vendored runtime library** (see §Vendoring)
+  - `.gitignore` — must declare the repo as a known file set; `databricks bundle deploy` emits `no files to sync` when the bundle is run from a directory that is neither a git repo nor has explicit `sync.include` patterns
+- LHP CLI installed in the generator's Python env (editable install from the LHP repo is fine during development; release builds install the published version).
+
+## Vendoring the runtime library
+
+Path 5 Option A (ADR-002 amended 2026-04-19) ships `lhp_watermark/` as a top-level directory in the user bundle. DAB syncs it to `${workspace.file_path}/lhp_watermark/` where the generated extraction notebook picks it up via a `sys.path` bootstrap.
+
+**Current method (copy)**:
+
+```bash
+# From the user-bundle repo root, with the LHP repo as a sibling checkout:
+cp -r ../Lakehouse_Plumber/src/lhp_watermark ./lhp_watermark
+rm -rf ./lhp_watermark/__pycache__
+```
+
+Refresh after every LHP upgrade. Commit the updated copy. A deterministic, explicit version pin.
+
+**Follow-up (Phase 5 backlog)**: `lhp sync-runtime` CLI subcommand that copies the installed package from site-packages into `./lhp_watermark/` automatically. Eliminates the sibling-checkout assumption.
+
+**Do not** add the LHP repo itself to `sync.paths` in `databricks.yml` reaching outside the bundle root — DAB rebases sync to the common parent directory and every `sync.include` pattern then needs the bundle-directory prefix, breaking portability.
 
 ## Deploy sequence
 
-(Body filled in Phase 5 T5.1 — ADO recipe + GitHub Actions recipe + bootstrap handling)
+Per target, per change:
 
-1. `lhp generate --env ${env}` — regenerate notebooks + resources
-2. Git: add, commit, push to `deploy/${env}/${COMMIT_SHA}`
-3. `databricks repos update <path> --branch deploy/${env}/${COMMIT_SHA}` — sync runtime + generated artifacts
-4. `databricks bundle deploy -t ${env}` — deploy DAB jobs referencing synced notebooks
+```bash
+# 1. Regenerate notebooks + resource files from source YAML
+lhp generate --env ${env}
+
+# 2. (Optional) Inspect pending changes
+databricks --profile ${PROFILE} bundle validate -t ${env}
+
+# 3. Deploy — uploads bundle files + registers workflow/pipeline resources
+databricks --profile ${PROFILE} bundle deploy -t ${env}
+
+# 4. Run the workflow to verify
+databricks --profile ${PROFILE} bundle run -t ${env} ${workflow_name}
+```
+
+**What `bundle deploy` does** (relevant to this runbook):
+- Uploads every tracked (and non-gitignored) file in the bundle root to `${workspace.file_path}/` (default `/Workspace/Users/<user>/.bundle/<bundle>/<target>/files/` for dev mode).
+- `lhp_watermark/` lands at `${workspace.file_path}/lhp_watermark/`.
+- `generated/${bundle.target}/.../__lhp_extract_*` extraction notebooks land at `${workspace.file_path}/generated/${bundle.target}/.../__lhp_extract_*`.
+- Registers workflow + pipeline resources from `resources/lhp/*.yml`.
+
+## Reference CI shapes
+
+### Azure DevOps
+
+```yaml
+# azure-pipelines.yml
+stages:
+  - stage: deploy_dev
+    jobs:
+      - job: lhp_deploy
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+          - task: UsePythonVersion@0
+            inputs: { versionSpec: '3.12' }
+          - script: pip install -e ../Lakehouse_Plumber
+            displayName: Install LHP CLI
+          - script: |
+              lhp generate --env dev
+            displayName: Generate notebooks
+          - script: |
+              curl -fsSL https://databricks.com/install.sh | sh
+              databricks --profile $(DATABRICKS_PROFILE) bundle validate -t dev
+              databricks --profile $(DATABRICKS_PROFILE) bundle deploy -t dev
+            env:
+              DATABRICKS_HOST: $(DATABRICKS_HOST)
+              DATABRICKS_CLIENT_ID: $(DATABRICKS_CLIENT_ID)
+              DATABRICKS_CLIENT_SECRET: $(DATABRICKS_CLIENT_SECRET)
+            displayName: Deploy bundle
+```
+
+### GitHub Actions
+
+```yaml
+# .github/workflows/deploy-dev.yml
+name: Deploy dev
+on:
+  push:
+    branches: [ main ]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install -e ../Lakehouse_Plumber
+      - run: lhp generate --env dev
+      - uses: databricks/setup-cli@main
+      - run: databricks bundle validate -t dev
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+      - run: databricks bundle deploy -t dev
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+```
+
+Service principal credentials via OIDC federation are preferred over static client secrets where available.
 
 ## Rollback
 
-(Body filled in Phase 5 T5.1)
-
-- Revert deploy branch to previous `${COMMIT_SHA}`
-- Re-run `repos update` + `bundle deploy`
+- **Code rollback**: revert the commit that changed `lhp_watermark/` or the source YAML that produced the failing generated notebook, push, rerun `bundle deploy`. Workspace files converge to the reverted state.
+- **Resource rollback**: `databricks bundle destroy -t ${env}` removes the registered workflow + pipeline; re-`bundle deploy` from the prior commit rebuilds them. Destroy is scoped to bundle-managed resources only.
 
 ## Troubleshooting
 
-(Body filled in Phase 5 T5.1)
+**`ModuleNotFoundError: No module named 'lhp_watermark'` inside an extraction task**
+  - Confirm `lhp_watermark/` exists at the bundle root and is not gitignored or excluded by `sync.exclude`.
+  - Confirm the generated extraction notebook includes `_lhp_watermark_bootstrap_syspath()` followed by the `lhp_watermark` imports. If it doesn't, regenerate with LHP version ≥ the ADR-002 commit `a1c12852`.
+  - Check the probe notebook output (adapt `notebooks/_probes/sys_path_probe.py` from the Wumbo reference bundle). Look at the `workspace_file_root` field — confirm it ends in `/files`. If the bundle uses a non-standard workspace layout, the `/files/` split heuristic may need adjustment.
 
-- `ModuleNotFoundError: lhp_watermark` → verify `sys.path` anchor (Phase 4 probe result); apply `sys.path.insert` prelude if needed
-- `databricks repos update` fails on slashed branch name → use flat naming `deploy-${env}-${SHA}`
-- Stale git folder (workspace still shows prior commit) → explicit `repos update` with `--branch` re-pins
+**`Warning: There are no files to sync, please check your .gitignore`**
+  - `databricks bundle deploy` walks the bundle root using git metadata when a `.git/` directory is present. Without a git repo, it needs explicit `sync.include` patterns in `databricks.yml`.
+  - Fix: `git init -b main` in the bundle repo, or add `sync.include:` patterns covering the directories to upload.
+
+**`error: unable to locate bundle root: databricks.yml not found`**
+  - You ran `databricks bundle ...` from outside the bundle repo. `cd` into the directory containing `databricks.yml`.
+
+**Stale workspace files after a deploy**
+  - DAB performs a differential sync. If workspace files diverged from local (rare; manual workspace edits), re-deploy with `--force-lock` if your target is locked, or delete the target's `files/` subtree in workspace and redeploy.
+
+**Bundle deploy rebases sync to a common parent**
+  - If `sync.paths` in `databricks.yml` points to a directory outside the bundle root (e.g. a sibling LHP checkout), DAB sets its sync root to the lowest common parent of the bundle and the external path. Every `sync.include` pattern then needs the bundle-directory prefix.
+  - Avoid this shape — vendor `lhp_watermark/` into the bundle instead.
 
 ## Related
 
-- [ADR-002](../adr/ADR-002-lhp-runtime-availability.md) — decision record
-- [Phase plan](../../tasks/plan.md) — full implementation plan
-- `.github/workflows/` — CI pipelines (to be updated in Phase 5)
+- [ADR-002](../adr/ADR-002-lhp-runtime-availability.md) — decision record (amended 2026-04-19)
+- [Phase plan](../../tasks/plan.md) — implementation plan + Phase 4 evidence
+- Reference bundle: [`github.com/dwtorres/Wumbo`](https://github.com/dwtorres/Wumbo) — `scooty_puff_junior` (working Path 5 Option A example)
