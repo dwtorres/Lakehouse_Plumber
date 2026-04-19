@@ -431,6 +431,27 @@ def deps(format, output, pipeline, job_name, job_config, bundle_output, verbose)
     )
 
 
+@cli.command("sync-runtime")
+@click.option(
+    "--dest",
+    "-d",
+    default=None,
+    help="Destination directory. Defaults to current working directory; "
+    "the package lands at <dest>/lhp_watermark.",
+)
+@click.option(
+    "--check",
+    is_flag=True,
+    help="Report whether destination matches installed lhp_watermark (exit 1 on drift). No files written.",
+)
+@cli_error_boundary("Sync lhp_watermark runtime")
+def sync_runtime(dest, check):
+    """Vendor the installed lhp_watermark package into a user bundle (ADR-002 Path 5 Option A)."""
+    from .commands.sync_runtime_command import SyncRuntimeCommand
+
+    SyncRuntimeCommand().execute(dest=dest, check=check)
+
+
 # ============================================================================
 # Entry Point
 # ============================================================================
