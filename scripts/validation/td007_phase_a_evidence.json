@@ -1,0 +1,84 @@
+{
+  "meta": {
+    "timestamp": "2026-04-18T14:07:12+00:00",
+    "pyspark_version": "4.1.1",
+    "python_version": "3.12.9"
+  },
+  "results": [
+    {
+      "id": "V1",
+      "name": "Run-scoped write + readback",
+      "verdict": "PASS",
+      "duration_s": 2.0248736247885972,
+      "details": {
+        "landing_root": "/var/folders/pt/vmvb6xrn4kb0k8ljqclxsg0m0000gn/T/td007-validation-9qim1wrf/landing_v1",
+        "run_landing_path": "/var/folders/pt/vmvb6xrn4kb0k8ljqclxsg0m0000gn/T/td007-validation-9qim1wrf/landing_v1/_lhp_runs/job-123-task-456-attempt-0",
+        "parquet_files_written": [
+          "part-00000-153451f6-30d3-4bc9-8299-0a7cd394bdb9-c000.snappy.parquet",
+          "part-00001-153451f6-30d3-4bc9-8299-0a7cd394bdb9-c000.snappy.parquet",
+          "part-00002-153451f6-30d3-4bc9-8299-0a7cd394bdb9-c000.snappy.parquet",
+          "part-00003-153451f6-30d3-4bc9-8299-0a7cd394bdb9-c000.snappy.parquet",
+          "part-00004-153451f6-30d3-4bc9-8299-0a7cd394bdb9-c000.snappy.parquet",
+          "part-00005-153451f6-30d3-4bc9-8299-0a7cd394bdb9-c000.snappy.parquet",
+          "part-00006-153451f6-30d3-4bc9-8299-0a7cd394bdb9-c000.snappy.parquet",
+          "part-00007-153451f6-30d3-4bc9-8299-0a7cd394bdb9-c000.snappy.parquet",
+          "part-00008-153451f6-30d3-4bc9-8299-0a7cd394bdb9-c000.snappy.parquet",
+          "part-00009-153451f6-30d3-4bc9-8299-0a7cd394bdb9-c000.snappy.parquet",
+          "part-00010-153451f6-30d3-4bc9-8299-0a7cd394bdb9-c000.snappy.parquet",
+          "part-00011-153451f6-30d3-4bc9-8299-0a7cd394bdb9-c000.snappy.parquet"
+        ],
+        "expected_count": 100,
+        "readback_count": 100,
+        "ok": true
+      },
+      "error": null
+    },
+    {
+      "id": "V2",
+      "name": "Post-write stats match input",
+      "verdict": "PASS",
+      "duration_s": 0.5158673340920359,
+      "details": {
+        "run_landing_path": "/var/folders/pt/vmvb6xrn4kb0k8ljqclxsg0m0000gn/T/td007-validation-9qim1wrf/landing_v2/_lhp_runs/job-200-task-1-attempt-0",
+        "expected_row_count": 10000,
+        "landed_row_count": 10000,
+        "expected_max_hwm": "2023-11-14 19:59:59",
+        "landed_max_hwm": "2023-11-14 19:59:59",
+        "row_count_match": true,
+        "hwm_match": true,
+        "ok": true
+      },
+      "error": null
+    },
+    {
+      "id": "V3",
+      "name": "Post-write latency within 1.0s for 1000000 rows",
+      "verdict": "PASS",
+      "duration_s": 0.8130238330923021,
+      "details": {
+        "rows": 1000000,
+        "budget_s": 1.0,
+        "measured_s": 0.14611304108984768,
+        "observed_row_count": 1000000,
+        "observed_max_hwm": "2023-11-26 06:59:59",
+        "ok": true
+      },
+      "error": null
+    },
+    {
+      "id": "V4",
+      "name": "Empty-batch write is readable",
+      "verdict": "PASS",
+      "duration_s": 0.781932083889842,
+      "details": {
+        "run_landing_path": "/var/folders/pt/vmvb6xrn4kb0k8ljqclxsg0m0000gn/T/td007-validation-9qim1wrf/landing_v4/_lhp_runs/job-400-task-1-attempt-0",
+        "landed_count": 0,
+        "count_matches_zero": true,
+        "read_succeeded_without_throw": true,
+        "error": null,
+        "ok": true
+      },
+      "error": null
+    }
+  ]
+}

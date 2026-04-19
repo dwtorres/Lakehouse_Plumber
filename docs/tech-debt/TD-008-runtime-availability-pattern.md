@@ -1,36 +1,72 @@
-# TD-008: LHP Runtime Availability Pattern
+# TD-008: LHP Runtime Availability Pattern Violates Constitution P2
 
-**Status**: Resolved
-**Opened**: 2026-04-18 (during TD-007 closure review)
-**Resolved**: 2026-04-19
-**Resolves-via**: [ADR-002](../adr/ADR-002-lhp-runtime-availability.md)
+- **Status**: Open
+- **Severity**: High (constitutional drift; blocks clean production story)
+- **Opened**: 2026-04-18
+- **Opened by**: dwtorres@gmail.com
+- **Surfaced during**: ADR-001 / TD-007 Phase B validation
+- **Owning ADR**: ADR-002 (pending)
+- **Related**: [ADR-001](../adr/ADR-001-jdbc-watermark-parquet-post-write-stats.md), Constitution P2, [src/lhp/templates/bundle/workflow_resource.yml.j2](../../src/lhp/templates/bundle/workflow_resource.yml.j2)
 
-## Problem
+## Summary
 
-The fork's generated extraction notebook (`src/lhp/templates/load/jdbc_watermark_job.py.j2`) imported `from lhp.extensions.watermark_manager import …` and the generated DAB workflow resource attached a Python wheel via `environments.dependencies: [${var.lhp_whl_path}]`.
+The generated DAB workflow resource ships a wheel dependency by default:
 
-Two alignment gaps with upstream LHP intent:
+```yaml
+environments:
+  - environment_key: lhp_env
+    spec:
+      environment_version: "2"
+      dependencies:
+        - ${var.lhp_whl_path}     # ← wheel path, supplied per-bundle
+```
 
-1. **Upstream says** (`README.md`): *"Zero runtime overhead — pure code generation, not a runtime framework."* A Python wheel attached per extraction task is a runtime dependency.
-2. **Maintainer intent for watermark support** ([issue #65](https://github.com/Mmodarre/Lakehouse_Plumber/issues/65)) scopes the feature to "create and maintain a table of high watermarks for tables which gets loaded by external integration tools" — not a Python class instantiated inside the pipeline.
+([src/lhp/templates/bundle/workflow_resource.yml.j2:11](../../src/lhp/templates/bundle/workflow_resource.yml.j2:11), populated by [src/lhp/generators/bundle/workflow_resource.py:77](../../src/lhp/generators/bundle/workflow_resource.py:77).)
 
-## Resolution
+This contradicts Constitution P2 as written:
 
-ADR-002 (amended 2026-04-19) adopted **Path 5: Namespace extraction + DAB workspace-file sync** (Option A):
+> "Runtime deploys as workspace files or production Git folder synced by Databricks Asset Bundles or an admin-managed service principal. A Python wheel is introduced only when reuse, versioning, or rollback operationally requires it."
+>
+> "Generated notebooks import `lhp.extensions.*` and `lhp.runtime.*` from PYTHONPATH, not from an installed wheel."
 
-1. Renamed `src/lhp/extensions/watermark_manager/` → `src/lhp_watermark/` (distinct top-level Python package, sibling to `src/lhp/`).
-2. LHP (`src/lhp/`) reverted to pure code generator.
-3. Generated extraction notebook imports `lhp_watermark.*` (not `lhp.*`).
-4. Runtime library deploys via existing `databricks bundle deploy` workspace-file sync — no wheel attachment, no separate Git Folder step.
-5. Template emits `_lhp_watermark_bootstrap_syspath()` helper to prepend `${workspace.file_path}` to `sys.path` before the `lhp_watermark` imports (Databricks Runtime `client.5.1` does not include that path by default).
+The current template treats wheel as the default deployment vehicle. Constitution P2 says wheel should be a last resort with documented operational justification.
 
-Constitution P2 amended (v1.0 → v1.1) to permit distinct top-level runtime packages.
+## Why This Matters
 
-**Evidence**: Phase 4 E2E smoke test — job run `517674443949620` on `dbc-8e058692-373e.cloud.databricks.com`, TERMINATED SUCCESS (4 extraction tasks + DLT pipeline, 4m 19s).
+- **Constitutional drift undermines the framework's stated shape.** Users reading the constitution and inspecting generated bundles see a direct mismatch.
+- **Operational coupling to wheel build/publish pipeline.** Every bundle deploy implicitly assumes a wheel is reachable at `${var.lhp_whl_path}`. No wheel → broken deploy. Contradicts "no wheel until justified" by making wheel mandatory.
+- **Blocks "one LHP runtime per workspace" vision.** User goal (captured in TD-007 ADR input) is: one shared LHP runtime instance per workspace, many ingestion bundles consume it. Wheel-per-bundle duplicates the runtime image and defeats "one instance".
+- **Cross-env promotion complexity.** Wheel versioning + DAB variable override + environment v2 dependency list is a lot of moving parts for something Constitution P2 expects to be simpler.
 
-## Related
+## Impact
 
-- [ADR-002](../adr/ADR-002-lhp-runtime-availability.md)
-- [Runbook](../runbooks/lhp-runtime-deploy.md)
-- Wumbo reference bundle: https://github.com/dwtorres/Wumbo
-- Constitution v1.1 (`.specs/constitution.md`)
+- Every `jdbc_watermark_v2` flowgroup deploy requires a wheel-build step.
+- Operators cannot bootstrap LHP by simply pulling the repo into a Databricks Git folder.
+- Validation environments have to reproduce the wheel pipeline (or fall back to `sys.path` hacks — what TD-007 Phase B did).
+
+## Candidate Resolutions
+
+ADR-002 will pick among (non-exhaustive, expand during ideation):
+
+1. **Git folder + `sys.path` prelude + env var `LHP_RUNTIME_PATH`.** Admin-managed git folder (e.g. `/Workspace/Shared/lhp_platform/Lakehouse_Plumber@release`). Generated extraction template prepends `sys.path.insert(0, os.environ["LHP_RUNTIME_PATH"])`. Workflow template emits `environments.env_vars: {LHP_RUNTIME_PATH: "${var.lhp_runtime_path}"}`. Wheel variable deprecated.
+2. **DAB workspace_files sync**: platform bundle deploys `src/lhp/**` to `/Workspace/.bundle/lhp_platform/src/`; per-source bundles reference it via convention. Cross-bundle path coupling.
+3. **Wheel via `workspace_file://` reference**: `${var.lhp_whl_path}` points at a workspace-hosted wheel built and synced by DAB. Closer to current shape; still wheel.
+4. **Vendored per bundle**: `lhp generate` copies the `lhp.extensions.*` subset into each generated bundle. Self-contained; duplicates runtime.
+5. **Hybrid**: vendored for single-user/dev workspaces; git folder for team workspaces. Flag on generator.
+
+## Open Questions
+
+- What is the minimum required admin permission set to create `/Workspace/Shared/*` paths? Determines whether Option 1 is feasible for single-user workspaces.
+- Does Databricks serverless Jobs environment v2 honor `env_vars` reliably across restarts? (Probably yes — spec supports it. Validate before committing to Option 1.)
+- How to handle version skew between an ingestion bundle pinned to LHP v0.8.x and a shared git folder that has since moved to v0.9.x? Git folder branch/tag pin vs. bundle-level pin vs. per-env promotion.
+- Do DLT pipelines (CloudFiles side) need LHP runtime at all, or only the extraction notebook? (Phase B evidence suggests: only the extraction notebook needs `lhp.extensions.watermark_manager`. DLT side is pure PySpark + DLT decorators.)
+
+## Non-Goals For This TD
+
+- Changing the YAML contract. Resolution must be runtime/deploy-shape-only.
+- Removing the wheel build from CI entirely. Wheel may still be useful for standalone testing or PyPI-style installs outside Databricks; TD-008 is specifically about the **Databricks runtime deploy** path.
+- Resolving this TD inside ADR-001. TD-007 / ADR-001 explicitly scope runtime-availability out.
+
+## Next Step
+
+Ideation + brainstorm session for ADR-002. Treat as its own `idea-refine` pass with the candidate resolutions above as input. Output: `docs/adr/ADR-002-lhp-runtime-availability.md` + matching `.specs/` entries for generator/template changes.
