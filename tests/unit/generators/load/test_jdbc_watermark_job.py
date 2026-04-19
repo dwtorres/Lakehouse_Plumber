@@ -230,6 +230,50 @@ class TestJDBCWatermarkJobGenerator:
         assert "/Volumes/cat/sch/landing/prod" in notebook
         assert "_lhp_runs" in notebook
 
+    def test_cloudfiles_stub_reads_from_run_scoped_glob(self):
+        """ADR-001 §Negative spot-check: AutoLoader must glob into the
+        run-scoped `_lhp_runs/*` subtree that the extractor writes to."""
+        action = _make_v2_action(landing_path="/Volumes/cat/sch/landing/prod")
+        fg = _make_flowgroup_with_write(action)
+        gen = JDBCWatermarkJobGenerator()
+        dlt_code = gen.generate(action, {"flowgroup": fg})
+        assert ".load(\"/Volumes/cat/sch/landing/prod/_lhp_runs/*\")" in dlt_code, (
+            "CloudFiles DLT notebook must load from the `_lhp_runs/*` glob to "
+            "match the extractor's run-scoped Parquet write path."
+        )
+        # Bare-root load would regress to the pre-ADR-003 CF_EMPTY_DIR symptom
+        assert ".load(\"/Volumes/cat/sch/landing/prod\")" not in dlt_code
+
+    def test_cloudfiles_stub_sets_non_strict_globber_by_default(self):
+        """ADR-001 read-path fix: `*` wildcard needs `useStrictGlobber=false`
+        to match across directory separators on Unity Catalog volumes."""
+        action = _make_v2_action(landing_path="/Volumes/cat/sch/landing/prod")
+        fg = _make_flowgroup_with_write(action)
+        gen = JDBCWatermarkJobGenerator()
+        dlt_code = gen.generate(action, {"flowgroup": fg})
+        assert "cloudFiles.useStrictGlobber" in dlt_code
+        assert '"false"' in dlt_code or "'false'" in dlt_code
+
+    def test_cloudfiles_stub_respects_user_strict_globber_override(self):
+        """Default is off, but an explicit user override must win."""
+        action = _make_v2_action(
+            landing_path="/Volumes/cat/sch/landing/prod",
+            source_overrides={
+                "options": {"cloudFiles.useStrictGlobber": "true"},
+            },
+        )
+        fg = _make_flowgroup_with_write(action)
+        gen = JDBCWatermarkJobGenerator()
+        dlt_code = gen.generate(action, {"flowgroup": fg})
+        # User explicitly opted back into strict globbing — don't override it.
+        import re as _re
+        matches = _re.findall(
+            r'cloudFiles\.useStrictGlobber.{0,80}', dlt_code
+        )
+        assert any("true" in m for m in matches), (
+            f"User override should win. Found occurrences: {matches}"
+        )
+
     def test_extraction_notebook_contains_recovery_hooks(self):
         action = _make_v2_action()
         fg = _make_flowgroup_with_write(action)
