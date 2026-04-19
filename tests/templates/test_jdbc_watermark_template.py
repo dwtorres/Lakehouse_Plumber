@@ -145,7 +145,7 @@ class TestImports:
         """AC-SA-35: template imports ``derive_run_id`` from the runtime module."""
         rendered = _render()
         assert re.search(
-            r"from\s+lhp\.extensions\.watermark_manager\.runtime\s+import\s+[^\n]*derive_run_id",
+            r"from\s+lhp_watermark\.runtime\s+import\s+[^\n]*derive_run_id",
             rendered,
         ), rendered
 
