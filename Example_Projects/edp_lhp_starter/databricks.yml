@@ -1,0 +1,76 @@
+# Databricks Asset Bundle — EDP per-env catalog starter
+#
+# Two physical workspaces:
+#   - devtest workspace hosts the `devtest` target only
+#   - shared qa/prod workspace hosts both `qa` and `prod` targets, isolated by
+#     catalog name and by mode=production permissions
+#
+# Per-target `variables.default_pipeline_catalog` controls the medallion catalog
+# the LHP-emitted pipeline resource binds to (see resources/lhp/*.yml after
+# `lhp generate`). Schema substitutions (bronze_schema, etc.) are resolved
+# from substitutions/<env>.yaml at generate time, not at deploy time, because
+# they participate in pipeline YAML generation rather than DAB resource binding.
+
+bundle:
+  name: edp_lhp_starter
+
+variables:
+  default_pipeline_catalog:
+    description: "Default catalog for LHP-emitted pipelines in this target"
+  default_pipeline_schema:
+    description: "Default schema for LHP-emitted pipelines in this target"
+
+include:
+-   resources/*.yml
+-   resources/lhp/*.yml
+
+sync:
+  include:
+  -   generated/${bundle.target}/*
+
+targets:
+
+  devtest:
+    # Engineer dev / CI deployment to the devtest workspace.
+    # Unity Catalog: external volumes already provisioned and ADLS-backed
+    # under devtest_edp_landing.landing.landing — no Terraform/Bicep in this
+    # bundle (handled by platform team in their account).
+    mode: development
+    default: true
+    workspace:
+      host: https://<your-devtest-workspace>.cloud.databricks.com
+      root_path: ~/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      default_pipeline_catalog: devtest_edp_bronze
+      default_pipeline_schema: bronze
+
+  qa:
+    # CI/CD QA target; shares a workspace with prod, isolated by catalog name.
+    mode: production
+    default: false
+    workspace:
+      host: https://<your-shared-qaprod-workspace>.cloud.databricks.com
+      root_path: /Workspace/ci_cd/.bundle/${bundle.name}/${bundle.target}
+    permissions:
+    -   service_principal_name: <qa-deploy-sp-uuid>
+        level: CAN_MANAGE
+    run_as:
+      service_principal_name: <qa-deploy-sp-uuid>
+    variables:
+      default_pipeline_catalog: qa_edp_bronze
+      default_pipeline_schema: bronze
+
+  prod:
+    # CI/CD prod target; shares the qa workspace, isolated by catalog + SP.
+    mode: production
+    workspace:
+      host: https://<your-shared-qaprod-workspace>.cloud.databricks.com
+      root_path: /Workspace/ci_cd/.bundle/${bundle.name}/${bundle.target}
+    permissions:
+    -   service_principal_name: <prod-deploy-sp-uuid>
+        level: CAN_MANAGE
+    run_as:
+      service_principal_name: <prod-deploy-sp-uuid>
+    variables:
+      default_pipeline_catalog: prod_edp_bronze
+      default_pipeline_schema: bronze

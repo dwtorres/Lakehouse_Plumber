@@ -1,0 +1,40 @@
+# Gold — materialized view aggregating silver.
+#
+# Demonstrates a second cross-catalog hop: gold (${gold_catalog}) reads from
+# silver (${silver_catalog}). materialized_view write_target binds the gold
+# catalog/schema explicitly.
+
+pipeline: edp_gold_marts
+flowgroup: customer_orders_summary
+
+actions:
+
+  - name: load_customer_silver
+    type: load
+    source:
+      type: delta
+      catalog: "${silver_catalog}"
+      schema: "${silver_schema}"
+      table: customer
+    target: v_customer_silver
+
+  - name: aggregate_customer_summary
+    type: transform
+    transform_type: sql
+    source: v_customer_silver
+    target: v_customer_summary
+    sql: |
+      SELECT
+        DATE_TRUNC('month', ModifiedDate) AS month,
+        COUNT(DISTINCT CustomerID)        AS active_customers
+      FROM v_customer_silver
+      GROUP BY DATE_TRUNC('month', ModifiedDate)
+
+  - name: write_customer_summary_gold
+    type: write
+    source: v_customer_summary
+    write_target:
+      type: materialized_view
+      catalog: "${gold_catalog}"
+      schema: "${gold_schema}"
+      table: customer_orders_summary_monthly

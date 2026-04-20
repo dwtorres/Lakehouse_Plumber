@@ -150,7 +150,13 @@ With B1 + B2 evidence in hand, decide ADR-003 §Q4:
 
 Goal: move from dev-tier (`main._landing.landing` managed volume + single-catalog `main`) to the production-shape that survives scale: external ADLS volumes per environment × medallion, `{env}_edp_{medallion}` catalog layout.
 
-### C1 — External ADLS volume setup (one-time, per environment)
+**Revision 2026-04-19 (post-A2/A3)**:
+- **C1 SKIPPED** — production env (devtest workspace + shared qa/prod workspace) already has external ADLS-Gen2-backed UC volumes provisioned by the platform team. No Terraform/Bicep required from this fork.
+- **C2 SHIPPED** as `Example_Projects/edp_lhp_starter/` (3 envs × 3 layers + JDBC watermark v2 + cross-catalog reads + per-env watermark registry; 5 e2e tests pass). Discovered LHP V0.8.2 already supplies everything needed: `WriteTarget.catalog` field, `WatermarkConfig.catalog/schema` fields, modern `${token}` substitution syntax, `source.catalog/schema` on delta sources. Plan's claim of a `source:` field gap was wrong on inspection.
+- **C3 (ADR-004 watermark registry placement = Option B per env)** — codified in starter (each env's `${watermark_catalog}` resolves to `<env>_edp_orchestration`). ADR-004 author still TODO.
+- **C4 (Q5 closure)** — A3 generator-side validator + starter-as-evidence covers the rule; ADR-003 §Q5 ready to flip to Closed once this branch merges.
+
+### C1 — ~~External ADLS volume setup~~ (out of scope; provisioned externally)
 
 **Workspace-admin scope**:
 
@@ -232,10 +238,10 @@ With C1 + C2 + C3 shipped:
 
 ### Phase C exit criteria
 
-- [ ] C1 external volumes live for dev (tst/prod as those envs come online).
-- [ ] C2 LHP supports `source.catalog:` override + generates cross-catalog DLT.
-- [ ] C3 ADR-004 (registry placement) filled in.
-- [ ] C4 ADR-003 §Q5 closed with production-shape evidence.
+- [~] C1 external volumes — out of scope (provisioned by platform team outside this fork).
+- [x] C2 LHP per-env catalog convention + cross-catalog reads — `Example_Projects/edp_lhp_starter/` shipped with 5 e2e tests; LHP V0.8.2 already exposes everything required (no LHP code change needed beyond convention codification).
+- [ ] C3 ADR-004 (watermark registry placement = Option B per env) — convention codified in starter; ADR-004 author still TODO.
+- [~] C4 ADR-003 §Q5 closed with production-shape evidence — A3 generator-side validator (`LHP-CFG-018`) + starter project = full closure, ready to flip §Q5 to Closed once this branch merges.
 
 ## Phase D — Retention policy (opportunistic, independent)
 

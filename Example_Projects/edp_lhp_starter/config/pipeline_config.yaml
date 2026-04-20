@@ -1,0 +1,24 @@
+# Per-pipeline DAB resource config (V0.8.2+ requires explicit catalog/schema
+# per pipeline; auto-detection deprecated for removal in v1.0.0).
+#
+# Multi-document YAML: first doc is project_defaults; subsequent docs override
+# per pipeline name. Tokens (${bronze_catalog}, etc.) resolve from
+# substitutions/<env>.yaml at generate time.
+
+project_defaults:
+  serverless: true
+
+---
+pipeline: edp_bronze_jdbc_ingestion
+catalog: "${bronze_catalog}"
+schema: "${bronze_schema}"
+
+---
+pipeline: edp_silver_curation
+catalog: "${silver_catalog}"
+schema: "${silver_schema}"
+
+---
+pipeline: edp_gold_marts
+catalog: "${gold_catalog}"
+schema: "${gold_schema}"
