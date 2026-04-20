@@ -378,3 +378,140 @@ class TestExistingIntegrationContract:
         rendered = _render(watermark_type="numeric", watermark_operator=">")
         ast.parse(rendered)
         black.format_str(rendered, mode=black.Mode(line_length=88))
+
+
+# ---------------------- ADR-003 §Q3 empty-batch hardening --------------
+
+
+class TestEmptyBatchSchemaFallback:
+    """ADR-003 follow-up A2 / §Q3.
+
+    When an incremental JDBC extract returns zero rows, Spark's plain
+    ``df.write.parquet(path)`` typically emits only a ``_SUCCESS`` marker
+    with no schema-bearing part file. AutoLoader on the bronze side then
+    fails the next run with ``CF_EMPTY_DIR_FOR_SCHEMA_INFERENCE`` because
+    the run-scoped landing dir contains no parquet to infer schema from
+    (and the persisted ``cloudFiles.schemaLocation`` is empty on the very
+    first incremental run).
+
+    The extractor template must therefore detect this case and write a
+    0-row, schema-bearing parquet using the JDBC ``df.schema`` so the
+    landing path is non-empty for AutoLoader.
+    """
+
+    def test_empty_batch_writes_schema_bearing_parquet(self):
+        """Template must emit a fallback write of an empty DF with df.schema."""
+        rendered = _render()
+        # The fallback path uses spark.createDataFrame([], df.schema) so the
+        # JDBC schema (already known post-read) is preserved into the parquet
+        # without re-inferring from the empty source.
+        assert "createDataFrame([], df.schema)" in rendered, (
+            "Empty-batch fallback must construct an empty DF from df.schema "
+            "to preserve the JDBC schema for AutoLoader."
+        )
+
+    def test_empty_batch_fallback_emits_parquet_format(self):
+        """The fallback DF must be written as parquet, mode=overwrite."""
+        rendered = _render()
+        # AST-level: find the createDataFrame([], df.schema) call and walk
+        # forward to confirm a .write...format("parquet").save(...) chain.
+        tree = _parse(rendered)
+        chains = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not (isinstance(node.func, ast.Attribute) and node.func.attr == "save"):
+                continue
+            chain_src = ast.unparse(node)
+            if "createDataFrame([], df.schema)" in chain_src:
+                chains.append(chain_src)
+        assert chains, (
+            "Expected at least one .save(...) chain that originates from "
+            "spark.createDataFrame([], df.schema)"
+        )
+        chain = chains[0]
+        assert 'format("parquet")' in chain or "format('parquet')" in chain, chain
+        assert 'mode("overwrite")' in chain or "mode('overwrite')" in chain, chain
+
+    def test_empty_batch_fallback_is_guarded_by_landing_check(self):
+        """Fallback must only fire when the natural write produced no parquet.
+
+        Structural assertion: the ``createDataFrame([], df.schema)`` call
+        sits inside an ``if not _landing_has_parquet(...)`` branch (or
+        equivalent ``else`` of an ``if _landing_has_parquet(...)`` check)
+        so a successful non-empty write does not get re-overwritten.
+        """
+        rendered = _render()
+        tree = _parse(rendered)
+
+        def _contains_empty_create(stmts) -> bool:
+            for stmt in stmts:
+                for sub in ast.walk(stmt):
+                    if isinstance(sub, ast.Call):
+                        src = ast.unparse(sub)
+                        if "createDataFrame([], df.schema)" in src:
+                            return True
+            return False
+
+        # Find any If whose test references _landing_has_parquet AND whose
+        # empty-branch (orelse for "if has_parquet", body for "if not")
+        # contains the schema-fallback call.
+        guarded = False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.If):
+                continue
+            test_src = ast.unparse(node.test)
+            if "_landing_has_parquet" not in test_src:
+                continue
+            empty_branch = node.orelse if "not " not in test_src else node.body
+            if _contains_empty_create(empty_branch):
+                guarded = True
+                break
+        assert guarded, (
+            "Schema-bearing empty-parquet fallback must live inside an "
+            "if/else branch keyed on _landing_has_parquet, so it only "
+            "fires when the natural write produced no part file."
+        )
+
+    def test_empty_batch_fallback_logs_phase_event(self):
+        """Operability: an empty-fallback write must emit a structured log event.
+
+        The existing log phases (jdbc_read_start/complete, landing_write_*,
+        finalization_*) bracket the happy path. An empty-batch fallback is
+        an unusual control-flow transition and must be observable post-hoc
+        in the run log without re-deriving from absence of other events.
+        """
+        rendered = _render()
+        # Allow either a dedicated phase name or an explicit subevent under
+        # landing_write_complete; assert at least one of them is present.
+        assert (
+            "landing_empty_schema_fallback" in rendered
+            or "empty_schema_fallback" in rendered
+        ), (
+            "Empty-batch fallback must call _log_phase with a recognisable "
+            "name (e.g. 'landing_empty_schema_fallback') so the run log "
+            "records the fallback fired."
+        )
+
+    def test_empty_batch_fallback_renders_for_numeric_watermark_too(self):
+        """Both watermark branches must include the fallback (it sits outside the branch)."""
+        rendered = _render(watermark_type="numeric", watermark_operator=">")
+        assert "createDataFrame([], df.schema)" in rendered
+
+    def test_existing_control_flow_contract_unchanged(self):
+        """Adding the fallback must not break the L2 §5.3 structure.
+
+        Re-runs the spine assertions from TestControlFlowContract on the
+        post-fallback render so a regression in the fallback wiring fails
+        loudly here rather than indirectly via integration tests.
+        """
+        rendered = _render()
+        tree = _parse(rendered)
+
+        # insert_new still at module scope, exactly once, never inside try.
+        module_level = _module_level_calls(tree, "insert_new")
+        assert len(module_level) == 1
+        assert _calls_inside_try(tree, "insert_new") == []
+
+        # mark_complete still after the try, never inside it.
+        assert _calls_inside_try(tree, "mark_complete") == []

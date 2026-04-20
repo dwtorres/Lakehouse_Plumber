@@ -225,6 +225,21 @@ try:
         row_count = agg_result["row_count"]
         new_hwm = agg_result["max_hwm"]
     else:
+        # ADR-003 §Q3 / A2: a plain df.write.parquet of an empty DataFrame
+        # emits only a _SUCCESS marker, no schema-bearing part file.
+        # AutoLoader on the bronze side then fails the next run with
+        # CF_EMPTY_DIR_FOR_SCHEMA_INFERENCE because cloudFiles.schemaLocation
+        # is empty on the very first incremental run. Reuse the JDBC
+        # df.schema (already known post-read) to write a 0-row, schema-bearing
+        # parquet so the landing path is non-empty for AutoLoader.
+        _log_phase(
+            "landing_empty_schema_fallback",
+            landing_path=run_landing_path,
+            schema=df.schema.simpleString(),
+        )
+        spark.createDataFrame([], df.schema).coalesce(1).write.mode(
+            "overwrite"
+        ).format("parquet").save(run_landing_path)
         row_count = 0
         new_hwm = hwm_value
     _log_phase(
