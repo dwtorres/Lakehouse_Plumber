@@ -7,8 +7,10 @@
 #
 # Convention: <env>_edp_<medallion>
 #   devtest_edp_bronze, devtest_edp_silver, devtest_edp_gold,
-#   devtest_edp_landing, devtest_edp_orchestration
+#   devtest_edp_landing
 #   (and same for qa / prod)
+# Watermark registry follows ADR-004 Option C: shared `metadata` catalog,
+# per-env `<env>_orchestration` schema (e.g. metadata.devtest_orchestration).
 #
 # Workspace layout:
 #   - devtest deploys to the devtest workspace

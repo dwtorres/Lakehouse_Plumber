@@ -7,17 +7,21 @@ prod:
   silver_catalog: prod_edp_silver
   gold_catalog: prod_edp_gold
   landing_catalog: prod_edp_landing
-  watermark_catalog: prod_edp_orchestration
+  watermark_catalog: metadata
 
   bronze_schema: bronze
   silver_schema: silver
   gold_schema: gold
   landing_schema: landing
-  watermark_schema: watermarks
+  watermark_schema: prod_orchestration
 
   landing_volume_root: /Volumes/${landing_catalog}/${landing_schema}/landing
 
   serverless: true
+
+  # JDBC source — replace with the prod-tier source connection details.
+  jdbc_url: "jdbc:postgresql://<prod-source-host>:5432/postgres?sslmode=require"
+  jdbc_driver: "org.postgresql.Driver"
 
 secrets:
   default_scope: prod_secrets

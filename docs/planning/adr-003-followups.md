@@ -185,7 +185,8 @@ dev:
   gold_catalog: devtest_edp_gold
   landing_catalog: devtest_edp_landing     # NEW — replaces main._landing
   landing_schema: landing
-  watermark_catalog: devtest_edp_orchestration   # per-env registry (Agent 2 Option B)
+  watermark_catalog: metadata                     # ADR-004 Option C (revised 2026-04-19; Option B per-env catalog rejected, see ADR-004 §Revision)
+  watermark_schema: devtest_orchestration         # per-env schema in shared metadata catalog
 ```
 
 **DAB target**:

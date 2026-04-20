@@ -137,8 +137,16 @@ def _check_landing_schema_overlap(
     if write_action is None:
         return
 
-    write_catalog = getattr(write_action.write_target, "catalog", None) or ""
-    write_schema = getattr(write_action.write_target, "schema", None) or ""
+    # write_target may be parsed as a dict (raw YAML) or as a WriteTarget
+    # pydantic model depending on call site. Support both — getattr on a dict
+    # always returns None, which silently disables the overlap check.
+    wt = write_action.write_target
+    if isinstance(wt, dict):
+        write_catalog = (wt.get("catalog") or "")
+        write_schema = (wt.get("schema") or "")
+    else:
+        write_catalog = getattr(wt, "catalog", None) or ""
+        write_schema = getattr(wt, "schema", None) or ""
 
     if landing_catalog != write_catalog:
         logger.warning(

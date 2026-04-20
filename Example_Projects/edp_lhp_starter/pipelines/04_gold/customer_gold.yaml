@@ -15,7 +15,7 @@ actions:
       type: delta
       catalog: "${silver_catalog}"
       schema: "${silver_schema}"
-      table: customer
+      table: department
     target: v_customer_silver
 
   - name: aggregate_customer_summary
@@ -25,10 +25,11 @@ actions:
     target: v_customer_summary
     sql: |
       SELECT
-        DATE_TRUNC('month', ModifiedDate) AS month,
-        COUNT(DISTINCT CustomerID)        AS active_customers
+        group_name,
+        COUNT(DISTINCT DepartmentID) AS department_count,
+        MAX(ModifiedDate)            AS last_modified
       FROM v_customer_silver
-      GROUP BY DATE_TRUNC('month', ModifiedDate)
+      GROUP BY group_name
 
   - name: write_customer_summary_gold
     type: write

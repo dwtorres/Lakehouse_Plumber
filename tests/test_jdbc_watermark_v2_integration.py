@@ -38,7 +38,7 @@ actions:
       operator: ">="
       source_system_id: "pg_crm"
     target: v_product_raw
-    landing_path: "/Volumes/bronze_catalog/bronze/landing/product"
+    landing_path: "/Volumes/bronze_catalog/landing/landing/product"
 
   - name: write_product_bronze
     type: write
@@ -104,9 +104,9 @@ class TestJDBCWatermarkV2Integration:
     def test_dlt_stub_references_landing_path(self, v2_project):
         generated, _ = self._generate(v2_project)
         code = generated["product_ingestion.py"]
-        assert "/Volumes/bronze_catalog/bronze/landing/product" in code
+        assert "/Volumes/bronze_catalog/landing/landing/product" in code
         assert (
-            "/Volumes/bronze_catalog/bronze/landing/_lhp_schema/load_product_jdbc"
+            "/Volumes/bronze_catalog/landing/landing/_lhp_schema/load_product_jdbc"
             in code
         )
 
@@ -290,7 +290,7 @@ actions:
       operator: ">="
       source_system_id: "pg_crm"
     target: v_product_raw
-    landing_path: "/Volumes/bronze_catalog/bronze/landing/product"
+    landing_path: "/Volumes/bronze_catalog/landing/landing/product"
 
   - name: write_product_bronze
     type: write

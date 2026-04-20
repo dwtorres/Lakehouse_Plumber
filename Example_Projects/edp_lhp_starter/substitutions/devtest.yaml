@@ -12,15 +12,16 @@ devtest:
   silver_catalog: devtest_edp_silver
   gold_catalog: devtest_edp_gold
   landing_catalog: devtest_edp_landing
-  # Per-env watermark registry (per ADR-004 placement = Option B)
-  watermark_catalog: devtest_edp_orchestration
+  # Per-env watermark registry (per ADR-004 placement = Option C):
+  # shared `metadata` catalog, env-scoped schema. See docs/adr/ADR-004.
+  watermark_catalog: metadata
 
   # Schemas (flat within each catalog)
   bronze_schema: bronze
   silver_schema: silver
   gold_schema: gold
   landing_schema: landing
-  watermark_schema: watermarks
+  watermark_schema: devtest_orchestration
 
   # Landing volume root — external ADLS-backed UC volume, provisioned by
   # the platform team. JDBC watermark v2 extractors write to
@@ -30,8 +31,13 @@ devtest:
   # Cluster / serverless defaults
   serverless: true
 
+  # JDBC source connection — Wumbo's existing AdventureWorks-on-Supabase
+  # devtest source. Real keys live in `dev-secrets` scope.
+  jdbc_url: "jdbc:postgresql://aws-0-us-west-2.pooler.supabase.com:5432/postgres?sslmode=require"
+  jdbc_driver: "org.postgresql.Driver"
+
 secrets:
-  default_scope: devtest_secrets
+  default_scope: dev-secrets
   scopes:
-    database: devtest_db_secrets
-    api: devtest_api_secrets
+    database: dev-secrets
+    api: dev-secrets

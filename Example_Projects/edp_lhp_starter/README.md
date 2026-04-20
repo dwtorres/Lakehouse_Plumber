@@ -32,16 +32,21 @@ edp_lhp_starter/
 
 ## Catalog convention
 
-| Layer        | Catalog token         | Resolves to (devtest)            | Schema token        |
-| ------------ | --------------------- | -------------------------------- | ------------------- |
-| Landing      | `{landing_catalog}`   | `devtest_edp_landing`            | `{landing_schema}`  |
-| Bronze       | `{bronze_catalog}`    | `devtest_edp_bronze`             | `{bronze_schema}`   |
-| Silver       | `{silver_catalog}`    | `devtest_edp_silver`             | `{silver_schema}`   |
-| Gold         | `{gold_catalog}`      | `devtest_edp_gold`               | `{gold_schema}`     |
-| Watermarks   | `{watermark_catalog}` | `devtest_edp_orchestration`      | `{watermark_schema}`|
+| Layer        | Catalog token         | Resolves to (devtest)         | Schema token         | Resolves to (devtest)        |
+| ------------ | --------------------- | ----------------------------- | -------------------- | ---------------------------- |
+| Landing      | `${landing_catalog}`  | `devtest_edp_landing`         | `${landing_schema}`  | `landing`                    |
+| Bronze       | `${bronze_catalog}`   | `devtest_edp_bronze`          | `${bronze_schema}`   | `bronze`                     |
+| Silver       | `${silver_catalog}`   | `devtest_edp_silver`          | `${silver_schema}`   | `silver`                     |
+| Gold         | `${gold_catalog}`     | `devtest_edp_gold`            | `${gold_schema}`     | `gold`                       |
+| Watermarks   | `${watermark_catalog}`| `metadata` (shared)           | `${watermark_schema}`| `devtest_orchestration`      |
 
-Schemas inside each catalog are flat (`bronze`, `silver`, `gold`, `landing`,
-`watermarks`) so the same `{X_schema}` token reuses across envs.
+Schemas inside each medallion catalog are flat (`bronze`, `silver`, `gold`, `landing`)
+so the same `${X_schema}` token reuses across envs. The watermark registry follows a
+**different shape** per [ADR-004](../../docs/adr/ADR-004-watermark-registry-placement.md):
+shared `metadata` catalog, env-scoped schema (`metadata.<env>_orchestration.watermarks`).
+Operational metadata is platform infrastructure, not env data — schema-level isolation
+gives equivalent runtime blast-radius bounds at the SCHEMA + TABLE level without
+provisioning a separate catalog per env.
 
 ## Workspace layout
 
@@ -80,12 +85,18 @@ write_target:
 
 ## Watermark registry placement
 
-The watermark catalog is per-env (`devtest_edp_orchestration`,
-`qa_edp_orchestration`, `prod_edp_orchestration`), not platform-shared. This
-matches Databricks' "catalogs as primary unit of data isolation" guidance and
-bounds the deletion blast radius per env. Tradeoff: cross-env analytical
-queries against the watermark table require explicit catalog references. See
-ADR-004 for the full rationale.
+The watermark registry uses a **shared `metadata` catalog with env-scoped schemas**:
+
+- `metadata.devtest_orchestration.watermarks`
+- `metadata.qa_orchestration.watermarks`
+- `metadata.prod_orchestration.watermarks`
+
+Per [ADR-004](../../docs/adr/ADR-004-watermark-registry-placement.md) (Option C),
+operational metadata is platform infrastructure not env data; schema-level
+GRANT bounds runtime blast radius identically to catalog-level GRANT for
+this workload while requiring only one catalog provisioning pass. Each
+env's deploy service principal gets `MODIFY` on its own schema only — no
+cross-env writes possible.
 
 ## External ADLS volumes
 
