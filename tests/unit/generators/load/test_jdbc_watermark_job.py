@@ -553,6 +553,32 @@ class TestJDBCWatermarkJobGenerator:
         # insert_new receives the same validated variable.
         assert "watermark_column_name=watermark_column" in notebook
 
+    def test_extraction_notebook_writes_schema_bearing_parquet_on_empty_batch(self):
+        """ADR-003 §Q3 / A2: empty incremental batch must still leave a
+        schema-bearing parquet at the run-scoped landing path.
+
+        Without this fallback, AutoLoader on the bronze side fails the
+        next run with ``CF_EMPTY_DIR_FOR_SCHEMA_INFERENCE`` because plain
+        ``df.write.parquet`` on an empty DataFrame writes only a
+        ``_SUCCESS`` marker. The extractor must construct an empty
+        DataFrame from the JDBC ``df.schema`` and write that as parquet
+        when the natural write produced no part file.
+        """
+        action = _make_v2_action()
+        fg = _make_flowgroup_with_write(action)
+        gen = JDBCWatermarkJobGenerator()
+        gen.generate(action, {"flowgroup": fg})
+        notebook = fg._auxiliary_files[f"__lhp_extract_{action.name}.py"]
+        assert "createDataFrame([], df.schema)" in notebook, (
+            "Extraction notebook must write a schema-bearing 0-row parquet "
+            "when the JDBC read returned no rows."
+        )
+        # The fallback is observable in the run log.
+        assert (
+            "landing_empty_schema_fallback" in notebook
+            or "empty_schema_fallback" in notebook
+        )
+
     def test_column_with_embedded_quote_escaped(self):
         """Column name with an embedded double-quote survives as Python-escaped literal.
 
@@ -576,3 +602,89 @@ class TestJDBCWatermarkJobGenerator:
         # Runtime ANSI-quoting helper is present — that's what doubles " at
         # execution time when composing the JDBC WHERE clause.
         assert "_ansi_quote_identifier" in notebook
+
+
+class TestLandingSchemaOverlapGuard:
+    """ADR-003 A3: landing_path must not share catalog+schema with bronze write target."""
+
+    def _make_overlap_action(self, landing_path):
+        return _make_v2_action(landing_path=landing_path)
+
+    def _make_overlap_flowgroup(self, action, write_catalog="bronze_catalog", write_schema="bronze_schema"):
+        write_action = Action(
+            name="write_product_bronze",
+            type="write",
+            source=action.target,
+            write_target=WriteTarget(
+                type="streaming_table",
+                catalog=write_catalog,
+                schema=write_schema,
+                table="product",
+                table_properties={"delta.enableChangeDataFeed": "true"},
+            ),
+        )
+        return FlowGroup(
+            pipeline="test_pipeline",
+            flowgroup="test_flowgroup",
+            actions=[action, write_action],
+        )
+
+    @pytest.mark.unit
+    def test_same_catalog_same_schema_raises_config_error(self):
+        """landing_path in same catalog+schema as bronze write target must raise LHPConfigError."""
+        from lhp.utils.error_formatter import LHPConfigError
+
+        action = self._make_overlap_action(
+            landing_path="/Volumes/bronze_catalog/bronze_schema/landing/product"
+        )
+        fg = self._make_overlap_flowgroup(action, "bronze_catalog", "bronze_schema")
+        gen = JDBCWatermarkJobGenerator()
+        with pytest.raises(LHPConfigError) as exc_info:
+            gen.generate(action, {"flowgroup": fg})
+        err_msg = str(exc_info.value)
+        assert "bronze_schema" in err_msg
+        assert "LHP-CFG-018" in err_msg
+
+    @pytest.mark.unit
+    def test_same_catalog_different_schema_generates_without_error(self):
+        """landing_path in same catalog but different schema from bronze must succeed."""
+        action = self._make_overlap_action(
+            landing_path="/Volumes/bronze_catalog/landing/data/product"
+        )
+        fg = self._make_overlap_flowgroup(action, "bronze_catalog", "bronze_schema")
+        gen = JDBCWatermarkJobGenerator()
+        code = gen.generate(action, {"flowgroup": fg})
+        assert 'format("cloudFiles")' in code
+
+    @pytest.mark.unit
+    def test_different_catalog_generates_with_warning(self, caplog):
+        """landing_path in a different catalog from bronze should generate but emit a warning."""
+        import logging
+
+        action = self._make_overlap_action(
+            landing_path="/Volumes/landing_catalog/bronze_schema/data/product"
+        )
+        fg = self._make_overlap_flowgroup(action, "bronze_catalog", "bronze_schema")
+        gen = JDBCWatermarkJobGenerator()
+        with caplog.at_level(logging.WARNING, logger="lhp.generators.load.jdbc_watermark_job"):
+            code = gen.generate(action, {"flowgroup": fg})
+        assert 'format("cloudFiles")' in code
+        assert any("cross-catalog" in r.message.lower() or "landing_catalog" in r.message for r in caplog.records)
+
+    @pytest.mark.unit
+    def test_non_uc_landing_path_generates_without_error_or_warning(self, caplog):
+        """abfss:// landing_path must skip the schema overlap check entirely."""
+        import logging
+
+        action = self._make_overlap_action(
+            landing_path="abfss://container@account.dfs.core.windows.net/landing/product"
+        )
+        fg = self._make_overlap_flowgroup(action, "bronze_catalog", "bronze_schema")
+        gen = JDBCWatermarkJobGenerator()
+        with caplog.at_level(logging.WARNING, logger="lhp.generators.load.jdbc_watermark_job"):
+            code = gen.generate(action, {"flowgroup": fg})
+        assert 'format("cloudFiles")' in code
+        assert not any(
+            "cross-catalog" in r.message.lower() or "overlap" in r.message.lower()
+            for r in caplog.records
+        )

@@ -386,6 +386,48 @@ the ``template_parameters`` section of the flowgroup.
 
    :doc:`templates_reference` for how templates and parameters work.
 
+LHP-CFG-018: Landing Path Overlaps Bronze Write Schema
+------------------------------------------------------
+
+**When it occurs:** A ``jdbc_watermark_v2`` action's ``landing_path`` resolves to the
+same Unity Catalog catalog and schema as the flowgroup's bronze write target.
+
+**Why it is an error:** AutoLoader reads Parquet from a UC managed volume and the Delta
+table write target both require exclusive ownership of their UC schema location. When they
+share a schema, Databricks raises ``LOCATION_OVERLAP`` at pipeline startup and refuses to
+create the table.
+
+**Common causes:**
+
+- Copied a flowgroup YAML and forgot to update ``landing_path`` to a dedicated schema
+- Used the same ``<catalog>/<schema>`` segment in the volume path as in ``write_target``
+
+**Resolution:**
+
+1. Change ``landing_path`` to a UC volume in a dedicated landing schema, e.g.
+   ``/Volumes/<catalog>/landing_<schema>/<table>``
+2. Or use an external location (``abfss://``) that is outside Unity Catalog managed storage
+
+.. code-block:: yaml
+   :caption: Before (triggers LHP-CFG-018)
+
+   landing_path: /Volumes/bronze_catalog/bronze_schema/landing/product
+   write_target:
+     catalog: bronze_catalog
+     schema: bronze_schema
+
+.. code-block:: yaml
+   :caption: After (fixed)
+
+   landing_path: /Volumes/bronze_catalog/landing_bronze/product
+   write_target:
+     catalog: bronze_catalog
+     schema: bronze_schema
+
+.. seealso::
+
+   ADR-003 §Q5 for the full analysis of the ``UC LOCATION_OVERLAP`` failure mode.
+
 LHP-CFG-020: Bundle Resource Error
 -----------------------------------
 
