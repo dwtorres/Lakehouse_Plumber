@@ -148,9 +148,12 @@ class MonitoringMaterializedViewConfig(BaseModel):
 class MonitoringConfig(BaseModel):
     """Project-level monitoring pipeline configuration.
 
-    Controls automatic creation of a synthetic monitoring pipeline that UNIONs
-    all pipeline event log tables into a single streaming table with optional
-    materialized views for analysis.
+    Generates two artifacts:
+    1. A standalone notebook that runs N independent streaming queries (one per
+       pipeline event log) appending into a user-created Delta table.
+    2. A DLT pipeline with materialized views only, reading from that Delta table.
+
+    A Databricks Workflow job chains: notebook_task (union) → pipeline_task (MVs).
     """
 
     model_config = ConfigDict(populate_by_name=True)
@@ -159,9 +162,21 @@ class MonitoringConfig(BaseModel):
     pipeline_name: Optional[str] = None  # default: {project_name}_event_log_monitoring
     catalog: Optional[str] = None  # default: event_log.catalog
     schema_: Optional[str] = Field(None, alias="schema")  # default: event_log.schema
-    streaming_table: str = "all_pipelines_event_log"
+    streaming_table: str = "all_pipelines_event_log"  # user-created Delta table
+    checkpoint_path: str = ""  # streaming checkpoint base path (required when enabled)
+    max_concurrent_streams: int = 10  # ThreadPoolExecutor max_workers
     materialized_views: Optional[List[MonitoringMaterializedViewConfig]] = None
     enable_job_monitoring: bool = False
+
+
+class TestReportingConfig(BaseModel):
+    """Configuration for test result reporting to external systems."""
+
+    __test__ = False  # Tell pytest this is not a test class
+
+    module_path: str
+    function_name: str
+    config_file: Optional[str] = None
 
 
 class ProjectConfig(BaseModel):
@@ -177,6 +192,7 @@ class ProjectConfig(BaseModel):
     event_log: Optional[EventLogConfig] = None
     monitoring: Optional[MonitoringConfig] = None
     required_lhp_version: Optional[str] = None
+    test_reporting: Optional[TestReportingConfig] = None
 
 
 class WriteTarget(BaseModel):
@@ -301,6 +317,12 @@ class Action(BaseModel):
     lookup_columns: Optional[List[str]] = None  # Lookup columns
     lookup_result_columns: Optional[List[str]] = None  # Expected result columns
     expectations: Optional[List[Dict[str, Any]]] = None  # Custom expectations
+    test_id: Optional[str] = None  # External test management ID for reporting
+
+    @property
+    def resolved_test_target(self) -> str:
+        """Canonical target name for test actions: explicit target or tmp_test_{name}."""
+        return self.target or f"tmp_test_{self.name}"
 
     def model_post_init(self, __context: Any) -> None:
         """Post-initialization processing - normalize all path fields for cross-platform compatibility."""
@@ -358,6 +380,7 @@ class FlowGroup(BaseModel):
     )
     _synthetic: bool = PrivateAttr(default=False)
     _auxiliary_files: Dict[str, str] = PrivateAttr(default_factory=dict)
+    _has_original_test_actions: bool = PrivateAttr(default=False)
 
 
 class Template(BaseModel):

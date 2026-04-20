@@ -201,6 +201,7 @@ class ConfigFieldValidator:
             "watermark",
             # JDBC watermark v2 landing zone path
             "landing_path",
+            "test_id",
         }
 
     def validate_load_source(

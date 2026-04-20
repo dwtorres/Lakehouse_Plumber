@@ -2,6 +2,7 @@
 
 import logging
 import sys
+import warnings
 from pathlib import Path
 from typing import List, Optional
 
@@ -91,6 +92,8 @@ def configure_logging(verbose: bool, project_root: Optional[Path] = None):
         )
         file_handler.setFormatter(file_formatter)
         root_logger.addHandler(file_handler)
+
+    warnings.filterwarnings("default", category=DeprecationWarning, module=r"lhp\.")
 
     return str(log_file_path) if log_file_path else None
 
@@ -304,12 +307,18 @@ def generate(
 @click.option("--env", "-e", default="dev", help="Environment")
 @click.option("--pipeline", "-p", help="Specific pipeline to validate")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option(
+    "--include-tests",
+    is_flag=True,
+    default=False,
+    help="Include test actions in validation (matches generate behavior)",
+)
 @cli_error_boundary("Pipeline validation")
-def validate(env, pipeline, verbose):
+def validate(env, pipeline, verbose, include_tests):
     """Validate pipeline configurations"""
     from .commands.validate_command import ValidateCommand
 
-    ValidateCommand().execute(env, pipeline, verbose)
+    ValidateCommand().execute(env, pipeline, verbose, include_tests)
 
 
 @cli.command()
