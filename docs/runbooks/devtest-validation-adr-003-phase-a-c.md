@@ -15,12 +15,12 @@ Discharge the four outstanding manual validation items from PRs #6 / #7 / #8 / #
 
 | # | Validates | PR | ADR success criterion impacted |
 |---|-----------|----|-------------------------------|
-| 1 | A2 — empty-batch schema-bearing fallback | [#6](https://github.com/dwtorres/Lakehouse_Plumber/pull/6) | ADR-003 §Q3 `[~]` → `[x]` |
-| 2 | A3 — generator-side landing-schema overlap guard | [#7](https://github.com/dwtorres/Lakehouse_Plumber/pull/7) | ADR-003 §Q5 (already closed; this is a regression-guard smoke) |
-| 3 | C2 — per-env catalog convention end-to-end | [#8](https://github.com/dwtorres/Lakehouse_Plumber/pull/8) | ADR-003 §Q5 (already closed; this is the production-shape evidence) |
-| 4 | ADR-004 — per-env watermark registry write | [#9](https://github.com/dwtorres/Lakehouse_Plumber/pull/9) | confirms ADR-004 §Implementation Status |
+| 1 | A3 — generator-side landing-schema overlap guard | [#7](https://github.com/dwtorres/Lakehouse_Plumber/pull/7) | ADR-003 §Q5 (already closed; this is a regression-guard smoke) |
+| 2 | C2 — per-env catalog convention end-to-end | [#8](https://github.com/dwtorres/Lakehouse_Plumber/pull/8) | ADR-003 §Q5 (already closed; this is the production-shape evidence). **Bootstraps the watermark registry table** as a side effect (auto-CREATE on first `WatermarkManager()` call). |
+| 3 | ADR-004 — per-env watermark registry write | [#9](https://github.com/dwtorres/Lakehouse_Plumber/pull/9) | confirms ADR-004 §Implementation Status |
+| 4 | A2 — empty-batch schema-bearing fallback | [#6](https://github.com/dwtorres/Lakehouse_Plumber/pull/6) | ADR-003 §Q3 `[~]` → `[x]`. **Requires Step 2 to have run first** (Step 4's sentinel `INSERT INTO metadata.<env>_orchestration.watermarks` only works after Step 2 auto-created the table). |
 
-Run them in numerical order. Steps 3 + 4 share the same deploy and can be observed in one bundle run.
+Run in numerical order. Step 1 (A3) is local-only and can run any time. Steps 2 + 3 share the same deploy and can be observed in one bundle run. Step 4 (A2) **must** follow Step 2 because the Delta watermark table is created on first `WatermarkManager()` call — INSERT against a non-existent table fails with `[TABLE_OR_VIEW_NOT_FOUND]`.
 
 ---
 
@@ -88,110 +88,13 @@ Before any step:
 
 ---
 
-## Step 1 — A2: empty-batch schema-bearing fallback
-
-**Goal**: prove that an incremental JDBC extract that returns zero rows still leaves a schema-bearing parquet at `{landing_volume_root}/customer/_lhp_runs/<uuid>/`, so the bronze AutoLoader does not fail with `CF_EMPTY_DIR_FOR_SCHEMA_INFERENCE` on the next run.
-
-### 1.1 — Force the customer source to return zero rows
-
-Two options:
-
-**Option a (recommended)** — temporarily override `WHERE` clause via watermark setup:
-
-```sql
--- Run in `metadata` catalog SQL editor (ADR-004 Option C — shared catalog, per-env schema):
--- Pre-seed the watermark to a future timestamp so the extractor reads zero rows.
-INSERT INTO metadata.devtest_orchestration.watermarks (
-  source_system_id, schema_name, table_name,
-  watermark_column_name, watermark_value, row_count,
-  status, created_at, updated_at, run_id, extraction_type
-) VALUES (
-  'pg_edp', 'public', 'customer',
-  'ModifiedDate', '2099-12-31T00:00:00.000000+00:00', 0,
-  'COMPLETED', current_timestamp(), current_timestamp(),
-  'sentinel-empty-batch-test', 'incremental'
-);
-```
-
-**Option b** — edit `customer_bronze.yaml` to point at an empty source table.
-
-### 1.2 — Vendor runtime + generate + deploy + run
-
-```bash
-cd Example_Projects/edp_lhp_starter
-
-# Vendor the runtime library (per ADR-002 / lhp-runtime-deploy.md)
-lhp sync-runtime
-
-lhp generate -e devtest --pipeline-config config/pipeline_config.yaml --force
-databricks bundle validate -t devtest -p dbc-8e058692-373e
-databricks bundle deploy   -t devtest -p dbc-8e058692-373e
-
-# Run only the JDBC extract task, not the bronze DLT yet
-databricks bundle run \
-  -t devtest -p dbc-8e058692-373e \
-  edp_bronze_jdbc_ingestion_workflow
-```
-
-### 1.3 — Observe the landing path
-
-```bash
-databricks fs ls \
-  dbfs:/Volumes/devtest_edp_landing/landing/landing/customer/_lhp_runs/ \
-  -p dbc-8e058692-373e
-
-# Expect: at least one <uuid>/ subdirectory containing one *.parquet file
-```
-
-Inspect the parquet — it must have schema but zero rows:
-
-```bash
-# In a Databricks notebook attached to a serverless cluster:
-landing = "/Volumes/devtest_edp_landing/landing/landing/customer/_lhp_runs"
-import os
-latest = max(
-    [f.path for f in dbutils.fs.ls(landing)],
-    key=lambda p: dbutils.fs.ls(p)[0].modificationTime,
-)
-df = spark.read.parquet(latest)
-assert df.count() == 0, f"expected zero rows, got {df.count()}"
-print("Schema:", df.schema.simpleString())
-# Schema must contain CustomerID, FirstName, LastName, EmailAddress, ModifiedDate (or whatever your source has)
-```
-
-### 1.4 — Run the bronze DLT
-
-```bash
-databricks bundle run -t devtest -p dbc-8e058692-373e \
-  edp_bronze_jdbc_ingestion_pipeline
-```
-
-**Pass criterion**: bronze DLT update finishes `COMPLETED` (not `FAILED`); event log shows `INFO` entries, no `CF_EMPTY_DIR_FOR_SCHEMA_INFERENCE` exception. Bronze table `devtest_edp_bronze.bronze.customer` exists and is empty (or unchanged from prior runs).
-
-```sql
-SELECT COUNT(*) FROM devtest_edp_bronze.bronze.customer;
--- expect: 0 (first run) or whatever the table held before
-```
-
-### 1.5 — Cleanup the sentinel watermark row
-
-```sql
-DELETE FROM metadata.devtest_orchestration.watermarks
-WHERE run_id = 'sentinel-empty-batch-test';
-```
-
-### 1.6 — Outcome
-
-- **PASS** → flip ADR-003 §Q3 from `[~]` to `[x]` in a follow-up commit.
-- **FAIL** → capture the DLT event-log JSON for the failed update, file an issue against the watermark branch, do NOT flip §Q3.
-
----
-
-## Step 2 — A3: generator-side landing-schema overlap guard
+## Step 1 — A3: generator-side landing-schema overlap guard
 
 **Goal**: confirm `LHPConfigError LHP-CFG-018` raises at `lhp generate` time when `landing_path` resolves into the same UC catalog/schema as the bronze `write_target`. Pure local check; no devtest deploy required.
 
-### 2.1 — Construct a misconfigured pipeline YAML
+This step runs first because it has zero deploy dependencies and zero side effects. It can also be re-run any time without affecting later steps.
+
+### 1.1 — Construct a misconfigured pipeline YAML
 
 ```bash
 cd Example_Projects/edp_lhp_starter
@@ -209,7 +112,7 @@ $EDITOR pipelines/02_bronze/customer_bronze.yaml
 #   landing_path: /Volumes/devtest_edp_bronze/bronze/landing/customer
 ```
 
-### 2.2 — Generate
+### 1.2 — Generate
 
 ```bash
 lhp generate -e devtest --pipeline-config config/pipeline_config.yaml --force
@@ -223,7 +126,7 @@ lhp generate -e devtest --pipeline-config config/pipeline_config.yaml --force
 
 …and an explanation that `landing_path` schema overlaps `write_target` schema. Generation must NOT produce a `generated/devtest/edp_bronze_jdbc_ingestion/` directory for the misconfigured flow.
 
-### 2.3 — Restore
+### 1.3 — Restore
 
 ```bash
 mv /tmp/customer_bronze.yaml.bak pipelines/02_bronze/customer_bronze.yaml
@@ -231,25 +134,34 @@ lhp generate -e devtest --pipeline-config config/pipeline_config.yaml --force
 # expect: clean generation, no LHP-CFG-018
 ```
 
-### 2.4 — Outcome
+### 1.4 — Outcome
 
 - **PASS** → A3 regression guard verified end-to-end. No ADR change needed (§Q5 already `[x]`).
 - **FAIL** → A3 generator logic is broken; file an issue against the watermark branch. Investigate `src/lhp/generators/load/jdbc_watermark_job.py::_check_landing_schema_overlap`.
 
 ---
 
-## Step 3 — C2: per-env catalog convention end-to-end (devtest)
+## Step 2 — C2: per-env catalog convention end-to-end (devtest)
 
 **Goal**: deploy the full EDP starter to devtest and confirm all three pipelines write to their expected `devtest_edp_*` catalogs and the cross-catalog reads resolve correctly at runtime (not just at generate time).
 
-### 3.1 — Generate + deploy + run
+**Bootstrap side effect**: this step is the first thing that calls `WatermarkManager()` against `metadata.devtest_orchestration` and therefore auto-creates the `metadata.devtest_orchestration.watermarks` Delta table via `CREATE TABLE IF NOT EXISTS` (`src/lhp_watermark/watermark_manager.py::_ensure_table_exists`). Steps 3 and 4 depend on this table existing.
+
+### 2.1 — Pre-flight: SP grants on the metadata schema
+
+The deploy SP must have `MODIFY` on the schema for `CREATE TABLE` to succeed. If absent, the first run fails with `Permission denied: CREATE TABLE`.
+
+```sql
+SHOW GRANTS `<your-devtest-deploy-sp>` ON SCHEMA metadata.devtest_orchestration;
+-- Required: USE SCHEMA, MODIFY, SELECT
+-- If MODIFY is absent, run:
+--   GRANT MODIFY ON SCHEMA metadata.devtest_orchestration TO `<your-devtest-deploy-sp>`;
+```
+
+### 2.2 — Generate + deploy + run
 
 ```bash
 cd Example_Projects/edp_lhp_starter
-
-# Source data must exist for the bronze pipeline to land non-empty rows.
-# If you ran Step 1 (sentinel watermark) ensure that row is gone:
-# (SQL: DELETE FROM metadata.devtest_orchestration.watermarks WHERE run_id='sentinel-empty-batch-test';)
 
 lhp sync-runtime
 lhp generate -e devtest --pipeline-config config/pipeline_config.yaml --force
@@ -267,7 +179,7 @@ databricks bundle run -t devtest -p dbc-8e058692-373e \
   edp_gold_marts_pipeline
 ```
 
-### 3.2 — Verify per-env writes
+### 2.3 — Verify per-env writes
 
 ```sql
 -- All three queries must return rows.
@@ -277,7 +189,17 @@ SELECT COUNT(*) AS gold_rows
   FROM devtest_edp_gold.gold.customer_orders_summary_monthly;
 ```
 
-### 3.3 — Verify cross-catalog source binding
+### 2.4 — Verify the watermark table was auto-created
+
+```sql
+-- This is the bootstrap evidence. Step 3 + Step 4 depend on this passing.
+DESCRIBE TABLE metadata.devtest_orchestration.watermarks;
+-- expect: Delta table with columns run_id, watermark_time, source_system_id,
+--         schema_name, table_name, watermark_column_name, watermark_value,
+--         previous_watermark_value, row_count, extraction_type, status, ...
+```
+
+### 2.5 — Verify cross-catalog source binding
 
 Pull the silver DLT pipeline event log entry for the `v_customer_bronze` view and confirm the source resolved to `devtest_edp_bronze.bronze.customer` (not some default catalog):
 
@@ -291,43 +213,40 @@ SELECT details:flow_definition.dataset_name, details:flow_definition.spec
 
 The `spec` field must reference `devtest_edp_bronze.bronze.customer`.
 
-### 3.4 — Outcome
+### 2.6 — Outcome
 
-- **PASS** → C2 production-shape evidence captured. Drop a screenshot or log excerpt into a follow-up commit referenced from ADR-003 §Q5.
-- **FAIL** → identify which pipeline failed, capture event log, file issue. Do not consider §Q5 production-validated.
+- **PASS** → C2 production-shape evidence captured AND watermark registry table bootstrapped (now exists for Steps 3 + 4). Drop a screenshot or log excerpt into a follow-up commit referenced from ADR-003 §Q5.
+- **FAIL** (DLT failure) → identify which pipeline failed, capture event log, file issue. Do not consider §Q5 production-validated. Steps 3 + 4 cannot run.
+- **FAIL** (`Permission denied: CREATE TABLE`) → SP missing `MODIFY` on `metadata.devtest_orchestration`. Re-run §2.1.
 
 ---
 
-## Step 4 — ADR-004: per-env watermark registry write
+## Step 3 — ADR-004: per-env watermark registry write
 
-**Goal**: confirm that the JDBC extract from Step 3 wrote a row into `metadata.devtest_orchestration.watermarks` with the expected key shape and `COMPLETED` status. This is the live-environment counterpart to ADR-004's design rationale.
+**Goal**: confirm that the JDBC extract from Step 2 wrote a row into `metadata.devtest_orchestration.watermarks` with the expected key shape and `COMPLETED` status. This is the live-environment counterpart to ADR-004's design rationale.
 
-### 4.1 — Prerequisite
+### 3.1 — Prerequisite
 
-Step 3 was run successfully (bronze workflow at minimum).
+Step 2 was run successfully (bronze workflow at minimum). The watermark table now exists at `metadata.devtest_orchestration.watermarks`.
 
-### 4.2 — Verify
+### 3.2 — Verify the row
 
 ```sql
--- Confirm the registry table exists in the per-env catalog.
-DESCRIBE TABLE metadata.devtest_orchestration.watermarks;
-
 -- Confirm at least one row from this run exists with COMPLETED status.
 SELECT
   source_system_id, schema_name, table_name,
   watermark_column_name, watermark_value, row_count,
-  status, created_at, updated_at, run_id, extraction_type
+  status, watermark_time, run_id, extraction_type
 FROM metadata.devtest_orchestration.watermarks
 WHERE source_system_id = 'pg_edp'
   AND schema_name      = 'public'
   AND table_name       = 'customer'
-ORDER BY updated_at DESC
+ORDER BY watermark_time DESC
 LIMIT 5;
 ```
 
 **Pass criteria** (all must hold):
 
-- Table exists at `metadata.devtest_orchestration.watermarks` (ADR-004 Option C — shared `metadata` catalog, per-env `devtest_orchestration` schema).
 - At least one row with `status = 'COMPLETED'`.
 - `watermark_value` is a parseable timestamp (`ModifiedDate` MAX from the source).
 - `row_count` matches what landed in `devtest_edp_bronze.bronze.customer`.
@@ -351,10 +270,118 @@ SHOW TABLES IN metadata.prod_orchestration;
 -- compromised — investigate WatermarkConfig.schema substitution immediately.
 ```
 
-### 4.3 — Outcome
+### 3.3 — Outcome
 
 - **PASS** → ADR-004 §Implementation Status row gains a "validated against devtest workspace 2026-04-XX" note in a follow-up commit.
 - **FAIL** → ADR-004 §Decision needs revisiting; capture event log + watermark table contents, file issue.
+
+---
+
+## Step 4 — A2: empty-batch schema-bearing fallback
+
+**Goal**: prove that an incremental JDBC extract that returns zero rows still leaves a schema-bearing parquet at `${landing_volume_root}/customer/_lhp_runs/<uuid>/`, so the bronze AutoLoader does not fail with `CF_EMPTY_DIR_FOR_SCHEMA_INFERENCE` on the next run.
+
+### 4.1 — Prerequisite: registry table exists
+
+The sentinel-watermark trick used below `INSERT INTO metadata.devtest_orchestration.watermarks (...)`. The table is auto-created on first `WatermarkManager()` call (Step 2). On a brand-new env this step fails with `[TABLE_OR_VIEW_NOT_FOUND]` if Step 2 has not run.
+
+```sql
+-- Sanity check before proceeding:
+DESCRIBE TABLE metadata.devtest_orchestration.watermarks;
+-- expect: column list. If [TABLE_OR_VIEW_NOT_FOUND], go run Step 2 first.
+```
+
+### 4.2 — Force the customer source to return zero rows
+
+Two options:
+
+**Option a (recommended)** — pre-seed a sentinel watermark row at a future timestamp so the extractor's `WHERE ModifiedDate >= '2099-…'` returns zero rows:
+
+```sql
+-- Run in `metadata` catalog SQL editor (ADR-004 Option C — shared catalog, per-env schema):
+INSERT INTO metadata.devtest_orchestration.watermarks (
+  run_id, watermark_time, source_system_id, schema_name, table_name,
+  watermark_column_name, watermark_value, previous_watermark_value, row_count,
+  extraction_type, status
+) VALUES (
+  'sentinel-empty-batch-test',
+  current_timestamp(),
+  'pg_edp', 'public', 'customer',
+  'ModifiedDate', '2099-12-31T00:00:00.000000+00:00', NULL, 0,
+  'incremental', 'COMPLETED'
+);
+```
+
+(Adjust the column list and types if the runtime DDL drifts — re-check with `DESCRIBE TABLE metadata.devtest_orchestration.watermarks`.)
+
+**Option b** — edit `customer_bronze.yaml` to point at an empty source table.
+
+### 4.3 — Generate + deploy + run only the extract task
+
+```bash
+cd Example_Projects/edp_lhp_starter
+
+lhp sync-runtime
+lhp generate -e devtest --pipeline-config config/pipeline_config.yaml --force
+databricks bundle deploy -t devtest -p dbc-8e058692-373e
+
+# Run only the JDBC extract task, not the bronze DLT yet
+databricks bundle run \
+  -t devtest -p dbc-8e058692-373e \
+  edp_bronze_jdbc_ingestion_workflow
+```
+
+### 4.4 — Observe the landing path
+
+```bash
+databricks fs ls \
+  dbfs:/Volumes/devtest_edp_landing/landing/landing/customer/_lhp_runs/ \
+  -p dbc-8e058692-373e
+
+# Expect: at least one <uuid>/ subdirectory containing one *.parquet file
+```
+
+Inspect the parquet — it must have schema but zero rows:
+
+```python
+# In a Databricks notebook attached to a serverless cluster:
+landing = "/Volumes/devtest_edp_landing/landing/landing/customer/_lhp_runs"
+latest = max(
+    [f.path for f in dbutils.fs.ls(landing)],
+    key=lambda p: dbutils.fs.ls(p)[0].modificationTime,
+)
+df = spark.read.parquet(latest)
+assert df.count() == 0, f"expected zero rows, got {df.count()}"
+print("Schema:", df.schema.simpleString())
+# Schema must contain CustomerID, FirstName, LastName, EmailAddress, ModifiedDate
+# (or whatever your source has)
+```
+
+### 4.5 — Run the bronze DLT
+
+```bash
+databricks bundle run -t devtest -p dbc-8e058692-373e \
+  edp_bronze_jdbc_ingestion_pipeline
+```
+
+**Pass criterion**: bronze DLT update finishes `COMPLETED` (not `FAILED`); event log shows `INFO` entries, no `CF_EMPTY_DIR_FOR_SCHEMA_INFERENCE` exception. Bronze table `devtest_edp_bronze.bronze.customer` exists and is unchanged from Step 2 (no new rows from the empty-batch run).
+
+```sql
+SELECT COUNT(*) FROM devtest_edp_bronze.bronze.customer;
+-- expect: same count as after Step 2 (no new rows)
+```
+
+### 4.6 — Cleanup the sentinel watermark row
+
+```sql
+DELETE FROM metadata.devtest_orchestration.watermarks
+WHERE run_id = 'sentinel-empty-batch-test';
+```
+
+### 4.7 — Outcome
+
+- **PASS** → flip ADR-003 §Q3 from `[~]` to `[x]` in a follow-up commit.
+- **FAIL** → capture the DLT event-log JSON for the failed update, file an issue against the watermark branch, do NOT flip §Q3.
 
 ---
 
