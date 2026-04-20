@@ -240,7 +240,7 @@ With C1 + C2 + C3 shipped:
 
 - [~] C1 external volumes — out of scope (provisioned by platform team outside this fork).
 - [x] C2 LHP per-env catalog convention + cross-catalog reads — `Example_Projects/edp_lhp_starter/` shipped with 5 e2e tests; LHP V0.8.2 already exposes everything required (no LHP code change needed beyond convention codification).
-- [ ] C3 ADR-004 (watermark registry placement = Option B per env) — convention codified in starter; ADR-004 author still TODO.
+- [x] C3 ADR-004 (watermark registry placement = Option B per env) — `docs/adr/ADR-004-watermark-registry-placement.md` Accepted 2026-04-19.
 - [~] C4 ADR-003 §Q5 closed with production-shape evidence — A3 generator-side validator (`LHP-CFG-018`) + starter project = full closure, ready to flip §Q5 to Closed once this branch merges.
 
 ## Phase D — Retention policy (opportunistic, independent)
