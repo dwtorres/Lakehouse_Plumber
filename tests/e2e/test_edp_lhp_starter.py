@@ -65,7 +65,7 @@ class TestEdpLhpStarterGeneration:
         )
 
     @pytest.mark.parametrize(
-        "env,bronze,silver,gold,landing,watermark",
+        "env,bronze,silver,gold,landing,wm_catalog,wm_schema",
         [
             (
                 "devtest",
@@ -73,7 +73,8 @@ class TestEdpLhpStarterGeneration:
                 "devtest_edp_silver",
                 "devtest_edp_gold",
                 "devtest_edp_landing",
-                "devtest_edp_orchestration",
+                "metadata",
+                "devtest_orchestration",
             ),
             (
                 "qa",
@@ -81,7 +82,8 @@ class TestEdpLhpStarterGeneration:
                 "qa_edp_silver",
                 "qa_edp_gold",
                 "qa_edp_landing",
-                "qa_edp_orchestration",
+                "metadata",
+                "qa_orchestration",
             ),
             (
                 "prod",
@@ -89,7 +91,8 @@ class TestEdpLhpStarterGeneration:
                 "prod_edp_silver",
                 "prod_edp_gold",
                 "prod_edp_landing",
-                "prod_edp_orchestration",
+                "metadata",
+                "prod_orchestration",
             ),
         ],
     )
@@ -101,7 +104,8 @@ class TestEdpLhpStarterGeneration:
         silver: str,
         gold: str,
         landing: str,
-        watermark: str,
+        wm_catalog: str,
+        wm_schema: str,
     ):
         """Each env resolves its own ``<env>_edp_<medallion>`` catalogs.
 
@@ -130,7 +134,9 @@ class TestEdpLhpStarterGeneration:
             f"{silver}.silver.customer" in gold_src
         ), f"Gold py for {env} should read from {silver}.silver.customer; got:\n{gold_src[:1000]}"
 
-        # 3. Bronze JDBC extract notebook binds the per-env watermark catalog.
+        # 3. Bronze JDBC extract notebook binds the ADR-004 Option C registry
+        #    shape: shared `metadata` catalog, per-env `<env>_orchestration`
+        #    schema. See docs/adr/ADR-004-watermark-registry-placement.md.
         extract_py = (
             project
             / "generated"
@@ -140,8 +146,11 @@ class TestEdpLhpStarterGeneration:
         )
         extract_src = extract_py.read_text()
         assert (
-            f'catalog="{watermark}"' in extract_src
-        ), f"Extract notebook for {env} must bind WatermarkManager to {watermark}; got:\n{extract_src[:2000]}"
+            f'catalog="{wm_catalog}"' in extract_src
+        ), f"Extract notebook for {env} must bind WatermarkManager to catalog={wm_catalog!r}; got:\n{extract_src[:2000]}"
+        assert (
+            f'schema="{wm_schema}"' in extract_src
+        ), f"Extract notebook for {env} must bind WatermarkManager to schema={wm_schema!r}; got:\n{extract_src[:2000]}"
 
         # 4. Bronze JDBC extract notebook lands under the per-env landing
         #    volume root.

@@ -52,7 +52,13 @@ Before any step:
    -- Run in devtest workspace SQL editor:
    SHOW CATALOGS LIKE 'devtest_edp_*';
    -- expect: devtest_edp_bronze, devtest_edp_silver, devtest_edp_gold,
-   --         devtest_edp_landing, devtest_edp_orchestration
+   --         devtest_edp_landing
+   --
+   -- Watermark registry (ADR-004 Option C) lives in the shared `metadata`
+   -- catalog under a per-env schema:
+   SHOW CATALOGS LIKE 'metadata';
+   SHOW SCHEMAS IN metadata LIKE 'devtest_orchestration';
+   -- expect: metadata catalog exists, metadata.devtest_orchestration schema exists
    ```
 
 5. **External landing volume available**:
@@ -93,9 +99,9 @@ Two options:
 **Option a (recommended)** — temporarily override `WHERE` clause via watermark setup:
 
 ```sql
--- Run in devtest_edp_orchestration.watermarks SQL editor:
+-- Run in `metadata` catalog SQL editor (ADR-004 Option C — shared catalog, per-env schema):
 -- Pre-seed the watermark to a future timestamp so the extractor reads zero rows.
-INSERT INTO devtest_edp_orchestration.watermarks.watermarks (
+INSERT INTO metadata.devtest_orchestration.watermarks (
   source_system_id, schema_name, table_name,
   watermark_column_name, watermark_value, row_count,
   status, created_at, updated_at, run_id, extraction_type
@@ -170,7 +176,7 @@ SELECT COUNT(*) FROM devtest_edp_bronze.bronze.customer;
 ### 1.5 — Cleanup the sentinel watermark row
 
 ```sql
-DELETE FROM devtest_edp_orchestration.watermarks.watermarks
+DELETE FROM metadata.devtest_orchestration.watermarks
 WHERE run_id = 'sentinel-empty-batch-test';
 ```
 
@@ -243,7 +249,7 @@ cd Example_Projects/edp_lhp_starter
 
 # Source data must exist for the bronze pipeline to land non-empty rows.
 # If you ran Step 1 (sentinel watermark) ensure that row is gone:
-# (SQL: DELETE FROM devtest_edp_orchestration.watermarks.watermarks WHERE run_id='sentinel-empty-batch-test';)
+# (SQL: DELETE FROM metadata.devtest_orchestration.watermarks WHERE run_id='sentinel-empty-batch-test';)
 
 lhp sync-runtime
 lhp generate -e devtest --pipeline-config config/pipeline_config.yaml --force
@@ -294,7 +300,7 @@ The `spec` field must reference `devtest_edp_bronze.bronze.customer`.
 
 ## Step 4 — ADR-004: per-env watermark registry write
 
-**Goal**: confirm that the JDBC extract from Step 3 wrote a row into `devtest_edp_orchestration.watermarks.watermarks` with the expected key shape and `COMPLETED` status. This is the live-environment counterpart to ADR-004's design rationale.
+**Goal**: confirm that the JDBC extract from Step 3 wrote a row into `metadata.devtest_orchestration.watermarks` with the expected key shape and `COMPLETED` status. This is the live-environment counterpart to ADR-004's design rationale.
 
 ### 4.1 — Prerequisite
 
@@ -304,14 +310,14 @@ Step 3 was run successfully (bronze workflow at minimum).
 
 ```sql
 -- Confirm the registry table exists in the per-env catalog.
-DESCRIBE TABLE devtest_edp_orchestration.watermarks.watermarks;
+DESCRIBE TABLE metadata.devtest_orchestration.watermarks;
 
 -- Confirm at least one row from this run exists with COMPLETED status.
 SELECT
   source_system_id, schema_name, table_name,
   watermark_column_name, watermark_value, row_count,
   status, created_at, updated_at, run_id, extraction_type
-FROM devtest_edp_orchestration.watermarks.watermarks
+FROM metadata.devtest_orchestration.watermarks
 WHERE source_system_id = 'pg_edp'
   AND schema_name      = 'public'
   AND table_name       = 'customer'
@@ -321,21 +327,28 @@ LIMIT 5;
 
 **Pass criteria** (all must hold):
 
-- Table exists in `devtest_edp_orchestration.watermarks` (per-env catalog, NOT in `metadata.orchestration` default).
+- Table exists at `metadata.devtest_orchestration.watermarks` (ADR-004 Option C — shared `metadata` catalog, per-env `devtest_orchestration` schema).
 - At least one row with `status = 'COMPLETED'`.
 - `watermark_value` is a parseable timestamp (`ModifiedDate` MAX from the source).
 - `row_count` matches what landed in `devtest_edp_bronze.bronze.customer`.
 - `run_id` matches a `_lhp_runs/<uuid>/` directory under
   `/Volumes/devtest_edp_landing/landing/landing/customer/`.
 
-Spot-check the cross-env isolation:
+Spot-check the cross-env schema isolation under ADR-004 Option C:
 
 ```sql
--- These tables should NOT exist if Option B is correctly enforced.
-SHOW TABLES IN qa_edp_orchestration.watermarks;
-SHOW TABLES IN prod_edp_orchestration.watermarks;
--- (Will succeed if the catalog/schema is provisioned but empty;
---  rows must NOT mention 'pg_edp / public / customer' from the devtest run.)
+-- All three schemas live in ONE catalog (metadata).
+SHOW SCHEMAS IN metadata LIKE '*_orchestration';
+-- expect (after qa/prod bootstrap): devtest_orchestration, qa_orchestration, prod_orchestration
+
+-- The qa/prod schemas may be empty (no qa/prod run executed yet) but
+-- when populated, their watermarks tables must NOT contain the devtest
+-- run rows — schema-level isolation is the runtime blast-radius bound.
+SHOW TABLES IN metadata.qa_orchestration;
+SHOW TABLES IN metadata.prod_orchestration;
+-- If either schema's `watermarks` table contains rows for source_system_id='pg_edp'
+-- with a run_id from this devtest run, the per-env schema isolation has been
+-- compromised — investigate WatermarkConfig.schema substitution immediately.
 ```
 
 ### 4.3 — Outcome
@@ -354,7 +367,7 @@ SHOW TABLES IN prod_edp_orchestration.watermarks;
 DELETE FROM devtest_edp_bronze.bronze.customer;
 DELETE FROM devtest_edp_silver.silver.customer;
 DELETE FROM devtest_edp_gold.gold.customer_orders_summary_monthly;
-DELETE FROM devtest_edp_orchestration.watermarks.watermarks
+DELETE FROM metadata.devtest_orchestration.watermarks
   WHERE source_system_id = 'pg_edp'
     AND schema_name      = 'public'
     AND table_name       = 'customer';

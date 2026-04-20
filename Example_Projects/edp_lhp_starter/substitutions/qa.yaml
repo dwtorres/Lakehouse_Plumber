@@ -7,13 +7,13 @@ qa:
   silver_catalog: qa_edp_silver
   gold_catalog: qa_edp_gold
   landing_catalog: qa_edp_landing
-  watermark_catalog: qa_edp_orchestration
+  watermark_catalog: metadata
 
   bronze_schema: bronze
   silver_schema: silver
   gold_schema: gold
   landing_schema: landing
-  watermark_schema: watermarks
+  watermark_schema: qa_orchestration
 
   landing_volume_root: /Volumes/${landing_catalog}/${landing_schema}/landing
 
