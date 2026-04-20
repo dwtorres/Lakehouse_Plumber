@@ -1,0 +1,46 @@
+# Bronze ingestion — customer table from a JDBC source via jdbc_watermark_v2.
+#
+# Demonstrates:
+#   - Per-env landing volume rooted at {landing_catalog}.{landing_schema}
+#     (resolved to <env>_edp_landing.landing.landing at generate time)
+#   - Per-env watermark registry catalog/schema in WatermarkConfig
+#   - Bronze write_target binds to {bronze_catalog}.{bronze_schema}
+#   - All values flow through substitutions/<env>.yaml — no hard-coded catalog names
+
+pipeline: edp_bronze_jdbc_ingestion
+flowgroup: customer_bronze
+
+actions:
+
+  - name: load_customer_jdbc
+    type: load
+    source:
+      type: jdbc_watermark_v2
+      url: "jdbc:postgresql://${secret:database/pg_host}/edp"
+      user: "${secret:database/pg_user}"
+      password: "${secret:database/pg_password}"
+      driver: "org.postgresql.Driver"
+      table: '"public"."customer"'
+      schema_name: "public"
+      table_name: "customer"
+    target: v_customer_raw
+    landing_path: "${landing_volume_root}/customer"
+    watermark:
+      column: ModifiedDate
+      type: timestamp
+      operator: ">="
+      source_system_id: pg_edp
+      # Per-env watermark registry — ADR-004 placement Option B
+      catalog: "${watermark_catalog}"
+      schema: "${watermark_schema}"
+
+  - name: write_customer_bronze
+    type: write
+    source: v_customer_raw
+    write_target:
+      type: streaming_table
+      catalog: "${bronze_catalog}"
+      schema: "${bronze_schema}"
+      table: customer
+      table_properties:
+        delta.enableChangeDataFeed: "true"

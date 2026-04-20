@@ -1,0 +1,48 @@
+# Silver — cross-catalog read from bronze.
+#
+# Demonstrates the load mechanic the per-env catalog convention exists for:
+# silver pipeline reads bronze table from a DIFFERENT catalog
+# (${bronze_catalog}) than where it writes (${silver_catalog}). LHP's modern
+# delta source has explicit `catalog:` and `schema:` fields, so no source-side
+# field add was required.
+
+pipeline: edp_silver_curation
+flowgroup: customer_silver
+
+actions:
+
+  - name: load_customer_bronze
+    type: load
+    readMode: stream
+    source:
+      type: delta
+      catalog: "${bronze_catalog}"
+      schema: "${bronze_schema}"
+      table: customer
+    target: v_customer_bronze
+
+  - name: cleanse_customer
+    type: transform
+    transform_type: sql
+    source: v_customer_bronze
+    target: v_customer_cleansed
+    sql: |
+      SELECT
+        CustomerID,
+        TRIM(FirstName)  AS first_name,
+        TRIM(LastName)   AS last_name,
+        LOWER(EmailAddress) AS email,
+        ModifiedDate
+      FROM v_customer_bronze
+      WHERE EmailAddress IS NOT NULL
+
+  - name: write_customer_silver
+    type: write
+    source: v_customer_cleansed
+    write_target:
+      type: streaming_table
+      catalog: "${silver_catalog}"
+      schema: "${silver_schema}"
+      table: customer
+      table_properties:
+        delta.enableChangeDataFeed: "true"

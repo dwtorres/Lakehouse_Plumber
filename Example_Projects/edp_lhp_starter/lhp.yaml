@@ -1,0 +1,30 @@
+# LakehousePlumber project — Enterprise Data Platform (EDP) starter
+#
+# Demonstrates the per-environment, per-medallion catalog convention used by
+# the Lakehouse_Plumber fork's `watermark` integration branch. Mirrors the
+# data_platform fork's catalog naming so existing teams can migrate without
+# renaming catalogs.
+#
+# Convention: <env>_edp_<medallion>
+#   devtest_edp_bronze, devtest_edp_silver, devtest_edp_gold,
+#   devtest_edp_landing, devtest_edp_orchestration
+#   (and same for qa / prod)
+#
+# Workspace layout:
+#   - devtest deploys to the devtest workspace
+#   - qa + prod deploy to the shared qa/prod workspace, isolated by catalog
+#
+# See ./README.md for migration guidance and the substitution variable
+# reference table.
+
+name: edp_lhp_starter
+version: "0.1"
+description: "EDP per-env catalog starter — devtest/qa/prod with cross-catalog reads"
+author: "dwtorres@gmail.com"
+created_date: "2026-04-19"
+required_lhp_version: ">=0.8.2"
+
+include:
+  - "02_bronze/**"
+  - "03_silver/**"
+  - "04_gold/**"

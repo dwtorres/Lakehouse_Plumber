@@ -1,0 +1,37 @@
+# Substitutions for `lhp generate -e devtest` — devtest workspace + catalogs.
+#
+# All EDP catalogs follow `<env>_edp_<medallion>`. Schema names are flat
+# (bronze, silver, gold, landing, watermarks) within each catalog so
+# pipeline YAMLs can reuse the same `{X_schema}` token across envs.
+
+devtest:
+  env: devtest
+
+  # Per-medallion catalogs (one per layer)
+  bronze_catalog: devtest_edp_bronze
+  silver_catalog: devtest_edp_silver
+  gold_catalog: devtest_edp_gold
+  landing_catalog: devtest_edp_landing
+  # Per-env watermark registry (per ADR-004 placement = Option B)
+  watermark_catalog: devtest_edp_orchestration
+
+  # Schemas (flat within each catalog)
+  bronze_schema: bronze
+  silver_schema: silver
+  gold_schema: gold
+  landing_schema: landing
+  watermark_schema: watermarks
+
+  # Landing volume root — external ADLS-backed UC volume, provisioned by
+  # the platform team. JDBC watermark v2 extractors write to
+  # /Volumes/{landing_catalog}/{landing_schema}/landing/<source>/_lhp_runs/<uuid>/
+  landing_volume_root: /Volumes/${landing_catalog}/${landing_schema}/landing
+
+  # Cluster / serverless defaults
+  serverless: true
+
+secrets:
+  default_scope: devtest_secrets
+  scopes:
+    database: devtest_db_secrets
+    api: devtest_api_secrets

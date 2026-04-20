@@ -1,0 +1,26 @@
+# Substitutions for `lhp generate -e qa` — qa target on shared qa/prod workspace.
+
+qa:
+  env: qa
+
+  bronze_catalog: qa_edp_bronze
+  silver_catalog: qa_edp_silver
+  gold_catalog: qa_edp_gold
+  landing_catalog: qa_edp_landing
+  watermark_catalog: qa_edp_orchestration
+
+  bronze_schema: bronze
+  silver_schema: silver
+  gold_schema: gold
+  landing_schema: landing
+  watermark_schema: watermarks
+
+  landing_volume_root: /Volumes/${landing_catalog}/${landing_schema}/landing
+
+  serverless: true
+
+secrets:
+  default_scope: qa_secrets
+  scopes:
+    database: qa_db_secrets
+    api: qa_api_secrets
