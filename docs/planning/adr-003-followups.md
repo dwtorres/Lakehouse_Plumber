@@ -1,9 +1,11 @@
 # ADR-003 Follow-Ups — Sequenced Plan
 
-**Status**: Planning (2026-04-19).
+**Status**: Planning (2026-04-19; revised same day to defer Phase B).
 **Owner**: dwtorres@gmail.com.
-**Related**: [ADR-003](../adr/ADR-003-landing-zone-shape.md), [ADR-002](../adr/ADR-002-lhp-runtime-availability.md), [ADR-001](../adr/ADR-001-jdbc-watermark-parquet-post-write-stats.md).
+**Related**: [ADR-003](../adr/ADR-003-landing-zone-shape.md), [ADR-002](../adr/ADR-002-lhp-runtime-availability.md), [ADR-001](../adr/ADR-001-jdbc-watermark-parquet-post-write-stats.md), [B1 blueprint](./b1-api-watermark-blueprint.md) (parked).
 **Not a decision.** This document sequences the seven open items surfaced by ADR-003 so they can be worked without re-colliding with each other.
+
+**Revision 2026-04-19**: Phase B (API source + Q4 decision) deferred — fork has no current API ingestion need (only API-sink reference); building `api_watermark_v2` solely to validate Q4 generalization is speculation. Q4 stays on Alternative A (status quo) on JDBC-only evidence; revisit when a real API-ingestion consumer materializes. B1 design research preserved in [`b1-api-watermark-blueprint.md`](./b1-api-watermark-blueprint.md) so it can be picked up cold.
 
 ## Context
 
@@ -75,13 +77,19 @@ Goal: close the research questions that don't require building new components. G
 
 ### Phase A exit criteria
 
-- [ ] A1: ADR-003 §Q1 has authoritative rationale text.
-- [ ] A2: empty-batch extract verified end-to-end on a dev workspace.
-- [ ] A3: generator-side landing-schema validator shipped; Wumbo's existing bundle passes validation.
+- [~] A1: ADR-003 §Q1 has authoritative rationale text. **Deferrable** (2026-04-19): underscore-prefix rationale low-stakes; closing it does not gate any production work. Ask whenever convenient.
+- [~] A2: empty-batch extract verified end-to-end on a dev workspace. **Code shipped** on `feature/adr-003-a2-empty-batch-hardening`; Wumbo dev-workspace `WHERE 1=0` validation is the remaining check.
+- [x] A3: generator-side landing-schema validator shipped; Wumbo's existing bundle passes validation. Closed by `feature/adr-003-a3-landing-schema-validator` (`LHP-CFG-018`, 4 new tests, 3406 total pass).
 
 Phase A can run in parallel. Earliest completion blocker is A1 response time.
 
-## Phase B — Second source type + Q4 decision (sequential)
+## Phase B — Second source type + Q4 decision (DEFERRED 2026-04-19)
+
+**Status**: deferred. Re-scope decision recorded above. The original goal (validate `jdbc_watermark_v2 + _lhp_runs/* + AutoLoader` convention via a second source type before deciding Q4) is sound only if a second source type is actually wanted. The fork's current scope is JDBC-only ingestion + an API-sink reference; there is no API-ingestion consumer asking for `api_watermark_v2`. Building it to satisfy Q4's "second data point" success criterion is speculation.
+
+**Q4 disposition**: codebase remains on Alternative A (status quo, `_lhp_runs/{run_id}/` + Path ③ glob). Formal Q4 closure deferred until a real second-source consumer materializes — at that point B1 blueprint (`b1-api-watermark-blueprint.md`) provides a cold-start implementation plan. ADR-003 §Decision continues to read "Deferred" with that rationale.
+
+**Original Phase B subsections preserved below for archival** (do not work them without reopening this decision):
 
 Goal: validate whether the `jdbc_watermark_v2 + _lhp_runs/* + AutoLoader` convention generalizes. Decide ADR-003 §Q4 with scale evidence, not extrapolation.
 
@@ -258,21 +266,23 @@ Before declaring Q2 closed, run a synthetic test: generate 10^4 `_lhp_runs/<uuid
 
 ## Summary — sequencing
 
-| Phase | Ordering | Blocks | Est. effort |
+| Phase | Status | Blocks | Notes |
 |---|---|---|---|
-| A (parallel unblockers) | any time | B3 decision gate; production readiness | ~1 week calendar |
-| B (API source + Q4) | after A complete | ADR-003 status flip | ~3 days focused |
-| C (external ADLS + refactor) | after B3; admin-dependent | production deploys | ~1 week + env-admin time |
+| A (parallel unblockers) | A2 + A3 code shipped 2026-04-19; A1 deferrable; A2 awaits Wumbo validation | production readiness | branches `feature/adr-003-a2-empty-batch-hardening`, `feature/adr-003-a3-landing-schema-validator` |
+| B (API source + Q4) | **DEFERRED** 2026-04-19 — no API-ingestion consumer in scope | nothing (Q4 stays on Alternative A) | blueprint preserved at `b1-api-watermark-blueprint.md` |
+| C (external ADLS + refactor) | next after A2/A3 PRs merge; admin-dependent | production deploys | ~1 week + env-admin time |
 | D (retention) | any time; ideally before 10^4 subdirs | production durability | ~3 days |
 
-**Critical sequence**: A1 → B3. Other items can flex.
+**Critical sequence**: A2/A3 PR merges → Phase C. Phase B deferred indefinitely.
 
-**Recommend kick-off order**:
-1. A1 ask today (async).
-2. A2 (empty-batch) next — unblocks both Q3 closure and is prereq for B2 empty-result validation.
-3. B1 (API generator) in parallel with A3 (generator validation) — disjoint files.
-4. B2/B3 after A1 responds.
-5. C + D scheduled independently based on workspace-admin availability + data growth signal.
+**Updated kick-off order (2026-04-19)**:
+1. ~~A1 ask today (async).~~ Deferrable.
+2. ~~A2 (empty-batch) next.~~ **Done** — `08fe67a1`.
+3. ~~B1 (API generator) in parallel with A3 (generator validation) — disjoint files.~~ B1 deferred; A3 **done** — `49fe740a`.
+4. ~~B2/B3 after A1 responds.~~ Deferred with B1.
+5. **PR review + merge of A2 then A3 to fork main** (current step).
+6. **Phase C kickoff** after A3 merges — workspace-admin time required for C1 (external ADLS).
+7. **Phase D** independent — schedule when landing dir count or operational pain signals it.
 
 ## Out of scope
 
