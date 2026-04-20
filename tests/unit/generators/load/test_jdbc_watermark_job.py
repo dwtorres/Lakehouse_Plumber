@@ -672,6 +672,49 @@ class TestLandingSchemaOverlapGuard:
         assert any("cross-catalog" in r.message.lower() or "landing_catalog" in r.message for r in caplog.records)
 
     @pytest.mark.unit
+    def test_overlap_check_handles_dict_write_target(self):
+        """Regression: write_target may be parsed as dict not WriteTarget model.
+
+        Real-world finding (devtest validation 2026-04-20): when YAML pipelines
+        are loaded through some code paths, ``Action.write_target`` resolves to
+        ``Dict[str, Any]`` rather than the ``WriteTarget`` pydantic model.
+        ``getattr(dict_obj, "catalog", None)`` returns ``None`` on a dict, which
+        silently disabled the overlap check — same-catalog same-schema YAML
+        generated without raising LHP-CFG-018, only the cross-catalog warning
+        fired (with an empty write_catalog). The fix in jdbc_watermark_job.py
+        branches on isinstance(wt, dict) and uses dict.get() in that case.
+        """
+        from lhp.utils.error_formatter import LHPConfigError
+
+        action = self._make_overlap_action(
+            landing_path="/Volumes/bronze_catalog/bronze_schema/landing/product"
+        )
+        # Build a flowgroup whose write action carries a dict write_target
+        # (skipping the WriteTarget model coercion).
+        write_action = Action(
+            name="write_product_bronze",
+            type="write",
+            source=action.target,
+            write_target={
+                "type": "streaming_table",
+                "catalog": "bronze_catalog",
+                "schema": "bronze_schema",
+                "table": "product",
+            },
+        )
+        fg = FlowGroup(
+            pipeline="test_pipeline",
+            flowgroup="test_flowgroup",
+            actions=[action, write_action],
+        )
+        gen = JDBCWatermarkJobGenerator()
+        with pytest.raises(LHPConfigError) as exc_info:
+            gen.generate(action, {"flowgroup": fg})
+        err_msg = str(exc_info.value)
+        assert "LHP-CFG-018" in err_msg
+        assert "bronze_schema" in err_msg
+
+    @pytest.mark.unit
     def test_non_uc_landing_path_generates_without_error_or_warning(self, caplog):
         """abfss:// landing_path must skip the schema overlap check entirely."""
         import logging

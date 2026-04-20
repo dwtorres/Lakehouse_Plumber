@@ -26,9 +26,33 @@ Run in numerical order. Step 1 (A3) is local-only and can run any time. Steps 2 
 
 ## Prerequisites
 
-Before any step:
+### Provisioning matrix (pre-provision vs auto-create)
 
-1. **Repo state**: branch `watermark` checked out, up to date with `origin/watermark` (post #6/#7/#8/#9 merges).
+What must exist BEFORE you run the runbook, vs what LHP / WatermarkManager / DAB will create on first use. Captured during the 2026-04-20 devtest validation pass; update if the platform shape changes.
+
+| Object | Pre-provision (admin)? | Auto-created by? | Notes |
+|---|---|---|---|
+| Catalog `metadata` | **YES** (one-time, metastore admin) | — | Shared platform catalog (ADR-004 Option C). |
+| Schema `metadata.<env>_orchestration` | **YES** (one-time per env, catalog admin) | — | Required for the watermark table to land in the right schema. |
+| Table `metadata.<env>_orchestration.watermarks` | NO | `WatermarkManager.__init__` (`src/lhp_watermark/watermark_manager.py:121` → `_ensure_table_exists` line 155) on first extract task run | Delta table with liquid clustering on `(source_system_id, schema_name, table_name)`. |
+| Catalog `<env>_edp_bronze` | **YES** | — | Bronze medallion. |
+| Catalog `<env>_edp_silver` | **YES** | — | Silver medallion. |
+| Catalog `<env>_edp_gold` | **YES** | — | Gold medallion. |
+| Catalog `<env>_edp_landing` | **YES** | — | Landing zone catalog. |
+| Schema `<env>_edp_landing.landing` | **YES** | — | Container for the landing volume. |
+| External UC volume `<env>_edp_landing.landing.landing` | **YES** (platform team; external ADLS location) | — | EXTERNAL volume backed by ADLS Gen2. Sidesteps `LOCATION_OVERLAP` (ADR-003 §Q5). A MANAGED volume works for runbook validation but is not the production shape. |
+| Bronze `streaming_table` `<env>_edp_bronze.bronze.<table>` | NO | DLT runtime on first pipeline update | One per LHP write action with `type: streaming_table`. |
+| Silver `streaming_table` `<env>_edp_silver.silver.<table>` | NO | DLT runtime | Same. |
+| Gold `materialized_view` `<env>_edp_gold.gold.<table>` | NO | DLT runtime | Same. |
+| Landing parquet `/Volumes/<env>_edp_landing/landing/landing/<source>/_lhp_runs/<uuid>/` | NO | JDBC extraction notebook write | Run-scoped per ADR-001. |
+| DAB resource files `resources/lhp/*.pipeline.yml` | NO | `lhp generate -e <env>` | Regenerated per env (literal catalog values baked from substitutions). |
+| Generated `.py` files `generated/<env>/...` | NO | `lhp generate -e <env>` | Per env. |
+| Vendored runtime `lhp_watermark/` directory in bundle root | NO | `lhp sync-runtime` | Per ADR-002 amendment 2026-04-19; required before `databricks bundle deploy`. |
+| Secret scope (e.g. `dev-secrets`) and JDBC keys | **YES** (workspace admin) | — | Production: typically Azure Key Vault-backed; dev: a Databricks-backend scope is fine. |
+
+### Steps to run before this runbook
+
+1. **Repo state**: branch `watermark` checked out, up to date with `origin/watermark` (post #6/#7/#8/#9/#10 merges).
    ```bash
    cd /Users/dwtorres/src/Lakehouse_Plumber
    git checkout watermark
@@ -41,50 +65,49 @@ Before any step:
    lhp --version   # expect: lhp, version 0.8.2
    ```
 
-3. **Databricks CLI authenticated** as profile `dbc-8e058692-373e`:
+3. **Databricks CLI + Terraform**:
    ```bash
-   databricks auth profiles | grep dbc-8e058692-373e
-   databricks current-user me -p dbc-8e058692-373e   # expect: 200 OK + user JSON
+   databricks --version            # expect: Databricks CLI v0.295.0+
+   databricks auth profiles | grep dbc-8e058692-373e   # expect: VALID
+   databricks current-user me -p dbc-8e058692-373e
+
+   # `databricks bundle deploy` ships its own Terraform. As of 2026-04-20 the
+   # signed-checksum verification on the bundled binary fails with
+   # `openpgp: key expired`. Workaround: pin to a system-installed terraform
+   # and override the version check.
+   terraform --version             # require any 1.x; e.g. v1.14.8
+   export DATABRICKS_TF_EXEC_PATH=$(which terraform)
+   export DATABRICKS_TF_VERSION=$(terraform --version | head -1 | awk '{print $2}' | sed 's/^v//')
    ```
 
-4. **Devtest workspace + catalogs provisioned** (already done by platform team):
-   ```sql
-   -- Run in devtest workspace SQL editor:
-   SHOW CATALOGS LIKE 'devtest_edp_*';
-   -- expect: devtest_edp_bronze, devtest_edp_silver, devtest_edp_gold,
-   --         devtest_edp_landing
-   --
-   -- Watermark registry (ADR-004 Option C) lives in the shared `metadata`
-   -- catalog under a per-env schema:
-   SHOW CATALOGS LIKE 'metadata';
-   SHOW SCHEMAS IN metadata LIKE 'devtest_orchestration';
-   -- expect: metadata catalog exists, metadata.devtest_orchestration schema exists
+4. **Catalogs + schemas + landing volume pre-provisioned** per the matrix above. Verify:
+   ```bash
+   databricks catalogs list -p dbc-8e058692-373e | \
+     grep -E 'devtest_edp_(bronze|silver|gold|landing)|^metadata'
+   databricks schemas list metadata -p dbc-8e058692-373e | \
+     grep devtest_orchestration
+   databricks schemas list devtest_edp_landing -p dbc-8e058692-373e | \
+     grep '^devtest_edp_landing\.landing '
+   databricks volumes list devtest_edp_landing landing -p dbc-8e058692-373e | \
+     grep '"name": "landing"'
    ```
 
-5. **External landing volume available**:
-   ```sql
-   SHOW VOLUMES IN devtest_edp_landing.landing;
-   -- expect at least: landing  (EXTERNAL, with abfss:// location)
-   ```
-
-6. **Edit `databricks.yml` placeholders** in the EDP starter to your real workspace + service principal (do this once; commit to a private branch if your env values are sensitive):
+5. **Edit `databricks.yml` placeholders** in the EDP starter to your real workspace + service principal (one-time; commit to a private branch if values are sensitive). For the devtest workspace `dbc-8e058692-373e.cloud.databricks.com` the substitution is mechanical:
    ```bash
    cd Example_Projects/edp_lhp_starter
-   # Replace <your-devtest-workspace> with actual hostname,
-   # <qa-deploy-sp-uuid> / <prod-deploy-sp-uuid> with real SP UUIDs.
-   $EDITOR databricks.yml
+   sed -i '' \
+     's|https://<your-devtest-workspace>.cloud.databricks.com|https://dbc-8e058692-373e.cloud.databricks.com|' \
+     databricks.yml
+   # If qa/prod targets are also being tested, replace the SP UUIDs too.
    ```
 
-7. **Source secrets present** in `devtest_secrets` Databricks scope (per `substitutions/devtest.yaml`):
-   ```bash
-   databricks secrets list-scopes -p dbc-8e058692-373e | grep devtest
-   databricks secrets list-secrets devtest_db_secrets -p dbc-8e058692-373e
-   # expect at least: pg_host, pg_user, pg_password
-   ```
+6. **Source secrets present** in a Databricks scope. The starter's `substitutions/devtest.yaml` aliases the secret scope as `database`. Out of the box this maps to `devtest_db_secrets`; in the devtest workspace tested 2026-04-20 the only existing scope was `dev-secrets`, which has only `jdbc_user` + `jdbc_password` (no `pg_host`). For a full Step 2 run you must EITHER:
+   - Add `pg_host`, `pg_user`, `pg_password` keys to a scope and update `substitutions/devtest.yaml::secrets.scopes.database` to point at it, OR
+   - Edit `pipelines/02_bronze/customer_bronze.yaml` to point at a JDBC source whose credentials are already available.
 
-   If the JDBC source you want to test against is not Postgres, edit
-   `Example_Projects/edp_lhp_starter/pipelines/02_bronze/customer_bronze.yaml` to
-   match your source's driver + URL + table identifier and re-run `lhp generate`.
+   Without working source secrets, the Step 2 extraction task fails with `IllegalArgumentException: Secret does not exist with scope: <scope> and key: pg_host`. The watermark table still bootstraps (WatermarkManager init runs before the JDBC read), so Steps 3 and 4 can still be partially validated against the empty bootstrapped table. See §Step 2 for the failure mode.
+
+   **Production note**: in real deployments these scopes are typically Databricks-secret-scopes backed by Azure Key Vault (`databricks secrets create-scope --scope-backend-type AZURE_KEYVAULT ...`). The starter is scope-name agnostic — only the substitution alias matters.
 
 ---
 
@@ -96,20 +119,21 @@ This step runs first because it has zero deploy dependencies and zero side effec
 
 ### 1.1 — Construct a misconfigured pipeline YAML
 
+The A3 guard compares `Action.write_target.catalog` and `Action.write_target.schema` literally — substitution tokens are NOT resolved before comparison. If the production starter uses `catalog: "${bronze_catalog}"` and your `landing_path` uses a literal catalog name, the catalog values do not match (string `${bronze_catalog}` ≠ string `devtest_edp_bronze`) so only the cross-catalog WARNING fires, not the LHP-CFG-018 ERROR. The misconfigured YAML below sets BOTH sides to literal devtest values so the guard's same-catalog branch is reached.
+
 ```bash
 cd Example_Projects/edp_lhp_starter
 
 # Save current config first
 cp pipelines/02_bronze/customer_bronze.yaml /tmp/customer_bronze.yaml.bak
 
-# Edit landing_path to overlap bronze write_target
-# (devtest_edp_bronze.bronze is bronze write target;
-#  set landing_path under same catalog+schema)
-$EDITOR pipelines/02_bronze/customer_bronze.yaml
-# Replace:
-#   landing_path: "${landing_volume_root}/customer"
-# With:
-#   landing_path: /Volumes/devtest_edp_bronze/bronze/landing/customer
+# Two edits in one pass:
+# 1. landing_path must be UC volume path under devtest_edp_bronze.bronze
+# 2. write_target.catalog must be literal devtest_edp_bronze (not substitution token)
+sed -i '' 's|landing_path: "${landing_volume_root}/customer"|landing_path: /Volumes/devtest_edp_bronze/bronze/landing/customer|' \
+  pipelines/02_bronze/customer_bronze.yaml
+sed -i '' 's|catalog: "${bronze_catalog}"|catalog: "devtest_edp_bronze"|' \
+  pipelines/02_bronze/customer_bronze.yaml
 ```
 
 ### 1.2 — Generate
@@ -118,26 +142,34 @@ $EDITOR pipelines/02_bronze/customer_bronze.yaml
 lhp generate -e devtest --pipeline-config config/pipeline_config.yaml --force
 ```
 
-**Pass criterion**: generation aborts with:
+**Pass criterion**: among the per-pipeline output, the bronze pipeline emits:
 
 ```
-❌ Error [LHP-CFG-018]
+❌ Error [LHP-CFG-018]: landing_path overlaps bronze write schema
 ```
 
-…and an explanation that `landing_path` schema overlaps `write_target` schema. Generation must NOT produce a `generated/devtest/edp_bronze_jdbc_ingestion/` directory for the misconfigured flow.
+with body text identifying the action name and pointing at remediation (move landing to a dedicated schema, or use abfss://). The other pipelines (silver, gold) generate normally.
+
+**Important**: `lhp generate` exit code is **0** even when a per-pipeline LHP-CFG-018 fires. The error is rendered to stdout and the affected pipeline's output dir contains stale prior content. Automation that gates on exit code will NOT catch this — grep stdout for `LHP-CFG-018` instead. Confirmed against generator commit `<see follow-up A3 dict-fix commit>`.
+
+The bronze pipeline directory still appears under `generated/devtest/edp_bronze_jdbc_ingestion/` because prior `--force` runs left it there; LHP does not delete it on per-pipeline failure. Inspect `git status` to confirm the bronze pipeline did not regenerate fresh content.
 
 ### 1.3 — Restore
 
 ```bash
-mv /tmp/customer_bronze.yaml.bak pipelines/02_bronze/customer_bronze.yaml
+cp /tmp/customer_bronze.yaml.bak pipelines/02_bronze/customer_bronze.yaml
+rm -rf generated/  # wipe stale bronze artifacts
 lhp generate -e devtest --pipeline-config config/pipeline_config.yaml --force
-# expect: clean generation, no LHP-CFG-018
+# expect: 3 pipelines generated, no LHP-CFG-018 in stdout
 ```
 
 ### 1.4 — Outcome
 
 - **PASS** → A3 regression guard verified end-to-end. No ADR change needed (§Q5 already `[x]`).
-- **FAIL** → A3 generator logic is broken; file an issue against the watermark branch. Investigate `src/lhp/generators/load/jdbc_watermark_job.py::_check_landing_schema_overlap`.
+- **FAIL — only WARNING fires, no ERROR** → A3's substitution-blindness is hitting your scenario. Confirm both `landing_path` and `write_target.catalog` are LITERAL strings (no `${...}` tokens). If still failing, the `isinstance(write_target, dict)` branch in `_check_landing_schema_overlap` may be bypassed — check generator implementation.
+- **FAIL — generator crashes** → A3 logic broken; file an issue. Investigate `src/lhp/generators/load/jdbc_watermark_job.py::_check_landing_schema_overlap`.
+
+**Known limitation**: the A3 check operates on raw YAML strings, not post-substitution values. A production scenario where `landing_path` and `write_target.catalog` BOTH come from substitutions resolving to the same final catalog is NOT caught at generate time — the check fires only when the literal strings happen to match. Long-term fix: resolve substitutions before comparing. Tracked separately from this runbook.
 
 ---
 
@@ -149,28 +181,122 @@ lhp generate -e devtest --pipeline-config config/pipeline_config.yaml --force
 
 ### 2.1 — Pre-flight: SP grants on the metadata schema
 
-The deploy SP must have `MODIFY` on the schema for `CREATE TABLE` to succeed. If absent, the first run fails with `Permission denied: CREATE TABLE`.
+The deploy SP (or interactive user, in dev mode) must have `MODIFY` on the per-env schema for `CREATE TABLE IF NOT EXISTS` to succeed during WatermarkManager bootstrap. If absent, the first run fails with `Permission denied: CREATE TABLE`.
 
-```sql
-SHOW GRANTS `<your-devtest-deploy-sp>` ON SCHEMA metadata.devtest_orchestration;
--- Required: USE SCHEMA, MODIFY, SELECT
--- If MODIFY is absent, run:
---   GRANT MODIFY ON SCHEMA metadata.devtest_orchestration TO `<your-devtest-deploy-sp>`;
+```bash
+# Effective grants endpoint:
+databricks api get \
+  /api/2.1/unity-catalog/effective-permissions/SCHEMA/metadata.devtest_orchestration \
+  -p dbc-8e058692-373e
 ```
 
-### 2.2 — Generate + deploy + run
+```sql
+-- Or via SQL:
+SHOW GRANTS ON SCHEMA metadata.devtest_orchestration;
+-- Required for the deploy principal: USE SCHEMA, MODIFY, SELECT
+-- If MODIFY is absent:
+--   GRANT MODIFY ON SCHEMA metadata.devtest_orchestration TO `<deploy-principal>`;
+```
+
+In `mode: development` DAB targets the deploy principal IS the interactive user (`workspace.User` in `databricks bundle summary`), so personal-token auth without separate SP grants generally works for devtest.
+
+### 2.2 — Generate + sync runtime + validate + deploy
 
 ```bash
 cd Example_Projects/edp_lhp_starter
 
+# Required env exports captured in §Prerequisites step 3:
+#   DATABRICKS_TF_EXEC_PATH=$(which terraform)
+#   DATABRICKS_TF_VERSION=<your-installed-tf-version>
+
 lhp sync-runtime
+# Creates ./lhp_watermark/ — DAB will sync this to the workspace alongside
+# generated notebooks. Re-run after every LHP upgrade.
+
 lhp generate -e devtest --pipeline-config config/pipeline_config.yaml --force
 databricks bundle validate -t devtest -p dbc-8e058692-373e
-databricks bundle deploy   -t devtest -p dbc-8e058692-373e
+# expect: "Validation OK!"
+# If it errors with "the host in the profile (...) doesn't match the host
+# configured in the bundle (https://<your-...>...)", you skipped Prereq §5.
 
-# Bronze workflow → bronze DLT → silver DLT → gold DLT (sequential)
+databricks bundle deploy -t devtest -p dbc-8e058692-373e
+# expect: "Deployment complete!"
+# If it errors with "error downloading Terraform: unable to verify checksums
+# signature: openpgp: key expired", the DATABRICKS_TF_EXEC_PATH +
+# DATABRICKS_TF_VERSION env exports from Prereq §3 are not set in this shell.
+
+# Inspect what got created:
+databricks bundle summary -t devtest -p dbc-8e058692-373e
+# expect: 1 Job (edp_bronze_jdbc_ingestion_workflow)
+#         3 Pipelines (edp_bronze_jdbc_ingestion_pipeline,
+#                      edp_silver_curation_pipeline,
+#                      edp_gold_marts_pipeline)
+# All names prefixed [dev <user>] when mode: development.
+```
+
+### 2.3 — Run the JDBC extract task (bootstraps registry)
+
+```bash
 databricks bundle run -t devtest -p dbc-8e058692-373e \
   edp_bronze_jdbc_ingestion_workflow
+```
+
+**Two outcomes are POSSIBLE and BOTH advance Step 3**:
+
+| Outcome | What happened | Bootstrap status | Step 3 / 4 unblocked? |
+|---|---|---|---|
+| Job task `extract_*` finishes COMPLETED | WatermarkManager init AND JDBC read both succeeded. Watermark row written. | YES | YES, with row to verify in Step 3 |
+| Job task `extract_*` fails with `IllegalArgumentException: Secret does not exist with scope: <scope> and key: pg_host` (or analogous secret-resolution error) | WatermarkManager init succeeded. JDBC read failed at `dbutils.secrets.get` BEFORE the JDBC connection. | YES (verified in §2.4) | YES for Step 3 schema check; Step 4 sentinel works because table exists |
+| Job task fails with `Permission denied: CREATE TABLE` | WatermarkManager init failed at `_ensure_table_exists`. SP missing MODIFY on `metadata.<env>_orchestration`. | NO | NO — go fix grants per §2.1 |
+| Job task fails with `[CATALOG_OR_SCHEMA_NOT_FOUND]` on `metadata.<env>_orchestration` | Pre-provisioning incomplete. | NO | NO — provision schema per §Prerequisites matrix |
+
+The first two outcomes BOTH satisfy this runbook's Step 2 bootstrap goal. The third and fourth are misconfiguration; fix and retry.
+
+### 2.4 — Verify the watermark table was auto-created
+
+```bash
+# Use any running SQL warehouse; list to find one:
+databricks warehouses list -p dbc-8e058692-373e
+
+# Then query (replace warehouse_id):
+databricks api post /api/2.0/sql/statements -p dbc-8e058692-373e --json '{
+  "warehouse_id": "<warehouse-id>",
+  "statement": "DESCRIBE TABLE metadata.devtest_orchestration.watermarks",
+  "wait_timeout": "30s"
+}' | python3 -c "import sys,json;d=json.load(sys.stdin);[print(r[0],r[1]) for r in d['result']['data_array']]"
+```
+
+Expected schema (verified 2026-04-20 against `_ensure_table_exists`):
+
+```
+run_id                    string
+watermark_time            timestamp
+source_system_id          string
+schema_name               string
+table_name                string
+watermark_column_name     string
+watermark_value           string
+previous_watermark_value  string
+row_count                 bigint
+extraction_type           string
+bronze_stage_complete     boolean
+silver_stage_complete     boolean
+status                    string
+error_class               string
+error_message             string
+created_at                timestamp
+completed_at              timestamp
+# Clustering columns (liquid clustering):
+source_system_id, schema_name, table_name
+```
+
+If `DESCRIBE TABLE` returns `[TABLE_OR_VIEW_NOT_FOUND]`, the bootstrap did not run — re-check §2.3 outcome and fix the underlying error before continuing to Steps 3 and 4.
+
+### 2.5 — Run the bronze + silver + gold DLT pipelines (only if §2.3 reached COMPLETED)
+
+If the JDBC extract failed at secret resolution but the watermark table bootstrapped, skip this section — the bronze DLT has nothing to consume from `_lhp_runs/`.
+
+```bash
 databricks bundle run -t devtest -p dbc-8e058692-373e \
   edp_bronze_jdbc_ingestion_pipeline
 databricks bundle run -t devtest -p dbc-8e058692-373e \
@@ -179,27 +305,17 @@ databricks bundle run -t devtest -p dbc-8e058692-373e \
   edp_gold_marts_pipeline
 ```
 
-### 2.3 — Verify per-env writes
+### 2.6 — Verify per-env writes (only if §2.5 ran)
 
 ```sql
--- All three queries must return rows.
+-- All three queries must return rows when §2.5 succeeded.
 SELECT COUNT(*) AS bronze_rows FROM devtest_edp_bronze.bronze.customer;
 SELECT COUNT(*) AS silver_rows FROM devtest_edp_silver.silver.customer;
 SELECT COUNT(*) AS gold_rows
   FROM devtest_edp_gold.gold.customer_orders_summary_monthly;
 ```
 
-### 2.4 — Verify the watermark table was auto-created
-
-```sql
--- This is the bootstrap evidence. Step 3 + Step 4 depend on this passing.
-DESCRIBE TABLE metadata.devtest_orchestration.watermarks;
--- expect: Delta table with columns run_id, watermark_time, source_system_id,
---         schema_name, table_name, watermark_column_name, watermark_value,
---         previous_watermark_value, row_count, extraction_type, status, ...
-```
-
-### 2.5 — Verify cross-catalog source binding
+### 2.7 — Verify cross-catalog source binding (only if §2.5 ran)
 
 Pull the silver DLT pipeline event log entry for the `v_customer_bronze` view and confirm the source resolved to `devtest_edp_bronze.bronze.customer` (not some default catalog):
 
@@ -213,11 +329,12 @@ SELECT details:flow_definition.dataset_name, details:flow_definition.spec
 
 The `spec` field must reference `devtest_edp_bronze.bronze.customer`.
 
-### 2.6 — Outcome
+### 2.8 — Outcome
 
-- **PASS** → C2 production-shape evidence captured AND watermark registry table bootstrapped (now exists for Steps 3 + 4). Drop a screenshot or log excerpt into a follow-up commit referenced from ADR-003 §Q5.
-- **FAIL** (DLT failure) → identify which pipeline failed, capture event log, file issue. Do not consider §Q5 production-validated. Steps 3 + 4 cannot run.
-- **FAIL** (`Permission denied: CREATE TABLE`) → SP missing `MODIFY` on `metadata.devtest_orchestration`. Re-run §2.1.
+- **FULL PASS** (extract + DLT all green) → C2 production-shape evidence captured AND watermark registry table bootstrapped (now exists for Steps 3 + 4). Drop log excerpts into a follow-up commit referenced from ADR-003 §Q5.
+- **PARTIAL PASS** (extract failed at secret resolution; bootstrap confirmed via §2.4) → Steps 3 and 4 still partially runnable; do NOT cite as ADR-003 §Q5 production-shape evidence (silver + gold never executed). Capture failure mode in your runbook log and provision real source secrets before re-running.
+- **FAIL** (`Permission denied: CREATE TABLE`) → SP missing `MODIFY` on `metadata.<env>_orchestration`. Re-run §2.1 and re-grant. Bootstrap did NOT happen.
+- **FAIL** (DLT failure after extract succeeded) → identify which pipeline failed, capture event log, file issue.
 
 ---
 
