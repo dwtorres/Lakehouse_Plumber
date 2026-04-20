@@ -1,11 +1,16 @@
-# Bronze ingestion — customer table from a JDBC source via jdbc_watermark_v2.
+# Bronze ingestion — HumanResources.Department from AdventureWorks-on-Supabase
+# via jdbc_watermark_v2.
+#
+# Source is the existing Wumbo devtest source (16-row Department table). Small
+# enough to run cheaply; carries ModifiedDate timestamp for watermarking.
 #
 # Demonstrates:
-#   - Per-env landing volume rooted at {landing_catalog}.{landing_schema}
-#     (resolved to <env>_edp_landing.landing.landing at generate time)
-#   - Per-env watermark registry catalog/schema in WatermarkConfig
-#   - Bronze write_target binds to {bronze_catalog}.{bronze_schema}
-#   - All values flow through substitutions/<env>.yaml — no hard-coded catalog names
+#   - Per-env landing volume rooted at ${landing_catalog}.${landing_schema}
+#   - Per-env watermark registry catalog/schema (ADR-004 Option C: shared
+#     metadata catalog, per-env schema)
+#   - Bronze write_target binds to ${bronze_catalog}.${bronze_schema}
+#   - JDBC URL + driver from substitution; credentials from Databricks
+#     secret scope `dev-secrets` (alias `database` per substitutions/devtest.yaml)
 
 pipeline: edp_bronze_jdbc_ingestion
 flowgroup: customer_bronze
@@ -16,21 +21,21 @@ actions:
     type: load
     source:
       type: jdbc_watermark_v2
-      url: "jdbc:postgresql://${secret:database/pg_host}/edp"
-      user: "${secret:database/pg_user}"
-      password: "${secret:database/pg_password}"
-      driver: "org.postgresql.Driver"
-      table: '"public"."customer"'
-      schema_name: "public"
-      table_name: "customer"
+      url: "${jdbc_url}"
+      user: "${secret:database/jdbc_user}"
+      password: "${secret:database/jdbc_password}"
+      driver: "${jdbc_driver}"
+      table: '"HumanResources"."Department"'
+      schema_name: "HumanResources"
+      table_name: "Department"
     target: v_customer_raw
-    landing_path: "${landing_volume_root}/customer"
+    landing_path: "${landing_volume_root}/department"
     watermark:
       column: ModifiedDate
       type: timestamp
       operator: ">="
-      source_system_id: pg_edp
-      # Per-env watermark registry — ADR-004 placement Option B
+      source_system_id: pg_supabase_aw
+      # Per-env watermark registry — ADR-004 Option C
       catalog: "${watermark_catalog}"
       schema: "${watermark_schema}"
 
@@ -41,6 +46,6 @@ actions:
       type: streaming_table
       catalog: "${bronze_catalog}"
       schema: "${bronze_schema}"
-      table: customer
+      table: department
       table_properties:
         delta.enableChangeDataFeed: "true"

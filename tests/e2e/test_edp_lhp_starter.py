@@ -121,18 +121,20 @@ class TestEdpLhpStarterGeneration:
         ), f"lhp generate -e {env} failed:\nSTDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
 
         # 1. Silver pipeline reads bronze from the correct env's catalog.
+        # Source table is HumanResources.Department (Wumbo AdventureWorks
+        # devtest source); bronze write_target table is named `department`.
         silver_py = project / "generated" / env / "edp_silver_curation" / "customer_silver.py"
         silver_src = silver_py.read_text()
         assert (
-            f"{bronze}.bronze.customer" in silver_src
-        ), f"Silver py for {env} should read from {bronze}.bronze.customer; got:\n{silver_src[:1000]}"
+            f"{bronze}.bronze.department" in silver_src
+        ), f"Silver py for {env} should read from {bronze}.bronze.department; got:\n{silver_src[:1000]}"
 
         # 2. Gold pipeline reads silver from the correct env's catalog.
         gold_py = project / "generated" / env / "edp_gold_marts" / "customer_orders_summary.py"
         gold_src = gold_py.read_text()
         assert (
-            f"{silver}.silver.customer" in gold_src
-        ), f"Gold py for {env} should read from {silver}.silver.customer; got:\n{gold_src[:1000]}"
+            f"{silver}.silver.department" in gold_src
+        ), f"Gold py for {env} should read from {silver}.silver.department; got:\n{gold_src[:1000]}"
 
         # 3. Bronze JDBC extract notebook binds the ADR-004 Option C registry
         #    shape: shared `metadata` catalog, per-env `<env>_orchestration`
@@ -155,8 +157,8 @@ class TestEdpLhpStarterGeneration:
         # 4. Bronze JDBC extract notebook lands under the per-env landing
         #    volume root.
         assert (
-            f"/Volumes/{landing}/landing/landing/customer" in extract_src
-        ), f"Extract notebook for {env} must write under /Volumes/{landing}/landing/landing/customer/_lhp_runs/<uuid>/"
+            f"/Volumes/{landing}/landing/landing/department" in extract_src
+        ), f"Extract notebook for {env} must write under /Volumes/{landing}/landing/landing/department/_lhp_runs/<uuid>/"
 
         # 5. DAB resource files bind the correct per-env catalog/schema.
         bronze_resource = (

@@ -7,6 +7,11 @@
 
 project_defaults:
   serverless: true
+  configuration:
+    # Silver SQL transform reads bronze via spark.sql; bronze view is
+    # produced by a streaming load. Disable the incompatible-view check
+    # so a streaming temp view can be referenced from a batch SQL view.
+    "pipelines.incompatibleViewCheck.enabled": "false"
 
 ---
 pipeline: edp_bronze_jdbc_ingestion

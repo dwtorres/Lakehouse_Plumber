@@ -19,6 +19,10 @@ qa:
 
   serverless: true
 
+  # JDBC source — replace with the qa-tier source connection details.
+  jdbc_url: "jdbc:postgresql://<qa-source-host>:5432/postgres?sslmode=require"
+  jdbc_driver: "org.postgresql.Driver"
+
 secrets:
   default_scope: qa_secrets
   scopes:

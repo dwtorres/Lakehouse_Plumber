@@ -18,7 +18,7 @@ actions:
       type: delta
       catalog: "${bronze_catalog}"
       schema: "${bronze_schema}"
-      table: customer
+      table: department
     target: v_customer_bronze
 
   - name: cleanse_customer
@@ -28,13 +28,12 @@ actions:
     target: v_customer_cleansed
     sql: |
       SELECT
-        CustomerID,
-        TRIM(FirstName)  AS first_name,
-        TRIM(LastName)   AS last_name,
-        LOWER(EmailAddress) AS email,
+        DepartmentID,
+        TRIM(Name)      AS department_name,
+        TRIM(GroupName) AS group_name,
         ModifiedDate
       FROM v_customer_bronze
-      WHERE EmailAddress IS NOT NULL
+      WHERE Name IS NOT NULL
 
   - name: write_customer_silver
     type: write
@@ -43,6 +42,6 @@ actions:
       type: streaming_table
       catalog: "${silver_catalog}"
       schema: "${silver_schema}"
-      table: customer
+      table: department
       table_properties:
         delta.enableChangeDataFeed: "true"

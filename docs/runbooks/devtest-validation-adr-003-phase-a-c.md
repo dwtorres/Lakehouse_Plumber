@@ -536,3 +536,40 @@ databricks fs rm -r \
 | 4 (ADR-004 PASS) | Append the same note to ADR-004 §Implementation Status. |
 
 If any step fails, leave the ADR success criteria as they are, file an issue, and stop here — do not run later steps until the failing one is fixed.
+
+---
+
+## Validation log — 2026-04-20 against devtest workspace `dbc-8e058692-373e`
+
+End-to-end pass executed by `dwtorres@gmail.com` (workspace user `verbena1@gmail.com`) using the existing Wumbo AdventureWorks-on-Supabase devtest source (`HumanResources.Department`, 16 rows). Starter pre-configured with that source — see `Example_Projects/edp_lhp_starter/substitutions/devtest.yaml` (jdbc_url + dev-secrets aliases) and `pipelines/02_bronze/customer_bronze.yaml` (HumanResources.Department source, watermark column ModifiedDate).
+
+| Step | Result | Evidence |
+|------|--------|----------|
+| 1 — A3 overlap guard | **PASS** (after generator dict-fix) | LHP-CFG-018 fired with literal `landing_path` + `write_target.catalog`. Captured generator bug: pre-fix `getattr(dict_obj, 'catalog', None)` silently disabled the check; new test `test_overlap_check_handles_dict_write_target` guards regression. |
+| 2 — C2 deploy + extract | **PASS** | Deploy created 1 Job + 3 Pipelines. Extract task `[dev verbena1] edp_bronze_jdbc_ingestion_workflow` TERMINATED SUCCESS. Bronze + silver + gold DLT updates all COMPLETED; row counts: bronze=16, silver=16, gold=6. |
+| 2.4 — Watermark table bootstrap | **PASS** | `metadata.devtest_orchestration.watermarks` auto-created on first `WatermarkManager()` call. 17-column schema matches `_ensure_table_exists` DDL. Liquid clustering on `(source_system_id, schema_name, table_name)`. |
+| 3 — ADR-004 watermark write | **PASS** | Row in `metadata.devtest_orchestration.watermarks`: `source_system_id=pg_supabase_aw, schema_name=HumanResources, table_name=Department, watermark_value=2008-04-30 00:00:00, row_count=16, status=completed, run_id=local-cb2d7a46-…`. |
+| 4 — A2 empty-batch | **NOT VALIDATED LIVE** (workspace serverless compute exhausted on retry; failed with `SERVERLESS_COMPUTE_EXHAUSTED`). Re-run the extract task once compute frees up — HWM is already 2008-04-30 so no source rows pass the filter; the extract should land an empty schema-bearing parquet via the A2 fallback. |
+
+### Discoveries that became runbook fixes
+
+1. **A3 dict-write_target bug** — see Step 1.4 known limitation. Generator fix shipped same PR.
+2. **Bundled Terraform GPG key expired** — bundle deploy fails with `error downloading Terraform: unable to verify checksums signature: openpgp: key expired`. Workaround: export `DATABRICKS_TF_EXEC_PATH` + `DATABRICKS_TF_VERSION` to use system-installed Terraform.
+3. **`databricks.yml` placeholder host blocks validate** — sed-substitute the real host before `bundle validate`.
+4. **`pipelines.incompatibleViewCheck.enabled: false` required** — silver SQL transform reads streaming bronze view; the check defaults true and rejects a batch SQL view referencing a streaming view. Set in `pipeline_config.yaml::project_defaults.configuration`.
+5. **Workspace pipeline quota = 1** — this devtest workspace caps active DLT pipelines at 1. Run silver/gold sequentially, never via background job parallelism.
+6. **Wumbo source secrets** — only `jdbc_user` + `jdbc_password` in `dev-secrets`; jdbc URL came from `${jdbc_url}` substitution in `dev.yaml` (not from secret). Reflected in starter `substitutions/devtest.yaml`.
+
+### Live-cleanup (executed 2026-04-20)
+
+```bash
+cd Example_Projects/edp_lhp_starter
+DATABRICKS_TF_EXEC_PATH=$(which terraform) \
+DATABRICKS_TF_VERSION=1.14.8 \
+  databricks bundle destroy -t devtest -p dbc-8e058692-373e --auto-approve
+```
+
+Removed: 1 Job + 3 Pipelines + workspace files at `~/.bundle/edp_lhp_starter/devtest`.
+**Left in place** (intentional, validation evidence): `metadata.devtest_orchestration.watermarks` (1 row), `devtest_edp_bronze.bronze.department` (16 rows), `devtest_edp_silver.silver.department` (16 rows), `devtest_edp_gold.gold.customer_orders_summary_monthly` (6 rows), landing parquet at `/Volumes/devtest_edp_landing/landing/landing/department/_lhp_runs/local-cb2d7a46-…/`.
+
+To remove the data artifacts too, run the SQL `DELETE` + `databricks fs rm` block in §Cleanup above.

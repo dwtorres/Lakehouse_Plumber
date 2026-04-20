@@ -31,8 +31,13 @@ devtest:
   # Cluster / serverless defaults
   serverless: true
 
+  # JDBC source connection — Wumbo's existing AdventureWorks-on-Supabase
+  # devtest source. Real keys live in `dev-secrets` scope.
+  jdbc_url: "jdbc:postgresql://aws-0-us-west-2.pooler.supabase.com:5432/postgres?sslmode=require"
+  jdbc_driver: "org.postgresql.Driver"
+
 secrets:
-  default_scope: devtest_secrets
+  default_scope: dev-secrets
   scopes:
-    database: devtest_db_secrets
-    api: devtest_api_secrets
+    database: dev-secrets
+    api: dev-secrets
