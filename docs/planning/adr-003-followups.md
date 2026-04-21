@@ -246,50 +246,95 @@ With C1 + C2 + C3 shipped:
 
 ## Phase D — Retention policy (opportunistic, independent)
 
-Goal: stop `_lhp_runs/` (or whatever Q4 landed on) from growing without bound.
+**Refreshed 2026-04-20** (post Phase A + C closure, post-runbook live validation):
+
+- Q4 closed at Alternative A (status quo) → retention targets remain `_lhp_runs/<run_id>/` directories under each landing volume.
+- TWO retention concerns surfaced during live validation, not one:
+  1. **Landing parquet directories** under `/Volumes/<env>_edp_landing/landing/landing/<source>/_lhp_runs/<uuid>/`. ~1 directory per source-table per extract run.
+  2. **Watermark registry rows** in `metadata.<env>_orchestration.watermarks`. ~1 row per run (insert_new) regardless of result; runs retained indefinitely as audit trail. Devtest accumulated ~10 rows in 1 day during runbook iteration.
+- Phase A2 added `landing_empty_schema_fallback` parquet writes — empty incrementals now also produce a `_lhp_runs/<uuid>/` directory with one part file. Retention pressure no longer scales only with non-empty extracts.
+- Q4 (`_lhp_runs/` vs Hive partition) is closed at status-quo, so any reaper logic must understand `_lhp_runs/<uuid>/` shape, not `run_id=<uuid>/`.
+
+Goal unchanged: stop `_lhp_runs/<uuid>/` directories from growing without bound. Goal extension: agree a separate operator contract for the `metadata.<env>_orchestration.watermarks` row-retention.
+
+### D0 — Discovery (NEW, do first)
+
+Sample current accumulation to size the problem before building.
+
+- For one production-shape source (e.g. AdventureWorks Department in devtest), measure rate of new `_lhp_runs/<uuid>/` per day at typical schedule.
+- Project to full prod load (count of source tables × extract cadence × 30/90/365 days).
+- Decide whether the problem is "tens of thousands of subdirs by EOY" or "millions" — sets whether D2 reaper is mandatory or nice-to-have.
+- Same for watermark rows. Per-row size is small but query plan cost on `get_latest_watermark` (filtered by composite key + ORDER BY watermark_time DESC LIMIT 1) grows with row count without liquid clustering refresh.
+
+**Effort**: ~30 min query + 30 min napkin math. Output: a one-paragraph projection committed alongside D1.
 
 ### D1 — Operator contract
 
-Ratify: "keep last N runs per table" OR "keep N days". Agent 1 flagged AutoLoader's `cloudFiles.cleanSource` as the native mechanism, but only on DBR 16.4+. Two tiers:
+Ratify two contracts:
 
-- **Tier 1 (cleanSource)**: set `cloudFiles.cleanSource = DELETE` + `cleanSource.retentionDuration = 30 days` in generator-emitted options. Only enabled for bundles whose pipelines run on DBR ≥ 16.4.
-- **Tier 2 (reaper job)**: for older DBR, a scheduled Databricks job runs nightly, queries `cloud_files_state` TVF for `commit_time < NOW() - retention`, and deletes corresponding `_lhp_runs/<uuid>/` subdirs via UC Files API. Single reaper job per bundle target.
+**Landing parquet retention**:
+- Recommend "keep last 30 days" per source. Aligns with typical incremental-load reprocessing windows; sufficient to recover from a bronze table corruption requiring N days of replay.
+- Two implementation tiers (verify DBR support before committing):
+  - **Tier 1 (`cloudFiles.cleanSource`)**: set `cloudFiles.cleanSource = DELETE` + `cleanSource.retentionDuration = 30 days` in generator-emitted bronze AutoLoader options. Required DBR version: confirm against current Databricks docs (was DBR 16.4+ at original draft). Devtest pipelines run serverless `channel: CURRENT` — verify whether that resolves to a version supporting `cleanSource`.
+  - **Tier 2 (reaper job)**: for any pipeline whose runtime does not support `cleanSource`, a scheduled Databricks job runs daily, queries `cloud_files_state` TVF for `commit_time < NOW() - retention`, and deletes corresponding `_lhp_runs/<uuid>/` subdirs via UC Files API. One reaper job per bundle target.
+
+**Watermark row retention**:
+- Recommend "keep last 90 days" of completed rows + indefinite retention of rows with status ∈ {`failed`, `landed_not_committed`} for audit. Failed/landed-not-committed are operator-investigation surface; auto-deleting them hides incidents.
+- Implementation: a separate scheduled job (or same reaper) issues `DELETE FROM metadata.<env>_orchestration.watermarks WHERE status='completed' AND completed_at < NOW() - INTERVAL 90 DAYS`. Run weekly.
+- Tradeoff: under-90-day deletes wipe rows that the recovery path (`get_recoverable_landed_run`) would otherwise pick up. Recovery only consults rows in `landed_not_committed`, so completed rows are safe to delete; sanity-check this before shipping.
 
 ### D2 — Implementation
 
-- LHP generator: emit `cleanSource.*` options conditionally behind a bundle-level opt-in. Default off for now.
-- Reaper job: new LHP CLI `lhp generate-reaper --env <target>` emits a Databricks job YAML that owns the retention logic.
+- **LHP generator**: emit `cleanSource.*` options conditionally behind a bundle-level opt-in flag. Default off so existing bundles do not silently start deleting landing data on first re-deploy. Add `lhp_retention.cloud_files_clean_source: { enabled: bool, retention_days: int }` to project / pipeline config.
+- **Reaper job**: new LHP CLI subcommand `lhp generate-reaper --env <target>` emits a Databricks Workflow resource YAML that owns the retention logic (both landing parquet AND watermark rows). Single deploy unit per env. Schedule: nightly at 02:00 UTC by default, configurable.
+- **Generator-side guard**: refuse to enable Tier 1 cleanSource for a source that also has a reaper job emitted — they would race. Mutually exclusive at generation.
 
 ### D3 — Benchmark at scale
 
-Before declaring Q2 closed, run a synthetic test: generate 10^4 `_lhp_runs/<uuid>/` subdirs, measure AutoLoader directory-listing latency with/without `cloudFiles.useIncrementalListing = true`, measure reaper throughput. Agent 1 cited no Databricks-published benchmarks for this regime — we're establishing our own baseline.
+Before declaring Q2 closed, run a synthetic test:
+
+- Generate 10^4 `_lhp_runs/<uuid>/` subdirs under one landing volume.
+- Measure AutoLoader directory-listing latency with/without `cloudFiles.useIncrementalListing = true`.
+- Measure reaper throughput (subdirs/min via UC Files API).
+- For watermark table: insert 10^5 historical rows, measure `get_latest_watermark` p99 with + without recent `OPTIMIZE` runs on the liquid-clustering keys.
+- Document results inline in Phase D log + cite from ADR-003 §Q2 closure.
+
+No Databricks-published benchmarks exist for this regime — establish own baseline.
 
 ### Phase D exit criteria
 
-- [ ] D1 operator contract agreed + documented.
-- [ ] D2 cleanSource + reaper shipped.
-- [ ] D3 scale benchmark published (landing listing + reaper latency at 10^4 subdirs).
+- [ ] D0 accumulation rate measured + projected (devtest baseline).
+- [ ] D1 landing parquet contract + watermark row contract agreed + documented.
+- [ ] D2 LHP generator emits `cleanSource.*` opt-in + `lhp generate-reaper` ships; mutual-exclusion guard in place.
+- [ ] D3 scale benchmark published (landing listing + reaper throughput at 10^4 subdirs; `get_latest_watermark` p99 at 10^5 rows).
 - [ ] ADR-003 §Q2 closed.
+
+### Sequencing notes
+
+- D0 + D1 can run in parallel (D0 measures, D1 drafts).
+- D2 depends on D1 (need contract before implementing).
+- D3 depends on D2 (need reaper to benchmark its throughput).
+- All of Phase D is independent of B / C work; can ship whenever a real growth signal appears (recommend triggering D0 once a real prod-shape source is on incremental cadence in devtest).
 
 ## Summary — sequencing
 
 | Phase | Status | Blocks | Notes |
 |---|---|---|---|
-| A (parallel unblockers) | A2 + A3 code shipped 2026-04-19; A1 deferrable; A2 awaits Wumbo validation | production readiness | branches `feature/adr-003-a2-empty-batch-hardening`, `feature/adr-003-a3-landing-schema-validator` |
+| A (parallel unblockers) | **CLOSED** 2026-04-20 — A2 + A3 code shipped + live-validated against devtest workspace; A1 deferrable | nothing | merged via PRs #6, #7, #10 |
 | B (API source + Q4) | **DEFERRED** 2026-04-19 — no API-ingestion consumer in scope | nothing (Q4 stays on Alternative A) | blueprint preserved at `b1-api-watermark-blueprint.md` |
-| C (external ADLS + refactor) | next after A2/A3 PRs merge; admin-dependent | production deploys | ~1 week + env-admin time |
-| D (retention) | any time; ideally before 10^4 subdirs | production durability | ~3 days |
+| C (external ADLS + refactor) | **CLOSED** 2026-04-20 — C1 platform-provisioned; C2 starter shipped + live-validated; C3 ADR-004 Option C accepted; C4 ADR-003 §Q5 closed | nothing | merged via PRs #8, #9, #10 |
+| D (retention) | **NEXT** — refreshed 2026-04-20; awaits real growth signal in devtest | ADR-003 §Q2 closure | ~3-5 days incl. D0 measurement |
 
-**Critical sequence**: A2/A3 PR merges → Phase C. Phase B deferred indefinitely.
+**Critical sequence**: Phase A + Phase C closed 2026-04-20. Phase B deferred indefinitely. Phase D awaits growth signal.
 
-**Updated kick-off order (2026-04-19)**:
+**Updated kick-off order (2026-04-20, post Phase A + C closure)**:
 1. ~~A1 ask today (async).~~ Deferrable.
-2. ~~A2 (empty-batch) next.~~ **Done** — `08fe67a1`.
-3. ~~B1 (API generator) in parallel with A3 (generator validation) — disjoint files.~~ B1 deferred; A3 **done** — `49fe740a`.
-4. ~~B2/B3 after A1 responds.~~ Deferred with B1.
-5. **PR review + merge of A2 then A3 to fork main** (current step).
-6. **Phase C kickoff** after A3 merges — workspace-admin time required for C1 (external ADLS).
-7. **Phase D** independent — schedule when landing dir count or operational pain signals it.
+2. ~~A2 (empty-batch).~~ **Closed** — `08fe67a1` shipped + live-validated 2026-04-20 (sentinel watermark forced empty incremental, A2 fallback wrote 0-row schema-bearing parquet at `_lhp_runs/local-f7816a34-.../`).
+3. ~~B1 (API generator) in parallel with A3.~~ B1 deferred; A3 **closed** — `49fe740a` + dict-fix from PR #10 + live-validated 2026-04-20 (`LHP-CFG-018` fired against misconfigured starter pipeline).
+4. ~~B2/B3.~~ Deferred with B1.
+5. ~~PR review + merge of A2 then A3.~~ Done (PRs #6, #7, #8, #9, #10 merged).
+6. ~~Phase C kickoff.~~ Done — C1 platform-provisioned externally; C2 EDP starter shipped + live-validated against devtest workspace `dbc-8e058692-373e` (16/16/6 row pass); C3 ADR-004 accepted with Option C revision (shared `metadata` catalog, per-env schema); C4 ADR-003 §Q5 closed.
+7. **Phase D NEXT** — refresh complete 2026-04-20. Trigger D0 measurement once a real prod-shape source is on incremental cadence in devtest. D2 implementation work (~3-5 days) opportunistic until then.
 
 ## Out of scope
 
