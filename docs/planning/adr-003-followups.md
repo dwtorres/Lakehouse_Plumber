@@ -78,7 +78,7 @@ Goal: close the research questions that don't require building new components. G
 ### Phase A exit criteria
 
 - [~] A1: ADR-003 §Q1 has authoritative rationale text. **Deferrable** (2026-04-19): underscore-prefix rationale low-stakes; closing it does not gate any production work. Ask whenever convenient.
-- [~] A2: empty-batch extract verified end-to-end on a dev workspace. **Code shipped** on `feature/adr-003-a2-empty-batch-hardening`; Wumbo dev-workspace `WHERE 1=0` validation is the remaining check.
+- [x] A2: empty-batch extract verified end-to-end on a dev workspace. Code shipped on `feature/adr-003-a2-empty-batch-hardening` (`08fe67a1`); live validation 2026-04-20 against devtest workspace `dbc-8e058692-373e` per [`docs/runbooks/devtest-validation-adr-003-phase-a-c.md`](../runbooks/devtest-validation-adr-003-phase-a-c.md) §Step 4 — sentinel watermark forced empty incremental, A2 fallback wrote 0-row schema-bearing parquet at `_lhp_runs/local-f7816a34-.../`, no `CF_EMPTY_DIR_FOR_SCHEMA_INFERENCE`.
 - [x] A3: generator-side landing-schema validator shipped; Wumbo's existing bundle passes validation. Closed by `feature/adr-003-a3-landing-schema-validator` (`LHP-CFG-018`, 4 new tests, 3406 total pass).
 
 Phase A can run in parallel. Earliest completion blocker is A1 response time.

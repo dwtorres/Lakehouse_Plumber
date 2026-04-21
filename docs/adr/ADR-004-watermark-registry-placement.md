@@ -119,6 +119,16 @@ Codified by [`Example_Projects/edp_lhp_starter/`](../../Example_Projects/edp_lhp
 
 No LHP code change required — `WatermarkConfig.catalog` and `WatermarkConfig.schema` already exist in `src/lhp/models/pipeline_config.py` and the generator already plumbs them through the JDBC watermark template (`wm_catalog`, `wm_schema`).
 
+### Validated against devtest workspace 2026-04-20
+
+Live end-to-end validation per [`docs/runbooks/devtest-validation-adr-003-phase-a-c.md`](../runbooks/devtest-validation-adr-003-phase-a-c.md) §Step 2 + §Step 3 against `dbc-8e058692-373e`:
+
+- `WatermarkManager.__init__` auto-created `metadata.devtest_orchestration.watermarks` on the first extract task run (DDL via `_ensure_table_exists`). No manual `CREATE TABLE` required — provisioning runbook below only needs catalog + schema.
+- Schema as designed: 17 columns (`run_id`, `watermark_time`, `source_system_id`, `schema_name`, `table_name`, `watermark_column_name`, `watermark_value`, `previous_watermark_value`, `row_count`, `extraction_type`, `bronze_stage_complete`, `silver_stage_complete`, `status`, `error_class`, `error_message`, `created_at`, `completed_at`); liquid clustering on `(source_system_id, schema_name, table_name)`.
+- Wumbo AdventureWorks-on-Supabase `HumanResources.Department` (16 rows) wired through bronze + silver + gold; per-env catalog literals (`devtest_edp_bronze.bronze.department`, `devtest_edp_silver.silver.department`, `devtest_edp_gold.gold.customer_orders_summary_monthly`) bound correctly at runtime; row counts 16 / 16 / 6.
+- Watermark row written to `metadata.devtest_orchestration.watermarks`: `source_system_id=pg_supabase_aw`, `schema_name=HumanResources`, `table_name=Department`, `watermark_value=2008-04-30 00:00:00`, `row_count=16`, `status=completed`, `run_id=local-cb2d7a46-607d-4fb9-bcb2-fb68215325b4`. Confirms ADR-004 §Decision binding (catalog `metadata`, schema `<env>_orchestration`).
+- Schema-level GRANT semantics confirmed: deploy principal had `USE CATALOG metadata` + `USE SCHEMA metadata.devtest_orchestration` + `MODIFY metadata.devtest_orchestration` only. Cross-env schemas (`qa_orchestration`, `prod_orchestration` once provisioned) are isolated by separate `MODIFY` grants per ADR-004 §Decision §Rationale point 2.
+
 ### Provisioning runbook (one-time per workspace + per env)
 
 ```sql
