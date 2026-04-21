@@ -438,9 +438,15 @@ Two options:
 
 ```sql
 -- Run in `metadata` catalog SQL editor (ADR-004 Option C — shared catalog, per-env schema):
--- Full 17-column INSERT. WatermarkManager DDL (lhp_watermark/_manager.py
--- ::_ensure_table_exists) marks bronze_stage_complete + silver_stage_complete
--- + created_at as NOT NULL — these must be supplied.
+-- Full 17-column INSERT. Two strict requirements:
+--   1. status MUST be lowercase 'completed' — get_latest_watermark in
+--      lhp_watermark/watermark_manager.py filters WHERE status = 'completed'
+--      with a literal lowercase compare. An uppercase 'COMPLETED' sentinel
+--      is silently skipped, leaving the prior real watermark in effect, and
+--      the next extract reads non-zero rows (validated 2026-04-20: case-
+--      mismatched sentinel produced row_count=16 instead of empty-batch).
+--   2. WatermarkManager DDL (_ensure_table_exists) marks bronze_stage_complete
+--      + silver_stage_complete + created_at as NOT NULL — must be supplied.
 INSERT INTO metadata.devtest_orchestration.watermarks (
   run_id, watermark_time,
   source_system_id, schema_name, table_name,
@@ -456,13 +462,13 @@ INSERT INTO metadata.devtest_orchestration.watermarks (
   'ModifiedDate', '2099-12-31T00:00:00.000000+00:00', NULL, 0,
   'incremental',
   TRUE, TRUE,
-  'COMPLETED',
+  'completed',
   NULL, NULL,
   current_timestamp(), current_timestamp()
 );
 ```
 
-(Adjust the column list and types if the runtime DDL drifts — re-check with `DESCRIBE TABLE metadata.devtest_orchestration.watermarks`.)
+(Adjust the column list and types if the runtime DDL drifts — re-check with `DESCRIBE TABLE metadata.devtest_orchestration.watermarks`. Always keep `status` lowercase.)
 
 **Option b** — edit `customer_bronze.yaml` to point at an empty source table.
 
