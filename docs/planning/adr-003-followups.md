@@ -268,6 +268,20 @@ Sample current accumulation to size the problem before building.
 
 **Effort**: ~30 min query + 30 min napkin math. Output: a one-paragraph projection committed alongside D1.
 
+#### D0 baseline (2026-04-20)
+
+Pre-trigger snapshot taken before any prod-shape source is on cadence.
+
+- **Devtest landing dirs** under `/Volumes/devtest_edp_landing/landing/landing/department/_lhp_runs/`: **0** (cleaned up post-runbook validation; landing dir does not currently exist — `databricks fs ls` returns `no such directory`).
+- **Devtest watermark rows** at `metadata.devtest_orchestration.watermarks`: **0** (`SELECT COUNT(*)` returned 0; rows wiped post-validation). Table itself remains, schema intact (17 cols + liquid clustering on `(source_system_id, schema_name, table_name)` per ADR-004 §Implementation Status).
+- **Per-extract growth model** (verified by live runbook 2026-04-20): each `databricks bundle run edp_bronze_jdbc_ingestion_workflow` produces exactly:
+  - 1 new `_lhp_runs/<uuid>/` directory under the source's landing path (regardless of result — empty incrementals also write a 0-row schema-bearing parquet via the A2 fallback).
+  - 1 new row in `metadata.devtest_orchestration.watermarks` (status `completed` on success, `failed` on extraction error, `landed_not_committed` on partial finalize crash).
+  - 1 part file + `_SUCCESS` + `_committed_*` + `_started_*` markers per `_lhp_runs/<uuid>/`.
+- **Cadence projection (placeholder)**: assuming a hypothetical `prod` shape of 50 source tables × 4 extracts/day each = 200 runs/day = **~73k landing dirs + 73k watermark rows per year per env**. With three envs (devtest + qa + prod), aggregate ~219k of each per year. Above the 10⁴ benchmark threshold in D3 by EOY year-1; reaper (D2) becomes mandatory, not nice-to-have, before that point. Numbers are placeholder — tighten with real source list once defined.
+
+**Trigger to refresh this baseline**: first time a prod-shape source runs in devtest on a recurring schedule (e.g. hourly). Re-run D0 measurements after 7 days, project from observed rate, then move to D1 contract drafting.
+
 ### D1 — Operator contract
 
 Ratify two contracts:
