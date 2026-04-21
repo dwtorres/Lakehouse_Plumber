@@ -130,7 +130,7 @@ cp pipelines/02_bronze/customer_bronze.yaml /tmp/customer_bronze.yaml.bak
 # Two edits in one pass:
 # 1. landing_path must be UC volume path under devtest_edp_bronze.bronze
 # 2. write_target.catalog must be literal devtest_edp_bronze (not substitution token)
-sed -i '' 's|landing_path: "${landing_volume_root}/customer"|landing_path: /Volumes/devtest_edp_bronze/bronze/landing/customer|' \
+sed -i '' 's|landing_path: "${landing_volume_root}/department"|landing_path: /Volumes/devtest_edp_bronze/bronze/landing/department|' \
   pipelines/02_bronze/customer_bronze.yaml
 sed -i '' 's|catalog: "${bronze_catalog}"|catalog: "devtest_edp_bronze"|' \
   pipelines/02_bronze/customer_bronze.yaml
@@ -307,27 +307,49 @@ databricks bundle run -t devtest -p dbc-8e058692-373e \
 
 ### 2.6 — Verify per-env writes (only if §2.5 ran)
 
+The starter's bronze + silver write_targets emit tables named `department` (the source is `HumanResources.Department` per the Wumbo wiring). Gold emits `customer_orders_summary_monthly` (MV name retained for e2e test fixture compatibility — it now contains a per-`group_name` Department aggregation, not customer order data).
+
 ```sql
 -- All three queries must return rows when §2.5 succeeded.
-SELECT COUNT(*) AS bronze_rows FROM devtest_edp_bronze.bronze.customer;
-SELECT COUNT(*) AS silver_rows FROM devtest_edp_silver.silver.customer;
+SELECT COUNT(*) AS bronze_rows FROM devtest_edp_bronze.bronze.department;
+SELECT COUNT(*) AS silver_rows FROM devtest_edp_silver.silver.department;
 SELECT COUNT(*) AS gold_rows
   FROM devtest_edp_gold.gold.customer_orders_summary_monthly;
+-- Expected (against the 16-row Wumbo Department source):
+--   bronze_rows = 16
+--   silver_rows = 16
+--   gold_rows   = 6   (one row per distinct GroupName)
 ```
 
 ### 2.7 — Verify cross-catalog source binding (only if §2.5 ran)
 
-Pull the silver DLT pipeline event log entry for the `v_customer_bronze` view and confirm the source resolved to `devtest_edp_bronze.bronze.customer` (not some default catalog):
+Pull the silver DLT pipeline event log via the Databricks Pipelines API (DLT does not expose a per-pipeline `event_log_<id>` table by default — it requires explicit `event_log:` config in the resource YAML). The CLI works against any pipeline without that config:
 
-```sql
-SELECT details:flow_definition.dataset_name, details:flow_definition.spec
-  FROM event_log(TABLE(devtest_edp_silver.silver.event_log_<pipeline_id>))
-  WHERE event_type = 'create_view'
-    AND details:flow_definition.dataset_name = 'v_customer_bronze'
-  ORDER BY timestamp DESC LIMIT 1;
+```bash
+# Get the silver pipeline_id (one-off):
+databricks pipelines list-pipelines -p dbc-8e058692-373e | \
+  python3 -c "import sys,json;d=json.load(sys.stdin);[print(p.get('pipeline_id'),'-',p.get('name')) for p in (d if isinstance(d,list) else d.get('statuses',[])) if 'edp_silver_curation' in p.get('name','')]"
+
+# Then fetch the latest CREATE_VIEW events:
+databricks pipelines list-pipeline-events <silver-pipeline-id> -p dbc-8e058692-373e | \
+  python3 -c "import sys,json;d=json.load(sys.stdin);events=d if isinstance(d,list) else d.get('events',[]); \
+[print(e.get('event_type'),'|',e.get('details',{}).get('flow_definition',{}).get('dataset_name'),'|',e.get('details',{}).get('flow_definition',{}).get('spec','')[:200]) \
+ for e in events[:30] if e.get('event_type') in ('create_update','flow_progress') and 'v_customer_bronze' in str(e)]"
 ```
 
-The `spec` field must reference `devtest_edp_bronze.bronze.customer`.
+The output should show `v_customer_bronze` source spec referencing `devtest_edp_bronze.bronze.department`.
+
+The view name is `v_customer_bronze` (not `v_department_bronze`) because the starter retains the `customer_*` action names for e2e test fixture compatibility — only the underlying table is `department`.
+
+**Alternative** (lower-friction sanity check): inspect the generated silver `.py` for the literal table reference, since the cross-catalog binding is baked at LHP generate time:
+
+```bash
+cd Example_Projects/edp_lhp_starter
+grep "spark.readStream.table\|spark.read.table" generated/devtest/edp_silver_curation/customer_silver.py
+# Expect: spark.readStream.table("devtest_edp_bronze.bronze.department")
+```
+
+If the generated `.py` shows the correct catalog-qualified literal, the runtime read will resolve to the same place.
 
 ### 2.8 — Outcome
 
@@ -355,9 +377,9 @@ SELECT
   watermark_column_name, watermark_value, row_count,
   status, watermark_time, run_id, extraction_type
 FROM metadata.devtest_orchestration.watermarks
-WHERE source_system_id = 'pg_edp'
-  AND schema_name      = 'public'
-  AND table_name       = 'customer'
+WHERE source_system_id = 'pg_supabase_aw'
+  AND schema_name      = 'HumanResources'
+  AND table_name       = 'Department'
 ORDER BY watermark_time DESC
 LIMIT 5;
 ```
@@ -366,9 +388,9 @@ LIMIT 5;
 
 - At least one row with `status = 'COMPLETED'`.
 - `watermark_value` is a parseable timestamp (`ModifiedDate` MAX from the source).
-- `row_count` matches what landed in `devtest_edp_bronze.bronze.customer`.
+- `row_count` matches what landed in `devtest_edp_bronze.bronze.department`.
 - `run_id` matches a `_lhp_runs/<uuid>/` directory under
-  `/Volumes/devtest_edp_landing/landing/landing/customer/`.
+  `/Volumes/devtest_edp_landing/landing/landing/department/`.
 
 Spot-check the cross-env schema isolation under ADR-004 Option C:
 
@@ -382,7 +404,7 @@ SHOW SCHEMAS IN metadata LIKE '*_orchestration';
 -- run rows — schema-level isolation is the runtime blast-radius bound.
 SHOW TABLES IN metadata.qa_orchestration;
 SHOW TABLES IN metadata.prod_orchestration;
--- If either schema's `watermarks` table contains rows for source_system_id='pg_edp'
+-- If either schema's `watermarks` table contains rows for source_system_id='pg_supabase_aw'
 -- with a run_id from this devtest run, the per-env schema isolation has been
 -- compromised — investigate WatermarkConfig.schema substitution immediately.
 ```
@@ -396,7 +418,7 @@ SHOW TABLES IN metadata.prod_orchestration;
 
 ## Step 4 — A2: empty-batch schema-bearing fallback
 
-**Goal**: prove that an incremental JDBC extract that returns zero rows still leaves a schema-bearing parquet at `${landing_volume_root}/customer/_lhp_runs/<uuid>/`, so the bronze AutoLoader does not fail with `CF_EMPTY_DIR_FOR_SCHEMA_INFERENCE` on the next run.
+**Goal**: prove that an incremental JDBC extract that returns zero rows still leaves a schema-bearing parquet at `${landing_volume_root}/department/_lhp_runs/<uuid>/`, so the bronze AutoLoader does not fail with `CF_EMPTY_DIR_FOR_SCHEMA_INFERENCE` on the next run.
 
 ### 4.1 — Prerequisite: registry table exists
 
@@ -423,7 +445,7 @@ INSERT INTO metadata.devtest_orchestration.watermarks (
 ) VALUES (
   'sentinel-empty-batch-test',
   current_timestamp(),
-  'pg_edp', 'public', 'customer',
+  'pg_supabase_aw', 'HumanResources', 'Department',
   'ModifiedDate', '2099-12-31T00:00:00.000000+00:00', NULL, 0,
   'incremental', 'COMPLETED'
 );
@@ -452,7 +474,7 @@ databricks bundle run \
 
 ```bash
 databricks fs ls \
-  dbfs:/Volumes/devtest_edp_landing/landing/landing/customer/_lhp_runs/ \
+  dbfs:/Volumes/devtest_edp_landing/landing/landing/department/_lhp_runs/ \
   -p dbc-8e058692-373e
 
 # Expect: at least one <uuid>/ subdirectory containing one *.parquet file
@@ -462,7 +484,7 @@ Inspect the parquet — it must have schema but zero rows:
 
 ```python
 # In a Databricks notebook attached to a serverless cluster:
-landing = "/Volumes/devtest_edp_landing/landing/landing/customer/_lhp_runs"
+landing = "/Volumes/devtest_edp_landing/landing/landing/department/_lhp_runs"
 latest = max(
     [f.path for f in dbutils.fs.ls(landing)],
     key=lambda p: dbutils.fs.ls(p)[0].modificationTime,
@@ -470,8 +492,8 @@ latest = max(
 df = spark.read.parquet(latest)
 assert df.count() == 0, f"expected zero rows, got {df.count()}"
 print("Schema:", df.schema.simpleString())
-# Schema must contain CustomerID, FirstName, LastName, EmailAddress, ModifiedDate
-# (or whatever your source has)
+# Schema must contain DepartmentID, Name, GroupName, ModifiedDate
+# (HumanResources.Department source columns)
 ```
 
 ### 4.5 — Run the bronze DLT
@@ -481,10 +503,10 @@ databricks bundle run -t devtest -p dbc-8e058692-373e \
   edp_bronze_jdbc_ingestion_pipeline
 ```
 
-**Pass criterion**: bronze DLT update finishes `COMPLETED` (not `FAILED`); event log shows `INFO` entries, no `CF_EMPTY_DIR_FOR_SCHEMA_INFERENCE` exception. Bronze table `devtest_edp_bronze.bronze.customer` exists and is unchanged from Step 2 (no new rows from the empty-batch run).
+**Pass criterion**: bronze DLT update finishes `COMPLETED` (not `FAILED`); event log shows `INFO` entries, no `CF_EMPTY_DIR_FOR_SCHEMA_INFERENCE` exception. Bronze table `devtest_edp_bronze.bronze.department` exists and is unchanged from Step 2 (no new rows from the empty-batch run).
 
 ```sql
-SELECT COUNT(*) FROM devtest_edp_bronze.bronze.customer;
+SELECT COUNT(*) FROM devtest_edp_bronze.bronze.department;
 -- expect: same count as after Step 2 (no new rows)
 ```
 
@@ -508,19 +530,19 @@ WHERE run_id = 'sentinel-empty-batch-test';
 -- Optional: clear the test rows from devtest tables if you do not want them
 -- accumulating. Skip if devtest is also your dev-loop environment.
 
-DELETE FROM devtest_edp_bronze.bronze.customer;
-DELETE FROM devtest_edp_silver.silver.customer;
+DELETE FROM devtest_edp_bronze.bronze.department;
+DELETE FROM devtest_edp_silver.silver.department;
 DELETE FROM devtest_edp_gold.gold.customer_orders_summary_monthly;
 DELETE FROM metadata.devtest_orchestration.watermarks
-  WHERE source_system_id = 'pg_edp'
-    AND schema_name      = 'public'
-    AND table_name       = 'customer';
+  WHERE source_system_id = 'pg_supabase_aw'
+    AND schema_name      = 'HumanResources'
+    AND table_name       = 'Department';
 ```
 
 ```bash
 # Remove the run-scoped landing parquet too if disk pressure matters.
 databricks fs rm -r \
-  dbfs:/Volumes/devtest_edp_landing/landing/landing/customer/_lhp_runs \
+  dbfs:/Volumes/devtest_edp_landing/landing/landing/department/_lhp_runs \
   -p dbc-8e058692-373e
 ```
 
