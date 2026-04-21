@@ -481,30 +481,48 @@ databricks bundle run \
   edp_bronze_jdbc_ingestion_workflow
 ```
 
-### 4.4 — Observe the landing path
+### 4.4 — Observe the empty-batch landing path
+
+The §4.3 extract should have produced a NEW `_lhp_runs/<uuid>/` subdirectory with a 0-row schema-bearing parquet (the A2 fallback). Do NOT pick the directory by modification time — earlier non-empty runs may sort newer if filesystem timestamps drift, and the recovery path can re-finalize an old run. Instead, look up the new run_id from the watermark table and read THAT specific directory.
+
+```sql
+-- Find the run_id of the empty-batch run (row_count=0, status='completed',
+-- and excluding the sentinel row inserted in §4.2).
+SELECT run_id, watermark_value, row_count, status, watermark_time
+FROM metadata.devtest_orchestration.watermarks
+WHERE source_system_id = 'pg_supabase_aw'
+  AND schema_name      = 'HumanResources'
+  AND table_name       = 'Department'
+  AND row_count        = 0
+  AND status           = 'COMPLETED'
+  AND run_id          != 'sentinel-empty-batch-test'
+ORDER BY watermark_time DESC
+LIMIT 1;
+```
+
+If zero rows return: §4.3 extract did not produce an empty-batch row. Either the sentinel watermark was not at a future timestamp (so JDBC returned non-zero rows) OR the extract failed. Check the workflow run logs and re-run §4.3 before continuing.
+
+If one row returns, take its `run_id` and inspect the parquet at that exact directory:
+
+```python
+# In a Databricks notebook attached to a serverless cluster.
+# Replace <empty-batch-run-id> with the run_id from the SQL query above.
+target = "/Volumes/devtest_edp_landing/landing/landing/department/_lhp_runs/<empty-batch-run-id>"
+files = [f for f in dbutils.fs.ls(target) if f.path.endswith(".parquet")]
+assert files, f"No *.parquet under {target} — A2 fallback did not write a schema-bearing file"
+df = spark.read.parquet(target)
+assert df.count() == 0, f"expected zero rows, got {df.count()}"
+print("Schema:", df.schema.simpleString())
+# Schema must contain DepartmentID, Name, GroupName, ModifiedDate
+# (HumanResources.Department source columns)
+```
+
+Optional — list all run subdirectories to inspect the run-id ordering:
 
 ```bash
 databricks fs ls \
   dbfs:/Volumes/devtest_edp_landing/landing/landing/department/_lhp_runs/ \
   -p dbc-8e058692-373e
-
-# Expect: at least one <uuid>/ subdirectory containing one *.parquet file
-```
-
-Inspect the parquet — it must have schema but zero rows:
-
-```python
-# In a Databricks notebook attached to a serverless cluster:
-landing = "/Volumes/devtest_edp_landing/landing/landing/department/_lhp_runs"
-latest = max(
-    [f.path for f in dbutils.fs.ls(landing)],
-    key=lambda p: dbutils.fs.ls(p)[0].modificationTime,
-)
-df = spark.read.parquet(latest)
-assert df.count() == 0, f"expected zero rows, got {df.count()}"
-print("Schema:", df.schema.simpleString())
-# Schema must contain DepartmentID, Name, GroupName, ModifiedDate
-# (HumanResources.Department source columns)
 ```
 
 ### 4.5 — Run the bronze DLT
