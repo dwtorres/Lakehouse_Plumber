@@ -438,16 +438,27 @@ Two options:
 
 ```sql
 -- Run in `metadata` catalog SQL editor (ADR-004 Option C — shared catalog, per-env schema):
+-- Full 17-column INSERT. WatermarkManager DDL (lhp_watermark/_manager.py
+-- ::_ensure_table_exists) marks bronze_stage_complete + silver_stage_complete
+-- + created_at as NOT NULL — these must be supplied.
 INSERT INTO metadata.devtest_orchestration.watermarks (
-  run_id, watermark_time, source_system_id, schema_name, table_name,
+  run_id, watermark_time,
+  source_system_id, schema_name, table_name,
   watermark_column_name, watermark_value, previous_watermark_value, row_count,
-  extraction_type, status
+  extraction_type,
+  bronze_stage_complete, silver_stage_complete,
+  status,
+  error_class, error_message,
+  created_at, completed_at
 ) VALUES (
-  'sentinel-empty-batch-test',
-  current_timestamp(),
+  'sentinel-empty-batch-test', current_timestamp(),
   'pg_supabase_aw', 'HumanResources', 'Department',
   'ModifiedDate', '2099-12-31T00:00:00.000000+00:00', NULL, 0,
-  'incremental', 'COMPLETED'
+  'incremental',
+  TRUE, TRUE,
+  'COMPLETED',
+  NULL, NULL,
+  current_timestamp(), current_timestamp()
 );
 ```
 
