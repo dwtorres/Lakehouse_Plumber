@@ -134,7 +134,9 @@ def _ansi_quote_identifier(value: str) -> str:
 
 def _build_jdbc_query(hwm):
     """Compose the JDBC subquery string from validated Python values."""
-    base = f"(SELECT * FROM {jdbc_table}) AS t"
+    # Subquery alias without `AS` — ANSI-compatible, works on Postgres + Oracle.
+    # Oracle rejects `AS` in FROM-clause alias position (ORA-03048).
+    base = f"(SELECT * FROM {jdbc_table}) t"
     if hwm is None:
         return base
     {% if watermark_type == "timestamp" %}
@@ -163,7 +165,7 @@ def _build_jdbc_query(hwm):
     if op not in (">=", ">", "<=", "<", "="):
         raise ValueError(f"unsupported watermark operator: {op!r}")
     col_quoted = _ansi_quote_identifier(watermark_column)
-    return f"(SELECT * FROM {jdbc_table} /*lhp-where*/ {col_quoted} {op} {hwm_literal}) AS t".replace(
+    return f"(SELECT * FROM {jdbc_table} /*lhp-where*/ {col_quoted} {op} {hwm_literal}) t".replace(
         "/*lhp-where*/", "WHERE"
     )
 
