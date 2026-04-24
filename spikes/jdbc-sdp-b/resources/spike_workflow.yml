@@ -1,0 +1,74 @@
+# Databricks Asset Bundle resource — JDBC SDP Spike B
+#
+# Job topology (3 tasks):
+#
+#   prepare_manifest  — discovers 73 AW tables, inserts manifest + registry
+#                       rows tagged load_group='spike_b', emits manifest_rows
+#                       task value (JSON array) for the for_each task.
+#
+#   for_each_ingest   — Databricks-native for_each_task; iterates over the
+#                       manifest_rows task value with max concurrency 10.
+#                       Each iteration runs ingest_one.py with the manifest
+#                       row fields as base_parameters. Per-table state
+#                       updates (manifest + watermark_registry) happen
+#                       INLINE in each iteration — no separate reconcile
+#                       task needed (contrast with Spike A1 which requires
+#                       a reconcile step to read SDP event_log() post-run).
+#
+#   validate          — Acceptance gate; asserts completed count >= min_completed
+#                       for this run_id and load_group='spike_b'.
+#
+# Key design differences from Spike A1:
+#   - No SDP pipeline, no reconcile task.
+#   - State transitions inline per iteration = simpler failure isolation.
+#   - for_each native retry can be configured per-task (not used here; each
+#     iteration handles its own try/except and marks failed gracefully).
+#   - run_if: ALL_DONE on validate ensures gate runs even when some iterations fail.
+
+resources:
+  jobs:
+    spike_jdbc_sdp_b_job:
+      name: spike_jdbc_sdp_b
+
+      parameters:
+        - name: run_id
+          default: "${bundle.name}-${var.stamp}"
+        - name: rerun_mode
+          default: fresh
+        - name: min_completed
+          default: "60"
+
+      tasks:
+        - task_key: prepare_manifest
+          notebook_task:
+            notebook_path: ../tasks/prepare_manifest.py
+            base_parameters:
+              run_id: "{{job.parameters.run_id}}"
+              rerun_mode: "{{job.parameters.rerun_mode}}"
+              load_group: spike_b
+
+        - task_key: for_each_ingest
+          depends_on:
+            - task_key: prepare_manifest
+          for_each_task:
+            inputs: "{{tasks.prepare_manifest.values.manifest_rows}}"
+            concurrency: 10
+            task:
+              task_key: ingest_one
+              notebook_task:
+                notebook_path: ../tasks/ingest_one.py
+                base_parameters:
+                  manifest_row: "{{input}}"
+                  run_id: "{{job.parameters.run_id}}"
+
+        - task_key: validate
+          depends_on:
+            - task_key: for_each_ingest
+          # Run even when some iterations fail — gate on manifest count.
+          run_if: ALL_DONE
+          notebook_task:
+            notebook_path: ../tasks/validate.py
+            base_parameters:
+              run_id: "{{job.parameters.run_id}}"
+              load_group: spike_b
+              min_completed: "{{job.parameters.min_completed}}"

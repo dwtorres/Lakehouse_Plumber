@@ -1,0 +1,42 @@
+# Self-contained Databricks Asset Bundle for Spike B
+#
+# Spike B proves the Databricks-native for_each_task approach to parallel
+# JDBC ingestion, using the same PG AdventureWorks source as Spike A1 but
+# with a fundamentally different execution model:
+#
+#   Spike A1: SDP-native dynamic flows (one DLT pipeline, N flows)
+#   Spike B:  for_each_task (one job, N per-iteration notebook tasks)
+#
+# The for_each_task model eliminates the separate reconcile task because
+# each iteration notebook writes its own state updates inline.
+#
+# Usage (from spikes/jdbc-sdp-b/ directory):
+#   databricks --profile dbc-8e058692-373e bundle validate --target dev
+#   databricks --profile dbc-8e058692-373e bundle deploy --target dev
+#   databricks --profile dbc-8e058692-373e bundle run spike_jdbc_sdp_b_job \
+#       --target dev \
+#       --params "run_id=b-scale-$(date +%s),rerun_mode=fresh,min_completed=60"
+
+bundle:
+  name: spike_jdbc_sdp_b
+  uuid: 96aa39df-943a-4bb9-a19c-c362cf4b5a2c
+
+variables:
+  stamp:
+    description: "Deployment stamp used in default run_id fallback"
+    default: "v1"
+  run_id:
+    description: "Run identifier — operator overrides per run"
+    default: ""
+
+include:
+  - resources/*.yml
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://dbc-8e058692-373e.cloud.databricks.com
+      # root_path scoped to bundle name — does NOT collide with A1 or Wumbo.
+      root_path: ~/.bundle/${bundle.name}/${bundle.target}
