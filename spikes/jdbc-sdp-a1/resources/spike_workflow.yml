@@ -88,6 +88,13 @@ resources:
         - task_key: reconcile
           depends_on:
             - task_key: run_sdp_pipeline
+          # Run reconcile even when the pipeline update reports FAILED. SDP
+          # marks an update FAILED if ANY flow fails, but other flows may
+          # have completed successfully and their outcomes are recorded in
+          # the event log. Reconcile must read those outcomes and transition
+          # manifest + watermark registry rows accordingly, regardless of
+          # overall pipeline status.
+          run_if: ALL_DONE
           notebook_task:
             notebook_path: ../tasks/reconcile.py
             base_parameters:
@@ -97,6 +104,9 @@ resources:
         - task_key: validate
           depends_on:
             - task_key: reconcile
+          # Same rationale as reconcile — validate gates on the manifest
+          # count, which is only accurate after reconcile runs.
+          run_if: ALL_DONE
           notebook_task:
             notebook_path: ../tasks/validate.py
             base_parameters:

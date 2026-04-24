@@ -95,11 +95,18 @@ def make_flow(spec: dict) -> None:
     def _flow(spec: dict = spec) -> "pyspark.sql.DataFrame":  # type: ignore[name-defined]
         source_fqn = f"freesql_catalog.{spec['source_schema']}.{spec['source_table']}"
 
-        # Failure injection for T-tkf-04 testing: point the first flow at a
-        # non-existent table so it fails at table-resolution time. Other flows
-        # are unaffected — SDP continue-on-failure is the mechanism under test.
-        if inject_failure == "true" and spec is pending_specs[0]:
-            source_fqn = "freesql_catalog.does_not_exist.nope_nope"
+        # Failure injection for acceptance testing: a RUNTIME-only error on
+        # the first flow. Earlier attempts at inject_failure pointed the
+        # source at a non-existent table, but that fails at SDP ANALYZE
+        # (graph-build) time — which aborts the entire pipeline update
+        # before any flow runs. The goal of the test is to verify per-flow
+        # runtime isolation, so the injection now uses a division-by-zero
+        # expression added AFTER the source read: the query analyses
+        # successfully (Spark infers an integer divide) but throws at
+        # materialisation time, isolating the failure to this one flow.
+        should_inject_runtime_failure = (
+            inject_failure == "true" and spec is pending_specs[0]
+        )
 
         # Oracle NUMBER columns without explicit precision map to
         # DECIMAL(38,10) in Databricks federation, but real Oracle values
@@ -141,6 +148,10 @@ def make_flow(spec: dict) -> None:
         if hwm:
             # Incremental load — filter to rows strictly after the stored HWM.
             df = df.filter(F.col(watermark_col) > F.lit(hwm))
+
+        if should_inject_runtime_failure:
+            # Runtime-only failure: analyse OK, throw on data access.
+            df = df.withColumn("__inject_fail", F.expr("1 / 0"))
 
         # Return the DataFrame ONLY — no imperative Delta writes permitted here.
         # SDP handles the materialisation to devtest_edp_bronze.jdbc_spike.<target_table>.
