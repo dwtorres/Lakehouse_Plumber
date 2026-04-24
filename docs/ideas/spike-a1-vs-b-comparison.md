@@ -9,13 +9,13 @@
 
 ## Summary Verdict
 
-**Both spikes proved their theses under fair test conditions.**
+**Both spikes proved their theses under fair test conditions. Shared prerequisite (Tier 1 HWM isolation) is shipped and V1-proven.**
 
 Spike B delivered 780,132 catalog rows (738,913 from this clean run's working set, remainder from prior partial runs) across 63 Delta tables. Spike A1 delivered 738,913 rows across 61 Delta tables on a clean first-run full-load under retest `retest_1777031969`, with per-table parity at exactly 0% delta against PG source on all 61 tables.
 
-The original "A1 = 0 rows" finding was a test-ordering artifact: Spike B ran first against a shared `watermark_registry` and advanced all PG HWMs to the dataset ceiling. A1 then correctly returned zero rows on a static historical dataset. A1 was never given a fair first-run full-load until the retest.
+The original "A1 = 0 rows" finding was a test-ordering artifact: Spike B ran first against a shared `watermark_registry` and advanced all PG HWMs to the dataset ceiling. A1 then correctly returned zero rows on a static historical dataset. A1 was never given a fair first-run full-load until the retest. The Tier 1 fix (commit `63bcfdb`) closes the underlying hazard at query level; V1 probe verified the filter excludes a synthetic poisoning row.
 
-**Strategic choice is now a genuine tradeoff, not a foregone conclusion.** Both approaches are viable. The recommendation depends on LHP's integration priorities — see Strategic Recommendation below.
+**Strategic choice is a genuine tradeoff.** Jump to the [TL;DR decision guide](#tldr-decision-guide) for a one-screen read, or the [Integration Path Options](#integration-path-options) section for full detail. The Appendix's HWM-poisoning section is now historical context — the hazard is closed in the spike prototypes; Tier 2 and Tier 3 mitigations remain available if future multi-tenancy requires stronger isolation.
 
 ---
 
@@ -151,7 +151,28 @@ Delta data.
 
 ## Integration Path Options
 
-Three viable paths for LHP integration. Each sketched symmetrically so the decision can be made on criteria, not narrative bias. Prerequisites (shared across all paths): Tier 1 HWM isolation must land first — see scheduled plan `docs/planning/tier-1-hwm-fix.md`.
+Three viable paths for LHP integration. Each sketched symmetrically so the decision can be made on criteria, not narrative bias.
+
+**Status of shared prerequisite: Tier 1 HWM isolation — DONE** (commit `63bcfdb`, quick task `260424-dwc`, V1 probe PASSED 2026-04-24). Both spike `prepare_manifest.py` copies now filter the registry by `source_system_id`. See `docs/planning/tier-1-hwm-fix.md` for the fix, and "V1 Probe Verification" below for the empirical proof the filter actually excludes poisoned rows.
+
+### TL;DR decision guide
+
+- **Target N per flowgroup < 50 AND no immediate N=100+ target:** Option B. Smallest delta, ships in 1.5 sprints, fits LHP's existing per-table template model almost 1:1.
+- **Target N ≥ 100 AND per-run cost matters (DBU-hours measurable):** Option A. Single cluster amortises cost flat across N; B's cold-start cost scales linearly.
+- **Mixed portfolio of flowgroup sizes AND team has the sprint capacity:** Option C. Per-flowgroup choice; start everything on B, migrate high-volume ones to A as evidence accumulates.
+- **Unsure about N trajectory OR team is capacity-constrained:** Option B now, revisit for Option A once a real N=100+ flowgroup materialises. Lowest-regret path.
+
+### V1 Probe Verification (Tier 1 proof)
+
+Empirical test of the Tier 1 filter fix, run 2026-04-24 against `devtest_edp_orchestration.jdbc_spike.watermark_registry`:
+
+1. Baseline HWM for `humanresources.employee` via `pg_supabase` = `2014-12-26 09:17:08.637000`.
+2. Inserted synthetic "poisoning" row — `source_system_id = 'fake_federation'`, same `(schema, table)`, `watermark_value = '2099-01-01T00:00:00'`.
+3. Ran old query (no `source_system_id` filter): returned **`2099-01-01T00:00:00`** — poisoning confirmed as real attack vector.
+4. Ran new query with Tier 1 filter (`AND source_system_id = 'pg_supabase'`): returned **`2014-12-26 09:17:08.637000`** — correct, poisoning excluded.
+5. Cleanup: fake row deleted, `SELECT COUNT(*) WHERE source_system_id='fake_federation'` = 0.
+
+The hazard described throughout this document is no longer theoretical — both the attack and the fix are now demonstrated end-to-end.
 
 ### Option A — Adopt Spike A1 only (SDP-native dynamic flows)
 
@@ -258,30 +279,43 @@ flowgroups:
 
 ---
 
-## Concrete Next Actions (scheduled)
+## Concrete Next Actions
 
-Actions below are path-independent (1, 2) or carry-over from each spike (3–6). Owners placeholder; assign per team structure.
+Path-independent items and per-path carry-overs. Owners placeholder; assign per team structure. Status shown for completed items.
 
-1. **Schedule: Tier 1 HWM isolation fix** (Owner: `@eng`, Effort: 4h, Plan: `docs/planning/tier-1-hwm-fix.md`)
-   Prerequisite for any LHP integration. Adds `source_system_id` parameter to `get_current_hwm` in both spike `prepare_manifest.py` copies and filters registry reads by it. Closes cross-source HWM poisoning hazard without DDL. Ship before adopting any path above.
+### Completed (2026-04-24)
 
-2. **Document A1 SDP-MV findings in ADR** (Owner: `@tech-lead`, Effort: 2h)
-   Record why SDP MVs over foreign catalogs work for batch watermark ingestion with Tier 1 applied, and why they did NOT work in the first A1 run. Capture HWM-poisoning hazard and tiered mitigations (see Appendix) as the decision's load-bearing rationale.
+1. **Tier 1 HWM isolation fix** — DONE (commit `63bcfdb`, quick task `260424-dwc`).
+   Added `source_system_id` parameter to `get_current_hwm` in both spike `prepare_manifest.py` copies; filter binds the value via `spark.sql args=`. V1 probe proved the filter excludes a synthetic poisoning row from a different `source_system_id`. No DDL required. Plan at `docs/planning/tier-1-hwm-fix.md`.
 
-3. **A1 carry-over: fix `^v[a-z]` over-filter** (Owner: `@eng`, Effort: 1h)
-   Replace regex with explicit view-name allowlist in `fixtures_discovery.py`. Restores the 7 AW tables (`vendor`, `unitmeasure`, etc.) to the A1 working set. Only required if Option A or C selected.
+### Path-independent (do before committing to A/B/C)
 
-4. **A1 carry-over: parallelize `fixtures_discovery` schema queries** (Owner: `@eng`, Effort: 2h)
-   Current 5 sequential `SHOW TABLES` dominates wall-clock (1,401 s). Thread-pool over schemas drops to <30 s. Applies to A, B, or C since discovery is shared.
+2. **Document A1 SDP-MV findings + Tier 1 decision in ADR** (Owner: `@tech-lead`, Effort: 2h)
+   Capture: SDP MVs over foreign catalogs work for batch watermark ingestion when Tier 1 is applied; the first A1 run failed due to HWM poisoning across a shared registry, not an SDP framework defect; Tier 1 closed the hazard via query-level filter; Tier 2/3 remain available if future multi-tenancy requires stronger isolation. ADR is the decision's load-bearing rationale and guards against re-litigating the "A1 is broken" conclusion.
 
-5. **B carry-over: `saveAsTable` idempotency fix** (Owner: `@eng`, Effort: 2h)
-   `spikes/jdbc-sdp-b/tasks/ingest_one.py`: check `tableExists`, branch `insertInto` vs `saveAsTable`. Only required if Option B or C selected.
+### Path A carry-overs (only if Option A or C selected)
 
-6. **B carry-over: batched `prepare_manifest` HWM lookup** (Owner: `@eng`, Effort: 4h)
-   Single `GROUP BY` query replaces 73-iteration Python loop. Drops prepare_manifest from 403 s to <30 s. Applies to both spike copies (A and B share the template).
+3. **Fix `^v[a-z]` view-regex over-filter** (Owner: `@eng`, Effort: 1h)
+   Replace regex in `spikes/jdbc-sdp-a1/tasks/fixtures_discovery.py` with explicit view-name allowlist. Restores the 7 AW tables (`vendor`, `unitmeasure`, etc.) to A1's working set.
 
-7. **A1 N=100+ validation run** (Owner: `@tech-lead`, Effort: 1 sprint)
-   Required only if Option A or C selected. Confirms A1's per-flow cost advantage at the N where it matters. Blocks Option A commit until evidence is in hand.
+4. **Parallelise `fixtures_discovery` schema queries** (Owner: `@eng`, Effort: 2h)
+   Current 5 sequential `SHOW TABLES` calls dominate wall clock (1,401 s). Thread-pool over schemas drops this to <30 s. Also applies to B and C if their discovery reuses the same code.
+
+5. **A1 N=100+ validation run** (Owner: `@tech-lead`, Effort: 1 sprint)
+   A1's per-flow cost advantage is material only at large N. Before committing Option A, run a 100-table scale test with Tier 1 applied to confirm the cost delta justifies A1's integration complexity.
+
+### Path B carry-overs (only if Option B or C selected)
+
+6. **`saveAsTable` idempotency fix** (Owner: `@eng`, Effort: 2h)
+   `spikes/jdbc-sdp-b/tasks/ingest_one.py`: check `tableExists`, branch `insertInto` vs `saveAsTable`. Resolves the `TABLE_OR_VIEW_ALREADY_EXISTS` failure surfaced on retry of a cancelled partial run.
+
+7. **Batched `prepare_manifest` HWM lookup** (Owner: `@eng`, Effort: 4h)
+   Replace the 73-iteration Python loop with a single `SELECT schema_name, table_name, MAX(watermark_value) ... GROUP BY ...` query. Drops prepare_manifest from 403 s to <30 s. Also applies to A1's copy if it becomes the single source of truth for Option C.
+
+### Cleanup
+
+8. **Drop retest backup tables after 7-day retention** (Owner: `@eng`, Effort: 15m, Schedule: 2026-05-01)
+   `devtest_edp_orchestration.jdbc_spike.{watermark_registry_bak,manifest_bak,hwm_ceiling_snapshot,source_row_counts}_retest_1777031969`. Retention window gives time for the final decision to land without losing the ability to rebuild the retest baseline.
 
 ---
 
