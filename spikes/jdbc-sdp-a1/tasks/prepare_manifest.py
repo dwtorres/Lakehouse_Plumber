@@ -130,6 +130,7 @@ if rerun_mode == "fresh":
     sources = sources_df.collect()
 
     for row in sources:
+        src_catalog = row["source_catalog"]
         src_schema = row["source_schema"]
         src_table = row["source_table"]
         watermark_col = row["watermark_column"]
@@ -151,7 +152,7 @@ if rerun_mode == "fresh":
                error_class, error_message, retry_count, parent_run_id,
                rows_written)
             VALUES
-              (:run_id, :load_group, 'freesql_catalog', :source_schema, :source_table,
+              (:run_id, :load_group, :source_catalog, :source_schema, :source_table,
                :target_table, :watermark_column, :hwm_at_start,
                'pending', NULL, NULL,
                NULL, NULL, 0, NULL,
@@ -160,6 +161,7 @@ if rerun_mode == "fresh":
             args={
                 "run_id": run_id,
                 "load_group": load_group,
+                "source_catalog": src_catalog,
                 "source_schema": src_schema,
                 "source_table": src_table,
                 "target_table": target_table,
@@ -179,7 +181,7 @@ if rerun_mode == "fresh":
                extraction_type, status, error_class, error_message,
                created_at, updated_at)
             VALUES
-              (:run_id, 'freesql_catalog', :schema_name, :table_name,
+              (:run_id, :source_system_id, :schema_name, :table_name,
                :watermark_column_name, :watermark_value,
                :previous_watermark_value, 0,
                :extraction_type, 'pending', NULL, NULL,
@@ -187,6 +189,7 @@ if rerun_mode == "fresh":
             """,
             args={
                 "run_id": run_id,
+                "source_system_id": src_catalog,
                 "schema_name": src_schema,
                 "table_name": src_table,
                 "watermark_column_name": watermark_col,
@@ -224,6 +227,7 @@ elif rerun_mode == "failed_only":
         )
 
     for row in failed_rows:
+        src_catalog = row["source_catalog"]
         src_schema = row["source_schema"]
         src_table = row["source_table"]
         watermark_col = row["watermark_column"]
@@ -269,7 +273,7 @@ elif rerun_mode == "failed_only":
                error_class, error_message, retry_count, parent_run_id,
                rows_written)
             VALUES
-              (:run_id, :load_group, 'freesql_catalog', :source_schema, :source_table,
+              (:run_id, :load_group, :source_catalog, :source_schema, :source_table,
                :target_table, :watermark_column, :hwm_at_start,
                'pending', NULL, NULL,
                NULL, NULL, :retry_count, :parent_run_id,
@@ -278,6 +282,7 @@ elif rerun_mode == "failed_only":
             args={
                 "run_id": run_id,
                 "load_group": load_group,
+                "source_catalog": src_catalog,
                 "source_schema": src_schema,
                 "source_table": src_table,
                 "target_table": target_table,
@@ -299,7 +304,7 @@ elif rerun_mode == "failed_only":
                extraction_type, status, error_class, error_message,
                created_at, updated_at)
             VALUES
-              (:run_id, 'freesql_catalog', :schema_name, :table_name,
+              (:run_id, :source_system_id, :schema_name, :table_name,
                :watermark_column_name, :watermark_value,
                :previous_watermark_value, 0,
                :extraction_type, 'pending', NULL, NULL,
@@ -307,6 +312,7 @@ elif rerun_mode == "failed_only":
             """,
             args={
                 "run_id": run_id,
+                "source_system_id": src_catalog,
                 "schema_name": src_schema,
                 "table_name": src_table,
                 "watermark_column_name": watermark_col,

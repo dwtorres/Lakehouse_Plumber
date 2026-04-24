@@ -4,8 +4,10 @@ JDBC SDP A1 Spike — Dynamic Flow Pipeline
 
 This is the SDP (Spark Declarative Pipelines / Lakeflow) source file for the
 JDBC federation spike. It dynamically generates one pipeline flow per pending
-manifest row at plan time, reading source data from the `freesql_catalog` foreign
-catalog and writing to the devtest_edp_bronze.jdbc_spike target schema.
+manifest row at plan time, reading source data from the foreign catalog
+indicated by each manifest row's `source_catalog` column (e.g. `pg_supabase`
+for the PG AW scale test, `freesql_catalog` for Oracle) and writing to the
+devtest_edp_bronze.jdbc_spike target schema.
 
 Design pattern: DLT-META factory-closure approach — each table spec is wrapped
 in a `make_flow()` factory that captures `spec` by value, then
@@ -93,7 +95,7 @@ def make_flow(spec: dict) -> None:
     # value into the function signature's default, providing a second layer of
     # closure isolation in addition to the factory scope.
     def _flow(spec: dict = spec) -> "pyspark.sql.DataFrame":  # type: ignore[name-defined]
-        source_fqn = f"freesql_catalog.{spec['source_schema']}.{spec['source_table']}"
+        source_fqn = f"{spec['source_catalog']}.{spec['source_schema']}.{spec['source_table']}"
 
         # Failure injection for acceptance testing: a RUNTIME-only error on
         # the first flow. Earlier attempts at inject_failure pointed the
