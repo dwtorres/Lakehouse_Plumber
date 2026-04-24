@@ -88,18 +88,23 @@ databricks --profile dbc-8e058692-373e sql query \
     --file spikes/jdbc-sdp-a1/ddl/watermark_registry_spike.sql
 
 # 2. Deploy the bundle (from the repo root, where databricks.yml lives).
-databricks --profile dbc-8e058692-373e bundle deploy --target devtest
+#
+# NOTE: The `--target` value is the DAB target name in your databricks.yml,
+# which may NOT match the workspace name. In the companion Wumbo bundle the
+# target is `dev` (it points at the devtest workspace); substitute whatever
+# your bundle defines (`databricks bundle schema | grep targets` to list).
+databricks --profile dbc-8e058692-373e bundle deploy --target dev
 
 # 3. Fresh run (expect 5 completed flows):
-databricks --profile dbc-8e058692-373e bundle run spike_jdbc_sdp_a1 \
+databricks --profile dbc-8e058692-373e bundle run spike_jdbc_sdp_a1 --target dev \
     --params run_id=spike-$(date +%s),rerun_mode=fresh,inject_failure=false,min_completed=5
 
 # 4. Failure-injection run (expect 4 completed, 1 failed):
-databricks --profile dbc-8e058692-373e bundle run spike_jdbc_sdp_a1 \
+databricks --profile dbc-8e058692-373e bundle run spike_jdbc_sdp_a1 --target dev \
     --params run_id=spike-fail-$(date +%s),rerun_mode=fresh,inject_failure=true,min_completed=4
 
 # 5. Failed-only rerun (replace <prior-failing-run-id> with the run_id from step 4):
-databricks --profile dbc-8e058692-373e bundle run spike_jdbc_sdp_a1 \
+databricks --profile dbc-8e058692-373e bundle run spike_jdbc_sdp_a1 --target dev \
     --params run_id=spike-retry-$(date +%s),rerun_mode=failed_only,parent_run_id=<prior-failing-run-id>,inject_failure=false,min_completed=1
 ```
 
