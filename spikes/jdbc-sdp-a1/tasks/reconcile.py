@@ -20,6 +20,7 @@
 # COMMAND ----------
 
 import json
+import re
 
 from pyspark.sql import functions as F
 from pyspark.sql import window as W
@@ -44,23 +45,36 @@ print(json.dumps({"run_id": run_id, "pipeline_id": pipeline_id}))
 # COMMAND ----------
 
 # Step 1: Query the SDP pipeline event log for terminal flow events.
-# event_log() is a table-valued function available in SDP pipelines on
-# Databricks Unity Catalog.
+# event_log() is a table-valued function. On current DBR runtimes the
+# pipeline identifier is passed as a string literal — there is no
+# `pipeline(...)` wrapping routine. Flow status lives under
+# `details.flow_progress.status`, not `details.status`.
 #
-# T-tkf-02: pipeline_id is bound via args= binding, not f-string composition.
+# T-tkf-02: pipeline_id was validated upstream (UUID regex), so
+# f-string interpolation into the TVF argument is safe here — the TVF
+# does not accept parameter markers in its positional argument slot.
+_PIPELINE_ID_UUID_PATTERN = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+if not _PIPELINE_ID_UUID_PATTERN.match(pipeline_id):
+    raise ValueError(
+        f"pipeline_id {pipeline_id!r} is not a valid UUID; aborting reconcile"
+    )
+
 event_log_df = spark.sql(
-    """
+    f"""
     SELECT
-        origin.flow_name                             AS flow_name,
-        details:status                               AS status,
-        CAST(details:metrics:num_output_rows AS BIGINT) AS rows_written,
-        message                                      AS error_message,
+        origin.flow_name                                        AS flow_name,
+        details:flow_progress:status                            AS status,
+        CAST(details:flow_progress:metrics:num_output_rows AS BIGINT)
+                                                                AS rows_written,
+        message                                                 AS error_message,
         timestamp
-    FROM event_log(pipeline(:pipeline_id))
+    FROM event_log('{pipeline_id}')
     WHERE event_type = 'flow_progress'
-      AND details:status IN ('COMPLETED', 'FAILED')
-    """,
-    args={"pipeline_id": pipeline_id},
+      AND details:flow_progress:status IN ('COMPLETED', 'FAILED')
+    """
 )
 
 # Deduplicate: keep only the latest terminal event per flow (handles in-pipeline
