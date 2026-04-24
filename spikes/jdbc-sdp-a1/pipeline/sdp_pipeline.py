@@ -92,7 +92,30 @@ def make_flow(spec: dict) -> None:
         if inject_failure == "true" and spec is pending_specs[0]:
             source_fqn = "freesql_catalog.does_not_exist.nope_nope"
 
-        df = spark.read.table(source_fqn)
+        # Oracle NUMBER columns without explicit precision map to
+        # DECIMAL(38,10) in Databricks federation, but real Oracle values
+        # (e.g. snowflake UIDs at 39 digits) overflow that precision and
+        # raise NUMERIC_VALUE_OUT_OF_RANGE at the federation boundary.
+        # Workaround: at plan time, DESCRIBE the source and CAST any
+        # decimal column to STRING in a pushed-down SELECT. Cast is on
+        # the supported-pushdown list for foreign catalogs so Oracle
+        # performs the to-string conversion before data crosses the
+        # federation boundary.
+        schema_rows = spark.sql(f"DESCRIBE TABLE {source_fqn}").collect()
+        select_items: list[str] = []
+        for r in schema_rows:
+            col_name = r["col_name"]
+            if not col_name or col_name.startswith("#"):
+                continue
+            data_type = (r["data_type"] or "").lower()
+            if data_type.startswith("decimal"):
+                select_items.append(
+                    f"CAST(`{col_name}` AS STRING) AS `{col_name}`"
+                )
+            else:
+                select_items.append(f"`{col_name}`")
+        query = f"SELECT {', '.join(select_items)} FROM {source_fqn}"
+        df = spark.sql(query)
 
         watermark_col: str = spec["watermark_column"]
         hwm: str | None = spec.get("watermark_value_at_start")
