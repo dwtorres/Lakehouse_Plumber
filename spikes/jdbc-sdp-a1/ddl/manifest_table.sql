@@ -1,6 +1,6 @@
 -- Purpose: Delta DDL for the spike execution manifest table.
 -- This table tracks per-table load state for a single run of the
--- JDBC SDP A1 spike. It is scoped to devtest_edp_metadata.jdbc_spike
+-- JDBC SDP A1 spike. It is scoped to devtest_edp_orchestration.jdbc_spike
 -- and must NOT be confused with any production metadata schema.
 --
 -- Run once before deploying the spike bundle. Re-running is safe because
@@ -10,10 +10,10 @@
 -- Watermark state machine: insert_new / mark_landed / mark_failed
 --   live in tasks/prepare_manifest.py and tasks/reconcile.py respectively.
 
-CREATE TABLE IF NOT EXISTS devtest_edp_metadata.jdbc_spike.manifest (
+CREATE TABLE IF NOT EXISTS devtest_edp_orchestration.jdbc_spike.manifest (
     run_id                  STRING   COMMENT 'Spike run identifier (job run context or widget)',
     load_group              STRING   COMMENT 'Logical grouping; spike uses single group spike_a1',
-    source_catalog          STRING   COMMENT 'Foreign catalog, e.g. freesql',
+    source_catalog          STRING   COMMENT 'Foreign catalog, e.g. freesql_catalog',
     source_schema           STRING   COMMENT 'Source schema name in the foreign catalog',
     source_table            STRING   COMMENT 'Source table name in the foreign catalog',
     target_table            STRING   COMMENT 'Bronze target under devtest_edp_bronze.jdbc_spike',

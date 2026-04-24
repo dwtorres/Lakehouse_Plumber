@@ -4,7 +4,7 @@ JDBC SDP A1 Spike — Dynamic Flow Pipeline
 
 This is the SDP (Spark Declarative Pipelines / Lakeflow) source file for the
 JDBC federation spike. It dynamically generates one pipeline flow per pending
-manifest row at plan time, reading source data from the `freesql` foreign
+manifest row at plan time, reading source data from the `freesql_catalog` foreign
 catalog and writing to the devtest_edp_bronze.jdbc_spike target schema.
 
 Design pattern: DLT-META factory-closure approach — each table spec is wrapped
@@ -41,7 +41,7 @@ inject_failure: str = spark.conf.get("spike.inject_failure", "false")
 # This determines the set of flows that SDP will create for this pipeline run.
 # ---------------------------------------------------------------------------
 pending_df = spark.read.table(
-    "devtest_edp_metadata.jdbc_spike.manifest"
+    "devtest_edp_orchestration.jdbc_spike.manifest"
 ).filter(
     (F.col("run_id") == run_id) & (F.col("execution_status") == "pending")
 )
@@ -77,13 +77,13 @@ def make_flow(spec: dict) -> None:
     # value into the function signature's default, providing a second layer of
     # closure isolation in addition to the factory scope.
     def _flow(spec: dict = spec) -> "pyspark.sql.DataFrame":  # type: ignore[name-defined]
-        source_fqn = f"freesql.{spec['source_schema']}.{spec['source_table']}"
+        source_fqn = f"freesql_catalog.{spec['source_schema']}.{spec['source_table']}"
 
         # Failure injection for T-tkf-04 testing: point the first flow at a
         # non-existent table so it fails at table-resolution time. Other flows
         # are unaffected — SDP continue-on-failure is the mechanism under test.
         if inject_failure == "true" and spec is pending_specs[0]:
-            source_fqn = "freesql.does_not_exist.nope_nope"
+            source_fqn = "freesql_catalog.does_not_exist.nope_nope"
 
         df = spark.read.table(source_fqn)
 

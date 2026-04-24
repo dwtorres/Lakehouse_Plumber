@@ -87,7 +87,7 @@ manifest_df = spark.sql(
     """
     SELECT target_table, watermark_column, watermark_value_at_start,
            source_schema, source_table
-    FROM devtest_edp_metadata.jdbc_spike.manifest
+    FROM devtest_edp_orchestration.jdbc_spike.manifest
     WHERE run_id = :run_id
     """,
     args={"run_id": run_id},
@@ -127,7 +127,7 @@ for row in joined_rows:
         # UPDATE manifest: mark completed.
         spark.sql(
             """
-            UPDATE devtest_edp_metadata.jdbc_spike.manifest
+            UPDATE devtest_edp_orchestration.jdbc_spike.manifest
             SET execution_status  = 'completed',
                 completed_at      = current_timestamp(),
                 rows_written      = :rows_written
@@ -156,7 +156,7 @@ for row in joined_rows:
         # UPDATE spike watermark_registry — mark_landed step.
         spark.sql(
             """
-            UPDATE devtest_edp_metadata.jdbc_spike.watermark_registry
+            UPDATE devtest_edp_orchestration.jdbc_spike.watermark_registry
             SET status          = 'landed',
                 watermark_value = :new_hwm,
                 row_count       = :row_count,
@@ -178,7 +178,7 @@ for row in joined_rows:
         # mark_landed → mark_complete two-step so intent is visible.
         spark.sql(
             """
-            UPDATE devtest_edp_metadata.jdbc_spike.watermark_registry
+            UPDATE devtest_edp_orchestration.jdbc_spike.watermark_registry
             SET status     = 'completed',
                 updated_at = current_timestamp()
             WHERE run_id   = :run_id
@@ -202,7 +202,7 @@ for row in joined_rows:
         # UPDATE manifest: mark failed.
         spark.sql(
             """
-            UPDATE devtest_edp_metadata.jdbc_spike.manifest
+            UPDATE devtest_edp_orchestration.jdbc_spike.manifest
             SET execution_status  = 'failed',
                 completed_at      = current_timestamp(),
                 error_class       = :error_class,
@@ -221,7 +221,7 @@ for row in joined_rows:
         # UPDATE spike watermark_registry: mark failed.
         spark.sql(
             """
-            UPDATE devtest_edp_metadata.jdbc_spike.watermark_registry
+            UPDATE devtest_edp_orchestration.jdbc_spike.watermark_registry
             SET status        = 'failed',
                 error_class   = :error_class,
                 error_message = :error_message,

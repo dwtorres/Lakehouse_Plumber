@@ -1,7 +1,7 @@
 # Databricks Asset Bundle resource — JDBC SDP A1 Spike
 #
 # Job topology (5 tasks, 1 SDP pipeline):
-#   fixtures_discovery  — discovers 5 AdventureWorks tables via freesql catalog
+#   fixtures_discovery  — discovers 5 AdventureWorks tables via freesql_catalog catalog
 #   prepare_manifest    — inserts pending manifest + watermark registry rows
 #   run_sdp_pipeline    — single SDP pipeline; N dynamic flows (one per table)
 #   reconcile           — reads event_log(); updates manifest + registry

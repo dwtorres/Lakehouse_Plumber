@@ -3,16 +3,20 @@
 # MAGIC %md
 # MAGIC ## fixtures_discovery — JDBC SDP A1 Spike
 # MAGIC
-# MAGIC Discover 5 PG AdventureWorks tables accessible via the `freesql` foreign
-# MAGIC catalog that carry a timestamp/ModifiedDate-style watermark column.
+# MAGIC Select 5 tables from the `freesql_catalog.PROJECTS` Oracle schema for the
+# MAGIC spike run. Each table uses column `UPDATED` as its incremental watermark.
 # MAGIC
-# MAGIC Persist the selection to `devtest_edp_metadata.jdbc_spike.selected_sources`
+# MAGIC Persist the selection to `devtest_edp_orchestration.jdbc_spike.selected_sources`
 # MAGIC for downstream tasks (`prepare_manifest`, `sdp_pipeline`).
 # MAGIC
-# MAGIC **Strategy:** query `freesql.information_schema.columns` for columns whose
-# MAGIC name matches `%modified%`, `%updated%`, or `%date%` and whose data_type is
-# MAGIC timestamp-like. First match per table wins. Cap at 100 candidate tables
-# MAGIC (T-tkf-04 DoS guard), then pick the first 5 with a watermark column.
+# MAGIC **Note on discovery strategy:** the foreign catalog backend is Oracle 23ai
+# MAGIC and does not expose a queryable `information_schema.tables` through the
+# MAGIC federation the way a UC-native catalog would. `SHOW SCHEMAS IN
+# MAGIC freesql_catalog` also trips UC_RESOURCE_QUOTA_EXCEEDED because the source
+# MAGIC has >50 schemas. The spike therefore pins the source schema (`PROJECTS`)
+# MAGIC and watermark column (`UPDATED`) and enumerates tables via
+# MAGIC `SHOW TABLES IN freesql_catalog.PROJECTS`. Operator swaps the schema
+# MAGIC constant below to retarget a different source.
 # MAGIC
 # MAGIC Run once per spike deployment, or re-run to refresh the selection.
 
@@ -21,83 +25,38 @@
 import re
 
 from pyspark.sql import functions as F
-from pyspark.sql.types import StringType, StructField, StructType
+from pyspark.sql.types import StringType
 
 # COMMAND ----------
 
-# Step 1: List all user tables in the freesql foreign catalog.
-# information_schema.tables is available in Databricks Unity Catalog federation.
+# Spike configuration — operator-curated, not auto-discovered.
+# Schema and watermark column pinned for the federated Oracle source.
+SOURCE_CATALOG = "freesql_catalog"
+SOURCE_SCHEMA = "PROJECTS"
+WATERMARK_COLUMN = "UPDATED"
+MAX_TABLES = 5
+
+# COMMAND ----------
+
+# Step 1: list base tables (not views) in the pinned source schema.
 all_tables_df = spark.sql(
-    """
-    SELECT table_schema, table_name
-    FROM freesql.information_schema.tables
-    WHERE table_type = 'BASE TABLE'
-      AND table_schema NOT IN ('information_schema', 'pg_catalog')
-    ORDER BY table_schema, table_name
-    LIMIT 100
-    """
-)
+    f"SHOW TABLES IN {SOURCE_CATALOG}.{SOURCE_SCHEMA}"
+).filter(F.col("isTemporary") == False)  # noqa: E712
 
 display(all_tables_df)
 
 # COMMAND ----------
 
-# Step 2: Query freesql.information_schema.columns for each schema to find
-# columns whose name matches timestamp-like patterns.
-# We query once across all columns and filter in Spark — avoids per-table
-# round-trips across the federation boundary.
+# Step 2: exclude views (`SHOW TABLES` returns them alongside base tables on
+# foreign catalogs). Views end in `_v` by local convention; drop explicitly.
+base_tables_df = all_tables_df.filter(~F.col("tableName").endswith("_v"))
 
-all_columns_df = spark.sql(
-    """
-    SELECT table_schema, table_name, column_name, data_type,
-           ordinal_position
-    FROM freesql.information_schema.columns
-    WHERE table_schema NOT IN ('information_schema', 'pg_catalog')
-      AND (
-            lower(data_type) LIKE 'timestamp%'
-         OR lower(data_type) = 'date'
-      )
-      AND (
-            lower(column_name) LIKE '%modified%'
-         OR lower(column_name) LIKE '%updated%'
-         OR lower(column_name) LIKE '%date%'
-      )
-    ORDER BY table_schema, table_name, ordinal_position
-    """
-)
-
-display(all_columns_df)
+display(base_tables_df)
 
 # COMMAND ----------
 
-# Step 3: For each (table_schema, table_name) keep only the first watermark
-# column match (lowest ordinal_position).
-first_match_df = (
-    all_columns_df.withColumn(
-        "rn",
-        F.row_number().over(
-            __import__("pyspark.sql.window", fromlist=["Window"])
-            .Window.partitionBy("table_schema", "table_name")
-            .orderBy("ordinal_position")
-        ),
-    )
-    .filter(F.col("rn") == 1)
-    .drop("rn", "ordinal_position", "data_type")
-    .withColumnRenamed("table_schema", "source_schema")
-    .withColumnRenamed("table_name", "source_table")
-    .withColumnRenamed("column_name", "watermark_column")
-)
-
-# Cap at 5 distinct (schema, table, watermark_column) rows.
-selected_5 = first_match_df.limit(5)
-display(selected_5)
-
-# COMMAND ----------
-
-# Step 4: Derive a safe Bronze target_table name.
-# Format: {source_schema}_{source_table} lowercased, non-alphanumerics → '_'.
-# Example: HumanResources.Employee → humanresources_employee
-
+# Step 3: cap at MAX_TABLES and attach the watermark column + bronze target.
+# target_table format: {source_schema_lower}_{source_table_lower}, non-alphanumerics → '_'.
 target_table_udf = F.udf(
     lambda schema, table: re.sub(
         r"[^a-z0-9]+", "_", f"{schema}_{table}".lower()
@@ -105,31 +64,53 @@ target_table_udf = F.udf(
     StringType(),
 )
 
-selection_df = selected_5.withColumn(
-    "target_table", target_table_udf(F.col("source_schema"), F.col("source_table"))
+selection_df = (
+    base_tables_df.orderBy("tableName")
+    .limit(MAX_TABLES)
+    .withColumnRenamed("database", "source_schema")
+    .withColumnRenamed("tableName", "source_table")
+    .withColumn("watermark_column", F.lit(WATERMARK_COLUMN))
+    .withColumn(
+        "target_table",
+        target_table_udf(F.col("source_schema"), F.col("source_table")),
+    )
+    .select("source_schema", "source_table", "watermark_column", "target_table")
 )
 
 display(selection_df)
 
 # COMMAND ----------
 
-# Step 5: Persist to devtest_edp_metadata.jdbc_spike.selected_sources.
+# Step 4: normalize source_schema to upstream casing (Oracle catalogs often
+# return lowercased schema names from SHOW TABLES; Oracle identifiers are
+# case-sensitive without quotes — the source is `PROJECTS`, not `projects`).
+# Upper-case here so downstream queries use the same identifier as the source.
+
+selection_df = selection_df.withColumn(
+    "source_schema", F.upper(F.col("source_schema"))
+)
+
+display(selection_df)
+
+# COMMAND ----------
+
+# Step 5: persist to devtest_edp_orchestration.jdbc_spike.selected_sources.
 # Overwrite so re-runs are idempotent.
 # Schema: source_schema STRING, source_table STRING,
 #         watermark_column STRING, target_table STRING
 
 (
-    selection_df.select(
-        "source_schema", "source_table", "watermark_column", "target_table"
+    selection_df.write.mode("overwrite").saveAsTable(
+        "devtest_edp_orchestration.jdbc_spike.selected_sources"
     )
-    .write.mode("overwrite")
-    .saveAsTable("devtest_edp_metadata.jdbc_spike.selected_sources")
 )
 
 # COMMAND ----------
 
-# Step 6: Display the persisted selection for visual verification.
-final_df = spark.read.table("devtest_edp_metadata.jdbc_spike.selected_sources")
+# Step 6: display the persisted selection for visual verification.
+final_df = spark.read.table(
+    "devtest_edp_orchestration.jdbc_spike.selected_sources"
+)
 display(final_df)
 
 rows = final_df.collect()

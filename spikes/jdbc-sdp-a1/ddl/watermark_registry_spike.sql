@@ -4,9 +4,9 @@
 -- (see src/lhp/templates/load/jdbc_watermark_job.py.j2 for the reference
 -- implementation and L2 §5.3 contract details).
 --
--- ISOLATION RATIONALE: This table lives at devtest_edp_metadata.jdbc_spike
+-- ISOLATION RATIONALE: This table lives at devtest_edp_orchestration.jdbc_spike
 -- and has no connection to the production watermark registry
--- (devtest_edp_metadata.jdbc_watermark_registry or any qa/prod equivalent).
+-- (devtest_edp_orchestration.jdbc_watermark_registry or any qa/prod equivalent).
 -- The spike reproduces state machine logic inline in plain spark.sql calls
 -- so there is zero dependency on the lhp_watermark package. If the spike
 -- succeeds and is integrated into LHP, this DDL will be superseded by the
@@ -14,9 +14,9 @@
 --
 -- Safe to re-run (IF NOT EXISTS guard). Schema changes need ALTER TABLE.
 
-CREATE TABLE IF NOT EXISTS devtest_edp_metadata.jdbc_spike.watermark_registry (
+CREATE TABLE IF NOT EXISTS devtest_edp_orchestration.jdbc_spike.watermark_registry (
     run_id                   STRING   NOT NULL COMMENT 'Run identifier; matches manifest.run_id',
-    source_system_id         STRING   NOT NULL COMMENT 'Foreign catalog name, e.g. freesql',
+    source_system_id         STRING   NOT NULL COMMENT 'Foreign catalog name, e.g. freesql_catalog',
     schema_name              STRING   NOT NULL COMMENT 'Source schema name',
     table_name               STRING   NOT NULL COMMENT 'Source table name',
     watermark_column_name    STRING   COMMENT 'Timestamp column used as high-water mark',

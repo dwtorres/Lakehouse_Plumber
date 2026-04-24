@@ -11,7 +11,7 @@
 #       --params run_id=spike-$(date +%s),rerun_mode=fresh,inject_failure=false,min_completed=5
 #
 # Workspace host matches Wumbo's dev target so the spike deploys to the same
-# devtest workspace where devtest_edp_metadata and devtest_edp_bronze
+# devtest workspace where devtest_edp_orchestration and devtest_edp_bronze
 # catalogs are provisioned. Bundle name differs so the workspace root_path
 # does NOT collide with Wumbo's deployment tree.
 

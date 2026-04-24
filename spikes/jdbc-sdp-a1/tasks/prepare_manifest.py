@@ -106,7 +106,7 @@ def get_current_hwm(schema_name: str, table_name: str) -> str:
     result = spark.sql(
         """
         SELECT MAX(watermark_value) AS hwm
-        FROM devtest_edp_metadata.jdbc_spike.watermark_registry
+        FROM devtest_edp_orchestration.jdbc_spike.watermark_registry
         WHERE schema_name   = :schema_name
           AND table_name    = :table_name
           AND status        = 'completed'
@@ -125,7 +125,7 @@ registry_rows_inserted = 0
 if rerun_mode == "fresh":
     # Read the fixture selection populated by fixtures_discovery.py.
     sources_df = spark.read.table(
-        "devtest_edp_metadata.jdbc_spike.selected_sources"
+        "devtest_edp_orchestration.jdbc_spike.selected_sources"
     )
     sources = sources_df.collect()
 
@@ -144,14 +144,14 @@ if rerun_mode == "fresh":
         # Insert manifest row.
         spark.sql(
             """
-            INSERT INTO devtest_edp_metadata.jdbc_spike.manifest
+            INSERT INTO devtest_edp_orchestration.jdbc_spike.manifest
               (run_id, load_group, source_catalog, source_schema, source_table,
                target_table, watermark_column, watermark_value_at_start,
                execution_status, started_at, completed_at,
                error_class, error_message, retry_count, parent_run_id,
                rows_written)
             VALUES
-              (:run_id, :load_group, 'freesql', :source_schema, :source_table,
+              (:run_id, :load_group, 'freesql_catalog', :source_schema, :source_table,
                :target_table, :watermark_column, :hwm_at_start,
                'pending', NULL, NULL,
                NULL, NULL, 0, NULL,
@@ -172,14 +172,14 @@ if rerun_mode == "fresh":
         # Insert spike watermark registry row (insert_new equivalent).
         spark.sql(
             """
-            INSERT INTO devtest_edp_metadata.jdbc_spike.watermark_registry
+            INSERT INTO devtest_edp_orchestration.jdbc_spike.watermark_registry
               (run_id, source_system_id, schema_name, table_name,
                watermark_column_name, watermark_value,
                previous_watermark_value, row_count,
                extraction_type, status, error_class, error_message,
                created_at, updated_at)
             VALUES
-              (:run_id, 'freesql', :schema_name, :table_name,
+              (:run_id, 'freesql_catalog', :schema_name, :table_name,
                :watermark_column_name, :watermark_value,
                :previous_watermark_value, 0,
                :extraction_type, 'pending', NULL, NULL,
@@ -207,7 +207,7 @@ elif rerun_mode == "failed_only":
         SELECT run_id, load_group, source_catalog, source_schema, source_table,
                target_table, watermark_column, watermark_value_at_start,
                retry_count
-        FROM devtest_edp_metadata.jdbc_spike.manifest
+        FROM devtest_edp_orchestration.jdbc_spike.manifest
         WHERE run_id            = :parent_run_id
           AND execution_status  = 'failed'
         """,
@@ -238,7 +238,7 @@ elif rerun_mode == "failed_only":
         prior_type_row = spark.sql(
             """
             SELECT extraction_type
-            FROM devtest_edp_metadata.jdbc_spike.watermark_registry
+            FROM devtest_edp_orchestration.jdbc_spike.watermark_registry
             WHERE run_id       = :parent_run_id
               AND schema_name  = :schema_name
               AND table_name   = :table_name
@@ -264,14 +264,14 @@ elif rerun_mode == "failed_only":
         # Insert fresh manifest row for the new run_id.
         spark.sql(
             """
-            INSERT INTO devtest_edp_metadata.jdbc_spike.manifest
+            INSERT INTO devtest_edp_orchestration.jdbc_spike.manifest
               (run_id, load_group, source_catalog, source_schema, source_table,
                target_table, watermark_column, watermark_value_at_start,
                execution_status, started_at, completed_at,
                error_class, error_message, retry_count, parent_run_id,
                rows_written)
             VALUES
-              (:run_id, :load_group, 'freesql', :source_schema, :source_table,
+              (:run_id, :load_group, 'freesql_catalog', :source_schema, :source_table,
                :target_table, :watermark_column, :hwm_at_start,
                'pending', NULL, NULL,
                NULL, NULL, :retry_count, :parent_run_id,
@@ -294,14 +294,14 @@ elif rerun_mode == "failed_only":
         # Insert fresh pending registry row for the retry run.
         spark.sql(
             """
-            INSERT INTO devtest_edp_metadata.jdbc_spike.watermark_registry
+            INSERT INTO devtest_edp_orchestration.jdbc_spike.watermark_registry
               (run_id, source_system_id, schema_name, table_name,
                watermark_column_name, watermark_value,
                previous_watermark_value, row_count,
                extraction_type, status, error_class, error_message,
                created_at, updated_at)
             VALUES
-              (:run_id, 'freesql', :schema_name, :table_name,
+              (:run_id, 'freesql_catalog', :schema_name, :table_name,
                :watermark_column_name, :watermark_value,
                :previous_watermark_value, 0,
                :extraction_type, 'pending', NULL, NULL,

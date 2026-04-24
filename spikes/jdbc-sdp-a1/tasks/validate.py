@@ -35,7 +35,7 @@ min_completed = int(min_completed_str)
 manifest_df = spark.sql(
     """
     SELECT target_table, execution_status, rows_written, completed_at
-    FROM devtest_edp_metadata.jdbc_spike.manifest
+    FROM devtest_edp_orchestration.jdbc_spike.manifest
     WHERE run_id = :run_id
     ORDER BY target_table
     """,

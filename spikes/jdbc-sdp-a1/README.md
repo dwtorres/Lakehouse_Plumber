@@ -6,7 +6,7 @@ This spike validates Direction A1 from the JDBC execution design exploration
 (see [docs/ideas/jdbc-execution-spike.md](../../docs/ideas/jdbc-execution-spike.md)).
 The core question: can a single Databricks SDP (Lakeflow Spark Declarative
 Pipelines) pipeline dynamically generate one flow per JDBC source table from a
-manifest, read via Unity Catalog Lakehouse Federation (`freesql` foreign catalog),
+manifest, read via Unity Catalog Lakehouse Federation (`freesql_catalog` foreign catalog),
 and handle per-flow failure isolation so that one failing table does not block
 the rest?
 
@@ -34,9 +34,9 @@ fixtures_discovery
 prepare_manifest  ────────────────────────────────────────────────────────────
         |                                                                     |
         v                                                                     v
-[SDP pipeline: N dynamic flows]                   devtest_edp_metadata.jdbc_spike.manifest
-        |                                         devtest_edp_metadata.jdbc_spike.watermark_registry
-        |  freesql.<schema>.<table>
+[SDP pipeline: N dynamic flows]                   devtest_edp_orchestration.jdbc_spike.manifest
+        |                                         devtest_edp_orchestration.jdbc_spike.watermark_registry
+        |  freesql_catalog.<schema>.<table>
         |      (filtered by watermark)
         v
 devtest_edp_bronze.jdbc_spike.<target_table>  (one table per flow)
@@ -54,9 +54,9 @@ devtest_edp_bronze.jdbc_spike.<target_table>  (one table per flow)
 
 | File | Purpose |
 |------|---------|
-| `ddl/manifest_table.sql` | Delta DDL for `devtest_edp_metadata.jdbc_spike.manifest` — per-run execution tracking |
+| `ddl/manifest_table.sql` | Delta DDL for `devtest_edp_orchestration.jdbc_spike.manifest` — per-run execution tracking |
 | `ddl/watermark_registry_spike.sql` | Isolated spike watermark registry DDL mirroring L2 §5.3 contract |
-| `tasks/fixtures_discovery.py` | Discovers 5 AdventureWorks tables via `freesql.information_schema`; persists to `selected_sources` |
+| `tasks/fixtures_discovery.py` | Discovers 5 AdventureWorks tables via `freesql_catalog.information_schema`; persists to `selected_sources` |
 | `tasks/prepare_manifest.py` | Pre-run bookend; inserts pending manifest + registry rows; supports `fresh` and `failed_only` modes |
 | `pipeline/sdp_pipeline.py` | SDP source file; reads manifest at plan time; factory-closure dynamic flow generation |
 | `tasks/reconcile.py` | Post-run bookend; queries event log; updates manifest + registry for COMPLETED / FAILED flows |
@@ -67,10 +67,10 @@ devtest_edp_bronze.jdbc_spike.<target_table>  (one table per flow)
 ## Prerequisites
 
 - Databricks CLI authenticated with `dbc-8e058692-373e` profile (devtest workspace).
-- `freesql` foreign catalog exists in devtest with PG AdventureWorks schemas/tables
+- `freesql_catalog` foreign catalog exists in devtest with PG AdventureWorks schemas/tables
   accessible to the running identity.
-- `devtest_edp_metadata` catalog exists; user has `CREATE SCHEMA` and `CREATE TABLE`
-  on `devtest_edp_metadata.jdbc_spike`.
+- `devtest_edp_orchestration` catalog exists; user has `CREATE SCHEMA` and `CREATE TABLE`
+  on `devtest_edp_orchestration.jdbc_spike`.
 - `devtest_edp_bronze` catalog exists; SDP pipeline service principal has
   `CREATE TABLE` on `devtest_edp_bronze.jdbc_spike`.
 - Python 3.11+ locally for static validation (`python -m py_compile`).
@@ -159,9 +159,9 @@ git diff --name-only HEAD~1 | grep '^src/lhp/' && echo 'FAIL: src/lhp modified' 
 - **Throwaway code** — this spike is NOT integrated into LHP core or the Wumbo
   metadata executor. All files live under `spikes/jdbc-sdp-a1/` and are
   explicitly excluded from the LHP package.
-- **Isolated schema** — all tables use `devtest_edp_metadata.jdbc_spike.*`.
+- **Isolated schema** — all tables use `devtest_edp_orchestration.jdbc_spike.*`.
   No reads or writes to the production watermark registry
-  (`devtest_edp_metadata.jdbc_watermark_registry` or any qa/prod equivalent).
+  (`devtest_edp_orchestration.jdbc_watermark_registry` or any qa/prod equivalent).
 - **No `lhp_watermark` dependency** — the spike reproduces `insert_new`,
   `mark_landed`, and `mark_failed` as inline `spark.sql` statements so the
   spike is fully self-contained.
