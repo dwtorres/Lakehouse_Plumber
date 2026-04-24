@@ -95,25 +95,34 @@ def make_flow(spec: dict) -> None:
         # Oracle NUMBER columns without explicit precision map to
         # DECIMAL(38,10) in Databricks federation, but real Oracle values
         # (e.g. snowflake UIDs at 39 digits) overflow that precision and
-        # raise NUMERIC_VALUE_OUT_OF_RANGE at the federation boundary.
-        # Workaround: at plan time, DESCRIBE the source and CAST any
-        # decimal column to STRING in a pushed-down SELECT. Cast is on
-        # the supported-pushdown list for foreign catalogs so Oracle
-        # performs the to-string conversion before data crosses the
-        # federation boundary.
+        # raise NUMERIC_VALUE_OUT_OF_RANGE AT THE FEDERATION READ BOUNDARY
+        # — before any Spark transformation (including CAST) has a chance
+        # to run. CAST-on-read therefore does NOT work as a workaround.
+        # Spark's `to_char` expects 2 args (format string) so Oracle's
+        # native TO_CHAR(number) also fails to translate.
+        #
+        # Spike workaround: DESCRIBE the source and build a SELECT that
+        # OMITS any column whose type is decimal(*). Real ingestion needs
+        # a principled type-mapping strategy (federation-connection-level
+        # numeric overrides, or per-table hand-maintained column schemas
+        # with explicit Oracle VARCHAR2 casts committed at source view).
         schema_rows = spark.sql(f"DESCRIBE TABLE {source_fqn}").collect()
         select_items: list[str] = []
+        skipped_numeric: list[str] = []
         for r in schema_rows:
             col_name = r["col_name"]
             if not col_name or col_name.startswith("#"):
                 continue
             data_type = (r["data_type"] or "").lower()
             if data_type.startswith("decimal"):
-                select_items.append(
-                    f"CAST(`{col_name}` AS STRING) AS `{col_name}`"
-                )
-            else:
-                select_items.append(f"`{col_name}`")
+                skipped_numeric.append(col_name)
+                continue
+            select_items.append(f"`{col_name}`")
+        if skipped_numeric:
+            print(
+                f"[spike] {source_fqn}: skipping overflow-prone decimal cols: "
+                + ", ".join(skipped_numeric)
+            )
         query = f"SELECT {', '.join(select_items)} FROM {source_fqn}"
         df = spark.sql(query)
 
