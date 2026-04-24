@@ -197,8 +197,6 @@ if rerun_mode == "fresh":
         )
         registry_rows_inserted += 1
 
-# COMMAND ----------
-
 elif rerun_mode == "failed_only":
     # Rerun mode: pick up only the failed rows from the parent run.
     # parent_run_id is already validated above.
