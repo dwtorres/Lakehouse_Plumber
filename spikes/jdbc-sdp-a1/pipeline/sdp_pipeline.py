@@ -33,7 +33,16 @@ spark = SparkSession.getActiveSession()
 
 # Pipeline-level configuration injected via the DAB pipeline resource's
 # `configuration:` block (see resources/spike_workflow.yml).
-run_id: str = spark.conf.get("spike.run_id")
+#
+# NOTE on run_id: DAB `pipeline_task` does NOT expose a per-run channel to
+# push job parameters into pipeline configuration — pipeline configuration
+# is fixed at DEPLOY time. The spike therefore operates on a serial-run
+# assumption: at pipeline plan time we read ALL rows where
+# `execution_status = 'pending'`, which are the rows prepare_manifest just
+# inserted for the current run. Operator MUST wait for reconcile to
+# transition pending → completed|failed before triggering another run.
+# A prior crashed run that never reconciled would leak stale pending rows
+# into the next run; surface this via validate.py count checks.
 inject_failure: str = spark.conf.get("spike.inject_failure", "false")
 
 # ---------------------------------------------------------------------------
@@ -42,9 +51,7 @@ inject_failure: str = spark.conf.get("spike.inject_failure", "false")
 # ---------------------------------------------------------------------------
 pending_df = spark.read.table(
     "devtest_edp_orchestration.jdbc_spike.manifest"
-).filter(
-    (F.col("run_id") == run_id) & (F.col("execution_status") == "pending")
-)
+).filter(F.col("execution_status") == "pending")
 
 # Collect at plan time — SDP evaluates module-level code to discover flows.
 pending_specs: list[dict] = [row.asDict() for row in pending_df.collect()]
