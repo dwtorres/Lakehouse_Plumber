@@ -101,17 +101,29 @@ print(
 EPOCH_ZERO = "1900-01-01T00:00:00"
 
 
-def get_current_hwm(schema_name: str, table_name: str) -> str:
-    """Return the latest completed HWM for this table, or EPOCH_ZERO."""
+def get_current_hwm(
+    schema_name: str, table_name: str, source_system_id: str
+) -> str:
+    """Return the latest completed HWM for this (source, schema, table), or EPOCH_ZERO.
+
+    Tier 1 HWM isolation: filter by source_system_id so HWMs written by a
+    different federation or pipeline against the same (schema, table) pair
+    cannot poison this lookup. See docs/planning/tier-1-hwm-fix.md.
+    """
     result = spark.sql(
         """
         SELECT MAX(watermark_value) AS hwm
         FROM devtest_edp_orchestration.jdbc_spike.watermark_registry
-        WHERE schema_name   = :schema_name
-          AND table_name    = :table_name
-          AND status        = 'completed'
+        WHERE schema_name      = :schema_name
+          AND table_name       = :table_name
+          AND source_system_id = :source_system_id
+          AND status           = 'completed'
         """,
-        args={"schema_name": schema_name, "table_name": table_name},
+        args={
+            "schema_name": schema_name,
+            "table_name": table_name,
+            "source_system_id": source_system_id,
+        },
     ).first()
     hwm = result["hwm"] if result else None
     return hwm if hwm is not None else EPOCH_ZERO
@@ -136,7 +148,7 @@ if rerun_mode == "fresh":
         watermark_col = row["watermark_column"]
         target_table = row["target_table"]
 
-        hwm_at_start = get_current_hwm(src_schema, src_table)
+        hwm_at_start = get_current_hwm(src_schema, src_table, src_catalog)
         extraction_type = (
             "incremental" if hwm_at_start != EPOCH_ZERO else "full"
         )
