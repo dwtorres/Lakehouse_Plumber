@@ -78,35 +78,45 @@ devtest_edp_bronze.jdbc_spike.<target_table>  (one table per flow)
 
 ## Deploy & Run
 
+The spike ships its own `databricks.yml` so it deploys as a self-contained
+bundle, independent of the companion Wumbo bundle. **All bundle commands run
+from this directory** so that relative paths in `resources/spike_workflow.yml`
+(which reference `../pipeline/`, `../tasks/`, `../ddl/`) resolve correctly.
+
 ```bash
+cd spikes/jdbc-sdp-a1
+
 # 1. Apply DDL manually (one-time, outside the bundle).
 #    NOTE: the `databricks sql query` command requires a SQL warehouse endpoint.
 #    If unavailable, run the DDL directly in a Databricks SQL editor notebook.
-databricks --profile dbc-8e058692-373e sql query \
-    --file spikes/jdbc-sdp-a1/ddl/manifest_table.sql
-databricks --profile dbc-8e058692-373e sql query \
-    --file spikes/jdbc-sdp-a1/ddl/watermark_registry_spike.sql
+databricks --profile dbc-8e058692-373e sql query --file ddl/manifest_table.sql
+databricks --profile dbc-8e058692-373e sql query --file ddl/watermark_registry_spike.sql
 
-# 2. Deploy the bundle (from the repo root, where databricks.yml lives).
-#
-# NOTE: The `--target` value is the DAB target name in your databricks.yml,
-# which may NOT match the workspace name. In the companion Wumbo bundle the
-# target is `dev` (it points at the devtest workspace); substitute whatever
-# your bundle defines (`databricks bundle schema | grep targets` to list).
-databricks --profile dbc-8e058692-373e bundle deploy --target dev
+# 2. Validate + deploy the spike bundle.
+#    Target `dev` is defined in this directory's databricks.yml and points at
+#    the devtest workspace (https://dbc-8e058692-373e.cloud.databricks.com).
+databricks --profile dbc-8e058692-373e bundle validate --target dev
+databricks --profile dbc-8e058692-373e bundle deploy   --target dev
 
 # 3. Fresh run (expect 5 completed flows):
-databricks --profile dbc-8e058692-373e bundle run spike_jdbc_sdp_a1 --target dev \
+databricks --profile dbc-8e058692-373e bundle run spike_jdbc_sdp_a1_job --target dev \
     --params run_id=spike-$(date +%s),rerun_mode=fresh,inject_failure=false,min_completed=5
 
 # 4. Failure-injection run (expect 4 completed, 1 failed):
-databricks --profile dbc-8e058692-373e bundle run spike_jdbc_sdp_a1 --target dev \
+databricks --profile dbc-8e058692-373e bundle run spike_jdbc_sdp_a1_job --target dev \
     --params run_id=spike-fail-$(date +%s),rerun_mode=fresh,inject_failure=true,min_completed=4
 
 # 5. Failed-only rerun (replace <prior-failing-run-id> with the run_id from step 4):
-databricks --profile dbc-8e058692-373e bundle run spike_jdbc_sdp_a1 --target dev \
+databricks --profile dbc-8e058692-373e bundle run spike_jdbc_sdp_a1_job --target dev \
     --params run_id=spike-retry-$(date +%s),rerun_mode=failed_only,parent_run_id=<prior-failing-run-id>,inject_failure=false,min_completed=1
 ```
+
+`mode: development` on the `dev` target auto-prefixes deployed resource
+names with `[dev <your_user>]`, so the pipeline appears in the workspace
+as `[dev dwtorres] spike_jdbc_sdp_a1_pipeline` and the job as
+`[dev dwtorres] spike_jdbc_sdp_a1`. This is the standard DAB dev-mode
+convention and keeps the spike distinguishable from any eventual prod
+deployment.
 
 ## Acceptance Criteria (Runtime)
 

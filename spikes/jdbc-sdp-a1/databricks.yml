@@ -1,0 +1,50 @@
+# Self-contained Databricks Asset Bundle for Spike A1
+#
+# Keeps the spike isolated from the companion Wumbo bundle. Deploy from this
+# directory so that relative paths inside resources/spike_workflow.yml (which
+# reference ../pipeline/sdp_pipeline.py, ../tasks/*.py, ../ddl/*.sql) resolve
+# correctly against THIS bundle's root.
+#
+# Usage (from spikes/jdbc-sdp-a1/ directory):
+#   databricks --profile dbc-8e058692-373e bundle deploy --target dev
+#   databricks --profile dbc-8e058692-373e bundle run spike_jdbc_sdp_a1 --target dev \
+#       --params run_id=spike-$(date +%s),rerun_mode=fresh,inject_failure=false,min_completed=5
+#
+# Workspace host matches Wumbo's dev target so the spike deploys to the same
+# devtest workspace where devtest_edp_metadata and devtest_edp_bronze
+# catalogs are provisioned. Bundle name differs so the workspace root_path
+# does NOT collide with Wumbo's deployment tree.
+
+bundle:
+  name: spike_jdbc_sdp_a1
+  uuid: b1afcf73-2ff7-4b74-995b-58aecfd58c19
+
+# Spike-local variables. Kept minimal — the spike's manifest manifest_table.sql
+# and watermark_registry_spike.sql hardcode catalog/schema at devtest_edp_*.*
+# because the devtest workspace has those catalogs pre-provisioned and the
+# spike is intentionally scoped to that one environment. If you need to move
+# the spike to a different workspace/catalog, override here via variables and
+# substitute into spike_workflow.yml.
+variables:
+  stamp:
+    description: "Deployment stamp used in default run_id fallback"
+    default: "v1"
+  run_id:
+    description: "Run identifier — operator overrides per run"
+    default: ""
+  inject_failure:
+    description: "Whether the pipeline should inject a deliberate flow failure"
+    default: "false"
+
+include:
+  - resources/*.yml
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://dbc-8e058692-373e.cloud.databricks.com
+      # root_path scoped to bundle name so the spike does not clobber Wumbo's
+      # dev deployment tree in the same workspace.
+      root_path: ~/.bundle/${bundle.name}/${bundle.target}
