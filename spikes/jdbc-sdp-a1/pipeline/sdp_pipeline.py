@@ -151,7 +151,14 @@ def make_flow(spec: dict) -> None:
 
         if should_inject_runtime_failure:
             # Runtime-only failure: analyse OK, throw on data access.
-            df = df.withColumn("__inject_fail", F.expr("1 / 0"))
+            # `raise_error` is guaranteed to throw at materialisation
+            # regardless of ANSI mode. 1/0 silently returns NULL when
+            # spark.sql.ansi.enabled=false, which is the SDP default and
+            # would not surface a failure.
+            df = df.withColumn(
+                "__inject_fail",
+                F.expr("raise_error('spike inject failure')"),
+            )
 
         # Return the DataFrame ONLY — no imperative Delta writes permitted here.
         # SDP handles the materialisation to devtest_edp_bronze.jdbc_spike.<target_table>.
