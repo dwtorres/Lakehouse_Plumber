@@ -1,0 +1,104 @@
+# Databricks Asset Bundle resource — JDBC SDP A1 Spike
+#
+# Job topology (5 tasks, 1 SDP pipeline):
+#   fixtures_discovery  — discovers 5 AdventureWorks tables via freesql catalog
+#   prepare_manifest    — inserts pending manifest + watermark registry rows
+#   run_sdp_pipeline    — single SDP pipeline; N dynamic flows (one per table)
+#   reconcile           — reads event_log(); updates manifest + registry
+#   validate            — asserts min_completed threshold; gate for acceptance
+#
+# The SDP pipeline (spike_jdbc_sdp_a1_pipeline) is declared separately under
+# resources.pipelines so DAB can resolve its ID for the pipeline_task reference
+# and for the reconcile notebook's pipeline_id parameter.
+#
+# NOTE on DAB library form: DAB supports both `notebook:` and `file:` source
+# forms for SDP pipeline libraries. The `file:` form (used here) is the modern
+# approach for plain Python source files (.py) consumed by SDP pipelines.
+# If your installed DAB version does not support `file:`, replace:
+#   libraries:
+#     - file:
+#         path: ../pipeline/sdp_pipeline.py
+# with:
+#   libraries:
+#     - notebook:
+#         path: ../pipeline/sdp_pipeline.py
+
+resources:
+
+  pipelines:
+    spike_jdbc_sdp_a1_pipeline:
+      name: spike_jdbc_sdp_a1_pipeline
+      catalog: devtest_edp_bronze
+      schema: jdbc_spike
+      serverless: true
+      # SDP dynamic flow API is on preview/current channel.
+      channel: PREVIEW
+      continuous: false
+      libraries:
+        - file:
+            path: ../pipeline/sdp_pipeline.py
+      configuration:
+        spike.run_id: "${var.run_id}"
+        spike.inject_failure: "${var.inject_failure}"
+
+  jobs:
+    spike_jdbc_sdp_a1_job:
+      name: spike_jdbc_sdp_a1
+
+      # Job-level parameters — operator overrides at trigger time via
+      # `databricks bundle run --params key=value,...`
+      parameters:
+        - name: run_id
+          # Use a bundle-scoped default; operator MUST override with a
+          # unique run identifier at trigger time (e.g. spike-$(date +%s)).
+          default: "${bundle.name}-${var.stamp}"
+        - name: rerun_mode
+          default: fresh
+        - name: inject_failure
+          default: "false"
+        - name: parent_run_id
+          default: ""
+        - name: min_completed
+          default: "4"
+
+      tasks:
+        - task_key: fixtures_discovery
+          # Serverless notebook task — no job_cluster_key needed.
+          notebook_task:
+            notebook_path: ../tasks/fixtures_discovery.py
+
+        - task_key: prepare_manifest
+          depends_on:
+            - task_key: fixtures_discovery
+          notebook_task:
+            notebook_path: ../tasks/prepare_manifest.py
+            base_parameters:
+              run_id: "{{job.parameters.run_id}}"
+              rerun_mode: "{{job.parameters.rerun_mode}}"
+              parent_run_id: "{{job.parameters.parent_run_id}}"
+              load_group: spike_a1
+
+        - task_key: run_sdp_pipeline
+          depends_on:
+            - task_key: prepare_manifest
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.spike_jdbc_sdp_a1_pipeline.id}
+            full_refresh: false
+
+        - task_key: reconcile
+          depends_on:
+            - task_key: run_sdp_pipeline
+          notebook_task:
+            notebook_path: ../tasks/reconcile.py
+            base_parameters:
+              run_id: "{{job.parameters.run_id}}"
+              pipeline_id: "${resources.pipelines.spike_jdbc_sdp_a1_pipeline.id}"
+
+        - task_key: validate
+          depends_on:
+            - task_key: reconcile
+          notebook_task:
+            notebook_path: ../tasks/validate.py
+            base_parameters:
+              run_id: "{{job.parameters.run_id}}"
+              min_completed: "{{job.parameters.min_completed}}"
