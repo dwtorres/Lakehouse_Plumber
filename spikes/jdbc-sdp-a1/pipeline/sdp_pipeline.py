@@ -54,15 +54,16 @@ pending_df = spark.read.table(
 ).filter(F.col("execution_status") == "pending")
 
 # Collect at plan time — SDP evaluates module-level code to discover flows.
-# NOTE: DataFrame.collect() triggers an SDP static-analysis warning
-# ("DataFrame.collect ... not supported in Lakeflow Declarative Pipelines")
-# when used inside @dp.table function bodies. It is benign at module scope
-# (plan-time flow registration cannot avoid driver-side materialisation),
-# but toLocalIterator() silences the warning while achieving the same
-# driver-side enumeration.
-pending_specs: list[dict] = [
-    row.asDict() for row in pending_df.toLocalIterator()
-]
+# Plan-time flow registration requires driver-side materialisation of
+# the pending manifest rows so that dp.table() can be called once per
+# spec with a factory closure. Three options were considered:
+#   - collect()          — emits an SDP static-analysis warning but works
+#   - toLocalIterator()  — raises "not supported when using file-based
+#                          collect" inside SDP pipeline modules
+#   - .take(n)           — requires knowing n up front, same warning
+# The warning against collect() targets its use INSIDE @dp.table bodies;
+# at module scope it is the supported path. Acceptable for the spike.
+pending_specs: list[dict] = [row.asDict() for row in pending_df.collect()]
 
 
 # ---------------------------------------------------------------------------
