@@ -12,7 +12,7 @@ See: .planning/PROJECT.md (updated 2026-04-18)
 Phase: 4 of 4 (Verification And Stress)
 Plan: 2 of 2 in current phase
 Status: Completed
-Last activity: 2026-04-24 - Completed quick task 260423-tkf: Spike A1 Session 2 - SDP federation scaffold
+Last activity: 2026-04-24 - Completed quick task 260424-dwc: Tier 1 HWM isolation — source_system_id filter in get_current_hwm
 
 Progress: [##########] 100%
 
@@ -58,6 +58,7 @@ None yet.
 | # | Description | Date | Commit | Directory |
 |---|-------------|------|--------|-----------|
 | 260423-tkf | Spike A1 Session 2 - SDP federation scaffold | 2026-04-24 | 26acf05 | [260423-tkf-spike-a1-session-2-sdp-federation-scaffo](./quick/260423-tkf-spike-a1-session-2-sdp-federation-scaffo/) |
+| 260424-dwc | Tier 1 HWM isolation — source_system_id filter in get_current_hwm | 2026-04-24 | 63bcfdb | [260424-dwc-apply-tier-1-hwm-isolation-add-source-sy](./quick/260424-dwc-apply-tier-1-hwm-isolation-add-source-sy/) |
 
 ## Deferred Items
 
