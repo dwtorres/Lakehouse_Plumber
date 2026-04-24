@@ -107,9 +107,19 @@ manifest_df = spark.sql(
     args={"run_id": run_id},
 )
 
+# SDP event_log flow_name is fully-qualified
+# (e.g. devtest_edp_bronze.jdbc_spike.projects_project_tasks), while
+# the manifest stores just the leaf target_table name. Strip the
+# catalog.schema prefix before joining so the names align.
+_BRONZE_PREFIX = "devtest_edp_bronze.jdbc_spike."
+events_for_join_df = latest_events_df.withColumn(
+    "target_table",
+    F.regexp_replace(F.col("flow_name"), f"^{_BRONZE_PREFIX}", ""),
+)
+
 joined_df = manifest_df.join(
-    latest_events_df,
-    on=manifest_df["target_table"] == latest_events_df["flow_name"],
+    events_for_join_df,
+    on="target_table",
     how="left",
 )
 
