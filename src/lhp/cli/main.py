@@ -500,8 +500,14 @@ def sync_runtime(dest, check):
     help="Override watermark registry schema (default: ${watermark_schema} "
     "from substitutions, falling back to '<env>_orchestration').",
 )
+@click.option(
+    "--warehouse-id",
+    default=None,
+    help="Databricks SQL warehouse ID for --apply (or set "
+    "DATABRICKS_WAREHOUSE_ID env var). Ignored on dry-run.",
+)
 @cli_error_boundary("Seed load_group SQL")
-def seed_load_group(env, flowgroup, apply, dry_run, catalog, schema):
+def seed_load_group(env, flowgroup, apply, dry_run, catalog, schema, warehouse_id):
     """Emit Step 4a SELECT-preview + INSERT-seed SQL for a Tier 2 flowgroup migration."""
     from .commands.seed_load_group_command import SeedLoadGroupCommand
 
@@ -512,6 +518,7 @@ def seed_load_group(env, flowgroup, apply, dry_run, catalog, schema):
         dry_run=dry_run,
         catalog=catalog,
         schema=schema,
+        warehouse_id=warehouse_id,
     )
 
 

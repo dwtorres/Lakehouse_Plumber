@@ -21,6 +21,7 @@ See: docs/planning/tier-2-hwm-load-group-fix.md §Step 4a
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import List, Optional
 
@@ -56,6 +57,7 @@ class SeedLoadGroupCommand(BaseCommand):
         dry_run: bool = True,
         catalog: Optional[str] = None,
         schema: Optional[str] = None,
+        warehouse_id: Optional[str] = None,
     ) -> None:
         """Execute the seed-load-group command.
 
@@ -66,6 +68,8 @@ class SeedLoadGroupCommand(BaseCommand):
             dry_run: When True (default), only emit SQL to stdout.
             catalog: Optional override of ``${watermark_catalog}``.
             schema: Optional override of ``${watermark_schema}``.
+            warehouse_id: Databricks SQL warehouse ID for ``--apply`` (or
+                set ``DATABRICKS_WAREHOUSE_ID`` env var).
         """
         self.setup_from_context()
         project_root = self.ensure_project_root()
@@ -83,7 +87,9 @@ class SeedLoadGroupCommand(BaseCommand):
         registry_table = f"{wm_catalog}.{wm_schema}.watermarks"
 
         for fg in flowgroups:
-            self._emit_for_flowgroup(fg, registry_table, apply=apply)
+            self._emit_for_flowgroup(
+                fg, registry_table, apply=apply, warehouse_id=warehouse_id
+            )
 
     # ------------------------------------------------------------------
     # Resolution helpers
@@ -192,7 +198,14 @@ class SeedLoadGroupCommand(BaseCommand):
     # Emission
     # ------------------------------------------------------------------
 
-    def _emit_for_flowgroup(self, fg, registry_table: str, *, apply: bool) -> None:
+    def _emit_for_flowgroup(
+        self,
+        fg,
+        registry_table: str,
+        *,
+        apply: bool,
+        warehouse_id: Optional[str] = None,
+    ) -> None:
         from ...models.config import LoadSourceType
 
         load_group = f"{fg.pipeline}{_LOAD_GROUP_SEP}{fg.flowgroup}"
@@ -277,15 +290,21 @@ class SeedLoadGroupCommand(BaseCommand):
             all_sql.append(insert)
 
         if apply:
-            self._apply_via_sdk(all_sql)
+            self._apply_via_sdk(all_sql, warehouse_id=warehouse_id)
 
     # ------------------------------------------------------------------
     # --apply path (lazy SDK import)
     # ------------------------------------------------------------------
 
-    def _apply_via_sdk(self, statements: List[str]) -> None:
+    def _apply_via_sdk(
+        self,
+        statements: List[str],
+        *,
+        warehouse_id: Optional[str] = None,
+    ) -> None:
         try:
             from databricks.sdk import WorkspaceClient
+            from databricks.sdk.service.sql import StatementState
         except ImportError as exc:
             raise click.ClickException(
                 "--apply requires the databricks-sdk. Install it via:\n"
@@ -295,6 +314,13 @@ class SeedLoadGroupCommand(BaseCommand):
                 f"Original import error: {exc}"
             ) from exc
 
+        wh_id = warehouse_id or os.environ.get("DATABRICKS_WAREHOUSE_ID")
+        if not wh_id:
+            raise click.ClickException(
+                "--apply requires a SQL warehouse. Set --warehouse-id <id> "
+                "or export DATABRICKS_WAREHOUSE_ID=<id>."
+            )
+
         client = WorkspaceClient(profile=_DEFAULT_DATABRICKS_PROFILE)
         for stmt in statements:
             # Skip dry-run-only SELECT preview blocks; Step 4a docs callout
@@ -303,9 +329,19 @@ class SeedLoadGroupCommand(BaseCommand):
             if stmt.lstrip().upper().startswith("SELECT"):
                 continue
             click.echo(f"-- applying: {stmt.splitlines()[0]} ...", err=True)
-            client.statement_execution.execute_statement(  # type: ignore[attr-defined]
-                statement=stmt
+            response = client.statement_execution.execute_statement(  # type: ignore[attr-defined]
+                warehouse_id=wh_id,
+                statement=stmt,
+                wait_timeout="30s",
             )
+            state = response.status.state if response.status else None
+            if state != StatementState.SUCCEEDED:
+                err = response.status.error if response.status else None
+                err_msg = err.message if err else f"state={state}"
+                raise click.ClickException(
+                    f"Databricks statement failed: {err_msg}"
+                )
+            click.echo(f"-- ok: state={state.value}", err=True)
 
 
 # ----------------------------------------------------------------------
