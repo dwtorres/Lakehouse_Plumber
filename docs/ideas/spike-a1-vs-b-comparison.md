@@ -161,9 +161,9 @@ Two rows have tightening corrections applied (failure isolation, per-flow retry)
 
 ### TL;DR decision guide
 
-**Use B2 (adopt as default).** All current N ≤ 100 workloads ship on B2 regardless of whether they are first-run full-loads or steady-state incremental. B2 is LHP's scale-out emission pattern for `jdbc_watermark_v2` flowgroups declaring `execution_mode: for_each`. Design spec: `docs/planning/b2-watermark-scale-out-design.md`.
+**B2 is the default path for current workloads up to the codegen ceiling of 300 actions per flowgroup (a platform-fit limit, not a recommendation).** B2 is LHP's scale-out emission pattern for `jdbc_watermark_v2` flowgroups declaring `execution_mode: for_each`. All workloads up to the ceiling ship on B2, regardless of whether they are first-run full-loads or steady-state incremental. Design spec: `docs/planning/b2-watermark-scale-out-design.md`.
 
-**Defer to A1 only when all three hold:** (a) a production B2 flowgroup consistently exceeds 0.5 wall-clock minutes per table at N ≥ 100 measured over a 4-week window; AND (b) total B2 cold-start cost exceeds the team's cost-tracking owner's established DBU/month baseline (placeholder until baseline is captured); AND (c) SDP streaming-table over foreign-catalog incremental support is generally available. Until all three are true, A1 stays deferred.
+**The A1-deferral cost trigger (0.5 wall-clock min/table at N≥100) may bind at N well below 300 depending on measured per-table runtime — operators evaluate cost evidence per flowgroup, not on the codegen cap.** Until all three trigger conditions hold (see [A1-deferral trigger metric](#a1-deferral-trigger-metric)), A1 stays deferred.
 
 ### V1 Probe Verification (Tier 1 proof)
 
@@ -191,7 +191,7 @@ The per-iteration worker is the existing `src/lhp/templates/load/jdbc_watermark_
 
 - **R1.** Per-table manifest row; HWM read live by worker via `WatermarkManager.get_latest_watermark(source_system_id, schema_name, table_name, load_group)`. No HWM snapshot in the manifest row.
 - **R1a.** `prepare_manifest` MERGEs on `(batch_id, action_name)` for idempotency; DAB task retries produce fresh `batch_id`.
-- **R2.** Task values carry only iteration key (`source_system_id, schema_name, table_name, action_name, load_group, batch_id`, ~200 B/entry). Codegen validates `len(actions) ≤ 300` against DAB's ~48 KB taskValue ceiling.
+- **R2.** Task values carry only the iteration key — `{ source_system_id, schema_name, table_name, action_name, load_group, batch_id, manifest_table }`, ~250 bytes/entry. DAB task-value cap ~48 KB → codegen enforces `len(actions_post_template_expansion) ≤ 300` and emits `LHPConfigError` if exceeded. Worker resolves remaining per-table config from substitutions + manifest table at iteration start.
 - **R3.** Worker uses production contract verbatim — `derive_run_id` → `insert_new` outside try → JDBC + landing inside try → `mark_landed` → `mark_complete` outside try. HIPAA hashing hook location is between JDBC read and landing write; hook code ships separately.
 - **R4.** Failed iterations call `mark_failed` then `raise`, so DAB `for_each_task.task.max_retries` is honoured. Validate uses latest-per-key aggregation to tolerate retry-induced duplicate rows.
 - **R5.** Strict validate gate: landing parity only (bronze parity is a downstream concern). `completed == expected`, `failed == 0`, `in_flight == 0`, scoped to this batch via the manifest-table-join on `batch_id`.
@@ -200,7 +200,7 @@ The per-iteration worker is the existing `src/lhp/templates/load/jdbc_watermark_
 
 - **(a) Tier 1 scope.** Tier 1 closes cross-source poisoning only; Tier 2 is a B2 prerequisite, not optional future mitigation.
 - **(b) Retry contract.** Spike B's `ingest_one.py` swallowed exceptions, which prevented DAB from observing iteration failures. B2 returns to the production template's raise-on-failure semantics (`jdbc_watermark_job.py.j2:255-262` already does this correctly). DAB retry becomes operationally real once that divergence is removed.
-- **(c) Manifest shape.** Task values carry the small iteration key (~200 B/entry), not full manifest rows. Worker reads its row from the manifest table at iteration start and re-resolves env substitutions at runtime. Cap at `len(actions) ≤ 300` enforced at codegen.
+- **(c) Manifest shape.** Task values carry only the iteration key — `{ source_system_id, schema_name, table_name, action_name, load_group, batch_id, manifest_table }`, ~250 bytes/entry. DAB task-value cap ~48 KB → codegen enforces `len(actions_post_template_expansion) ≤ 300` and emits `LHPConfigError` if exceeded. Worker resolves remaining per-table config (jdbc_url, secrets, landing_path) from substitutions + manifest table at iteration start.
 - **(d) Idempotency primitive.** B2 uses run-scoped landing (`<landing_root>/_lhp_runs/<run_id>/`) per ADR-003, which is deterministic overwrite per `(run_id, source_table)`. AutoLoader consumes the landing zone downstream. Spike B's direct-to-bronze `saveAsTable` is not the pattern B2 uses.
 
 **Reusable from spike.** `spikes/jdbc-sdp-b/tasks/prepare_manifest.py` and `tasks/validate.py` — conceptually; both are rewritten against the `lhp_watermark` API and the manifest schema in the design doc. Not a direct port.
