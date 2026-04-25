@@ -1,6 +1,6 @@
 # Scheduled Work: Tier 2 HWM `load_group` Fix
 
-**Status:** Scheduled, not started
+**Status:** scheduled (planned 2026-04-22) → shipped (Plan: [`docs/plans/2026-04-25-001-feat-tier-2-load-group-registry-axis-plan.md`](../plans/2026-04-25-001-feat-tier-2-load-group-registry-axis-plan.md); Runbook: [`docs/runbooks/tier-2-load-group-rollout.md`](../runbooks/tier-2-load-group-rollout.md))
 **Priority:** Prerequisite for any LHP integration of Spike B2
 **Effort:** see Effort section
 **Blocks:** B2 integration (`b2-watermark-scale-out-design.md`)
@@ -358,3 +358,18 @@ Or inline once reviewed:
   before Tier 2 ships.
 - Run `rg -l '::' <project>/flowgroups/*.yaml` to confirm no existing flowgroup files
   contain the new separator literal.
+
+---
+
+## Status: scheduled → shipped
+
+This planning doc is the origin reference for Tier 2. The implementation plan and the
+operator runbook are the authoritative live documents:
+
+- **Implementation plan:** [`docs/plans/2026-04-25-001-feat-tier-2-load-group-registry-axis-plan.md`](../plans/2026-04-25-001-feat-tier-2-load-group-registry-axis-plan.md)
+- **Operator runbook (dev → qa → prod rollout):** [`docs/runbooks/tier-2-load-group-rollout.md`](../runbooks/tier-2-load-group-rollout.md)
+
+The runbook supersedes the migration steps and pre-flight checks captured here for
+day-to-day operator use. This file is preserved for design-rationale provenance (the
+`load_group` composite definition, the rejected `source_system_id` alternative, the V1–V4
+verification design, and the Delta column-mapping deferral).
