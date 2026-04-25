@@ -1,21 +1,23 @@
 # Spike A1 vs Spike B — Comparison & Integration Recommendation
 
-**Agent:** COMPARE-A1-B / RETEST-MEASURE-COMMIT  
-**Date:** 2026-04-24 (retest verdict revised 2026-04-24)  
-**Branch:** spike/jdbc-sdp-a1  
+**Agent:** COMPARE-A1-B / RETEST-MEASURE-COMMIT
+**Date:** 2026-04-24 (reframed to B2-adopt / A1-deferred 2026-04-24)
+**Branch:** spike/jdbc-sdp-a1
 **Source:** PG AdventureWorks via `pg_supabase` (Supabase PgBouncer pooler)
 
 ---
 
 ## Summary Verdict
 
-**Both spikes proved their theses under fair test conditions. Shared prerequisite (Tier 1 HWM isolation) is shipped and V1-proven.**
+**B2 (hardened `for_each` on the production `lhp_watermark` substrate) is the adopted production path. Option A1 (SDP-native dynamic flows) is a deferred future optimisation. Tier 2 (`load_group` registry column) is a B2 prerequisite, not an optional later mitigation.**
 
-Spike B delivered 780,132 catalog rows (738,913 from this clean run's working set, remainder from prior partial runs) across 63 Delta tables. Spike A1 delivered 738,913 rows across 61 Delta tables on a clean first-run full-load under retest `retest_1777031969`, with per-table parity at exactly 0% delta against PG source on all 61 tables.
+Both spikes proved their theses under fair test conditions: at N=61 on PG AdventureWorks, A1 materialised 738,913 rows with exact source parity (retest `retest_1777031969`), and B materialised 780,132 catalog rows across 63 tables. The shared Tier 1 HWM isolation prerequisite is shipped (commit `63bcfdb`, V1 probe verified 2026-04-24).
 
-The original "A1 = 0 rows" finding was a test-ordering artifact: Spike B ran first against a shared `watermark_registry` and advanced all PG HWMs to the dataset ceiling. A1 then correctly returned zero rows on a static historical dataset. A1 was never given a fair first-run full-load until the retest. The Tier 1 fix (commit `63bcfdb`) closes the underlying hazard at query level; V1 probe verified the filter excludes a synthetic poisoning row.
+The earlier "Spike A vs Spike B, preferred path B" framing understated the integration gap. Raw Spike B is not production-ready — its `ingest_one.py` swallows exceptions, passes full manifest rows through DAB task values, uses `saveAsTable` as its idempotency primitive, and is disconnected from the existing production `lhp_watermark` L2 §5.3 contract. B2 is the hardened variant: same `for_each` topology, but rebuilt on the production substrate (see `docs/planning/b2-watermark-scale-out-design.md` for the design spec). A1 remains viable as a future cost optimisation but is deferred behind three concrete trigger conditions (see §A1-deferral triggers).
 
-**Strategic choice is a genuine tradeoff.** Jump to the [TL;DR decision guide](#tldr-decision-guide) for a one-screen read, or the [Integration Path Options](#integration-path-options) section for full detail. The Appendix's HWM-poisoning section is now historical context — the hazard is closed in the spike prototypes; Tier 2 and Tier 3 mitigations remain available if future multi-tenancy requires stronger isolation.
+**Tier 1 scope correction.** Tier 1 closes **cross-source** HWM poisoning only (different `source_system_id` values against the same `(schema, table)` pair). Same-source + same-`(schema, table)` + different flowgroup still poisons. B2 requires Tier 2 (`load_group` column) to close this; Tier 2 is a hard prerequisite for any B2 integration commit, not the "available if future multi-tenancy requires" caveat the original draft described. See `docs/planning/tier-2-hwm-load-group-fix.md` for the migration plan.
+
+Jump to the [TL;DR decision guide](#tldr-decision-guide) for a one-paragraph read, or skip to [Integration Path Options](#integration-path-options) for the full reframed options.
 
 ---
 
@@ -40,7 +42,7 @@ The original "A1 = 0 rows" finding was a test-ordering artifact: Spike B ran fir
 
 ### Spike A1 — Original Run
 
-**Claimed:** 61/61 flows COMPLETED, 0 rows written (MV semantics, normal behavior).  
+**Claimed:** 61/61 flows COMPLETED, 0 rows written (MV semantics, normal behavior).
 **Actual:** 0 rows in all bronze tables. Confirmed by `COUNT(*)` query against
 `devtest_edp_bronze.jdbc_spike.humanresources_employee` (source has 290 rows).
 
@@ -109,7 +111,7 @@ at N=61 scale with zero row loss when given a clean first-run HWM state.
 
 ### Spike B — Row Count Verification
 
-**Claimed:** 739,005 rows across 62 completed tables.  
+**Claimed:** 739,005 rows across 62 completed tables.
 **Actual (verified):** 780,132 rows across 63 tables confirmed by `SUM(COUNT(*))` over
 all 63 `devtest_edp_bronze.jdbc_spike_b.*` tables via warehouse API.
 
@@ -128,39 +130,40 @@ Delta data.
 
 ## Dimension-by-Dimension Comparison
 
-| Dimension | Spike A1 (SDP dynamic flows) | Spike B (for_each_task) | Verdict |
+Two rows have tightening corrections applied (failure isolation, per-flow retry) reflecting the distinction between raw Spike B and the hardened B2 design. The rest of the table records empirical spike-run numbers and stands unchanged.
+
+| Dimension | Spike A1 (SDP dynamic flows) | Spike B (`for_each_task`) | Verdict |
 |-----------|------------------------------|-------------------------|---------|
 | **Tables successfully ingested** | 61/61 (738,913 rows; retest-verified) | 62 of 63 (1 idempotency failure) | Equivalent at clean-run |
 | **Total rows loaded (verified)** | 738,913 (retest; exact match to PG source) | 780,132 (catalog); 739,005 (this-run metric) | Equivalent on overlapping 61 tables |
 | **Total wall-clock (job trigger → validate)** | 1,332 s retest (22 min); 2,462 s original (41 min) | 3,097 s (51.6 min) | A1 faster |
 | **Concurrency model** | SDP runtime-managed (opaque) | `for_each concurrency: 10` (explicit, configurable) | B — transparent and tunable |
 | **Concurrency observed** | Not directly measurable per-flow | 10 sustained (confirmed via API) | B — observable |
-| **Failure isolation** | SDP flow-level (MV body exception → flow FAILED; others continue) | try/except per notebook iteration; notebook never raises | Both pass; B gives visible iteration status |
-| **State machine location** | External (prepare_manifest + reconcile bookend; no state inside flow body) | Inline per iteration (ingest_one.py updates manifest + registry directly) | B simpler; A1 introduces reconcile as a required 5th task |
-| **Code complexity** | 1,239 total lines (5 tasks + pipeline + 2 yml) | 874 total lines (3 tasks + 2 yml) | B is 30% less code |
-| **HWM poisoning vulnerability** | Present when registry is shared across source systems or pipelines — Tier 1 fix closes it | Present under same conditions — same Tier 1 fix applies | Both need mitigation; neither has it today |
-| **Ops gotchas (scale run)** | (1) Zero-row silent trap on pre-advanced HWMs (Tier 1 fix closes); (2) `^v[a-z]` over-filter loses valid tables; (3) stale-pending-row collision needs pre-cleanup; (4) fixtures_discovery slow (1,401 s via PgBouncer SHOW TABLES) | (1) `saveAsTable` idempotency fails on retry of cancelled run; (2) prepare_manifest 403 s for 73 sequential HWM lookups; (3) `abandoned` row provenance unknown | B gotchas simpler to fix; A1 silent-trap is a silent failure mode if Tier 1 not applied |
-| **Cost model per iteration** | Single pipeline update runs all N flows on one cluster; marginal cost per table near-zero once cluster is up | Each of 63 iterations starts a serverless notebook (~10-15 s cold start); 63 cold starts at \$0.40/DBU-hour serverless is material | A1 cheaper per-flow at large N on warm cluster; B cold-start cost scales with N |
-| **DAB asset footprint** | Job (5 tasks) + Pipeline (1 SDP resource) | Job (3 tasks) only | B simpler (no SDP pipeline resource to manage) |
-| **Operator debuggability** | Two places: pipeline UI (flow events) + job run history; reconcile must succeed for watermarks to be correct | One place: job run history; each iteration is a visible task with its own log | B wins — single pane |
-| **Per-flow retry model** | SDP internal retries inside pipeline update (configurable); failed flows do not rerun without new pipeline update | DAB `for_each_task` has built-in `max_retries`; failed iterations can be retried at job level | Equivalent; B retry more visible |
-| **Observability surface** | SDP `event_log()` TVF (queryable via SQL); requires knowing pipeline_id; reconcile reads it post-run | Job run history API + manifest table; no external TVF required | B simpler operationally |
-| **LHP integration delta** | Larger: new SDP pipeline resource, reconcile task, event_log TVF reader — none of these exist in current LHP codegen | Smaller: `ingest_one.py` maps directly to `load/jdbc_watermark_job.py.j2`; for_each DAB pattern is one new `execution_mode` field in flowgroup spec | B smaller integration delta |
+| **Failure isolation** | SDP flow-level (MV body exception → flow FAILED; others continue) | Spike B's `ingest_one.py` swallowed exceptions, defeating DAB iteration failure detection. **B2 returns to the production contract's raise-on-failure semantics** (`jdbc_watermark_job.py.j2:255-262` already does this correctly); DAB then sees iteration failures and fires task-level retries honestly. | Both pass under B2; Spike B raw code is non-production |
+| **State machine location** | External (prepare_manifest + reconcile bookend; no state inside flow body) | B2: inline per iteration using the production `WatermarkManager` L2 §5.3 contract. Spike B's direct registry writes from `ingest_one.py` bypass the production state machine. | B2 simpler than A1; A1 introduces reconcile as a required 5th task |
+| **Code complexity** | 1,239 total lines (5 tasks + pipeline + 2 yml) | Spike B raw: 874 lines. B2 reuses existing production template + adds prepare_manifest + validate notebooks (est. +200 lines of template, no duplicate state machine). | B2 is lightest |
+| **HWM poisoning vulnerability** | Cross-source: Tier 1 closed. Same-source cross-flowgroup: requires Tier 2. | Same as A1 — both share the registry. | Both need Tier 2 before any multi-flowgroup production deployment. |
+| **Ops gotchas (scale run)** | (1) Zero-row silent trap on pre-advanced HWMs (Tier 1 fix closes cross-source portion); (2) `^v[a-z]` over-filter loses valid tables; (3) stale-pending-row collision needs pre-cleanup; (4) fixtures_discovery slow (1,401 s via PgBouncer SHOW TABLES) | Spike B: (1) `saveAsTable` idempotency fails on retry of cancelled run — **B2 replaces this with ADR-003's run-scoped landing (`<landing_root>/_lhp_runs/<run_id>/`), which is already idempotent per (run_id, source_table)**; (2) prepare_manifest 403 s for 73 sequential HWM lookups — B2 batches via single `GROUP BY` per Tier 2 registry; (3) `abandoned` row provenance — handled by B2's retry-aware validate (R5). | B2 resolves all three Spike B gotchas in its design |
+| **Cost model per iteration** | Single pipeline update runs all N flows on one cluster; marginal cost per table near-zero once cluster is up | Each of 63 iterations starts a serverless notebook (~10-15 s cold start); 63 cold starts at \$0.40/DBU-hour serverless is material | A1 cheaper per-flow at large N on warm cluster; B cold-start cost scales with N (still within budget at N≤100) |
+| **DAB asset footprint** | Job (5 tasks) + Pipeline (1 SDP resource) | Job (3 tasks): prepare_manifest → for_each_ingest → validate | B2 simpler (no SDP pipeline resource to manage) |
+| **Operator debuggability** | Two places: pipeline UI (flow events) + job run history; reconcile must succeed for watermarks to be correct | One place: job run history; each iteration is a visible task with its own log | B2 wins — single pane |
+| **Per-flow retry model** | SDP internal retries inside pipeline update (configurable); failed flows do not rerun without new pipeline update | Spike B: `ingest_one.py` never re-raised, so DAB `for_each_task.task.max_retries` was theoretical. **B2 changes this: iteration re-raises after `mark_failed`, so DAB retry is real.** Validate task tolerates retry-induced duplicate rows via latest-per-key aggregation. | B2 retry is operationally real and observable |
+| **Observability surface** | SDP `event_log()` TVF (queryable via SQL); requires knowing pipeline_id; reconcile reads it post-run | Job run history API + manifest table; no external TVF required | B2 simpler operationally |
+| **LHP integration delta** | Larger: new SDP pipeline resource, reconcile task, event_log TVF reader — none of these exist in current LHP codegen | B2: one new `execution_mode: for_each` field on `FlowGroup.workflow`; two new task templates (prepare_manifest, validate); one conditional header block in existing jdbc_watermark_v2 template. Reuses production `WatermarkManager` API verbatim. | B2 smaller integration delta |
 
 ---
 
 ## Integration Path Options
 
-Three viable paths for LHP integration. Each sketched symmetrically so the decision can be made on criteria, not narrative bias.
+**Shared prerequisite — DONE:** Tier 1 HWM isolation shipped in commit `63bcfdb` on 2026-04-24 (quick task `260424-dwc`, V1 probe PASSED). Both spike `prepare_manifest.py` copies filter the registry by `source_system_id`. See `docs/planning/tier-1-hwm-fix.md` and the [V1 Probe Verification](#v1-probe-verification-tier-1-proof) section below.
 
-**Status of shared prerequisite: Tier 1 HWM isolation — DONE** (commit `63bcfdb`, quick task `260424-dwc`, V1 probe PASSED 2026-04-24). Both spike `prepare_manifest.py` copies now filter the registry by `source_system_id`. See `docs/planning/tier-1-hwm-fix.md` for the fix, and "V1 Probe Verification" below for the empirical proof the filter actually excludes poisoned rows.
+**B2 prerequisite — scheduled:** Tier 2 `load_group` migration (`docs/planning/tier-2-hwm-load-group-fix.md`). Must land before the B2 integration commit.
 
 ### TL;DR decision guide
 
-- **Target N per flowgroup < 50 AND no immediate N=100+ target:** Option B. Smallest delta, ships in 1.5 sprints, fits LHP's existing per-table template model almost 1:1.
-- **Target N ≥ 100 AND per-run cost matters (DBU-hours measurable):** Option A. Single cluster amortises cost flat across N; B's cold-start cost scales linearly.
-- **Mixed portfolio of flowgroup sizes AND team has the sprint capacity:** Option C. Per-flowgroup choice; start everything on B, migrate high-volume ones to A as evidence accumulates.
-- **Unsure about N trajectory OR team is capacity-constrained:** Option B now, revisit for Option A once a real N=100+ flowgroup materialises. Lowest-regret path.
+**Use B2 (adopt as default).** All current N ≤ 100 workloads ship on B2 regardless of whether they are first-run full-loads or steady-state incremental. B2 is LHP's scale-out emission pattern for `jdbc_watermark_v2` flowgroups declaring `execution_mode: for_each`. Design spec: `docs/planning/b2-watermark-scale-out-design.md`.
+
+**Defer to A1 only when all three hold:** (a) a production B2 flowgroup consistently exceeds 0.5 wall-clock minutes per table at N ≥ 100 measured over a 4-week window; AND (b) total B2 cold-start cost exceeds the team's cost-tracking owner's established DBU/month baseline (placeholder until baseline is captured); AND (c) SDP streaming-table over foreign-catalog incremental support is generally available. Until all three are true, A1 stays deferred.
 
 ### V1 Probe Verification (Tier 1 proof)
 
@@ -172,221 +175,193 @@ Empirical test of the Tier 1 filter fix, run 2026-04-24 against `devtest_edp_orc
 4. Ran new query with Tier 1 filter (`AND source_system_id = 'pg_supabase'`): returned **`2014-12-26 09:17:08.637000`** — correct, poisoning excluded.
 5. Cleanup: fake row deleted, `SELECT COUNT(*) WHERE source_system_id='fake_federation'` = 0.
 
-The hazard described throughout this document is no longer theoretical — both the attack and the fix are now demonstrated end-to-end.
+The cross-source hazard is no longer theoretical — both the attack and the fix are demonstrated end-to-end. The same-source cross-flowgroup hazard remains open and is closed by Tier 2.
 
-### Option A — Adopt Spike A1 only (SDP-native dynamic flows)
+### Option B2 — Hardened `for_each` on the production `lhp_watermark` substrate (ADOPTED)
 
-**What LHP ships.** A new `execution_mode: sdp_dynamic` flowgroup field. LHP codegen emits:
+**What LHP ships.** A new `execution_mode: for_each` field on `FlowGroup.workflow`. LHP codegen emits a three-task DAB job:
 
-- An SDP pipeline source `.py` file dynamically generating one flow per pending manifest row (DLT-META factory-closure pattern).
-- A DAB pipeline resource pointing at that source.
-- A 5-task job: `fixtures_discovery` → `prepare_manifest` → `run_sdp_pipeline` → `reconcile` → `validate`, with `run_if: ALL_DONE` on reconcile+validate.
-- Reconcile task that reads SDP `event_log(<pipeline_id>)` and updates manifest + watermark registry.
-
-**Reusable from spike.** `spikes/jdbc-sdp-a1/pipeline/sdp_pipeline.py`, `tasks/prepare_manifest.py`, `tasks/reconcile.py`, `tasks/validate.py`, `resources/spike_workflow.yml` — all transferable to template form.
-
-**Cost & effort.** ≈ 3 sprints. New LHP template surface area: SDP pipeline emitter, event-log reader, two extra tasks vs current per-table model. Existing `load/jdbc_watermark_job.py.j2` retired or kept as fallback.
-
-**Where it wins.**
-- Per-flow cost at scale (N≥100): single cluster, flat marginal cost.
-- Wall-clock: 1,332s vs B's 3,097s at N=61 (2.3× faster); delta widens with N.
-- Declarative alignment with Databricks Lakeflow direction.
-- Code density in generated artifacts: dynamic flow generation reads as one template + one data-driven loop vs B's N per-table notebooks.
-
-**Where it hurts.**
-- Silent-trap failure mode if HWM isolation not applied (Tier 1 hard prerequisite, not optional).
-- Two debug surfaces: SDP pipeline UI + job run history; operators must know both.
-- SDP pipeline resource lifecycle to manage per environment.
-- MV semantics tie outputs to foreign catalog federation — if source moves off federation (direct JDBC), pattern needs re-validation.
-
-**Carry over from spike.** Fix `^v[a-z]` over-filter. Parallelize `fixtures_discovery` schema queries. Keep decimal-column skip logic as defensive code path.
-
-### Option B — Adopt Spike B only (`for_each_task` native)
-
-**What LHP ships.** A new `execution_mode: for_each` flowgroup field. LHP codegen emits:
-
-- A `tasks/ingest_one.py` notebook template reading one table from the foreign catalog, writing to bronze with incremental filter, updating manifest + registry inline.
-- A 3-task DAB job: `prepare_manifest` → `for_each_ingest` (over manifest rows as task value) → `validate`.
-- Concurrency parameterized via a flowgroup field.
-
-**Reusable from spike.** `spikes/jdbc-sdp-b/tasks/ingest_one.py`, `tasks/prepare_manifest.py`, `tasks/validate.py`, `resources/spike_workflow.yml` — all transferable.
-
-**Cost & effort.** ≈ 1.5 sprints. Closer to LHP's existing per-table model. Reuses more of `load/jdbc_watermark_job.py.j2` semantics inside the iteration notebook.
-
-**Where it wins.**
-- Per-iteration UI visibility: operators see which table failed without querying an event log.
-- Explicit, tunable concurrency in one YAML field.
-- One debug surface: job run history.
-- Native DAB retry per iteration; `run_if: ALL_DONE` not required because no SDP pipeline phase.
-- Smallest LHP integration delta — maps almost directly onto existing template.
-
-**Where it hurts.**
-- Per-iteration cold-start cost scales with N. At N=100+, cold-starts are measurable cost overhead.
-- Wall-clock 2.3× A1's at N=61; gap widens with N.
-- Serverless quota ceilings: `for_each` hard cap is 100 concurrent iterations and 5,000 total per job run (verify for target N).
-- Less declarative; each iteration is an independent notebook invocation.
-
-**Carry over from spike.** Fix `saveAsTable` idempotency (check `tableExists`, branch `insertInto` vs `saveAsTable`). Batch HWM lookup in `prepare_manifest` to one `GROUP BY` query.
-
-### Option C — Adopt both, gated by `execution_mode` flowgroup field
-
-**What LHP ships.** Both Option A and Option B generators, selected per flowgroup via YAML. Examples:
-
-```yaml
-flowgroups:
-  - flowgroup: high_volume_jdbc
-    execution_mode: sdp_dynamic       # A1 path
-    ...
-  - flowgroup: small_cdc_source
-    execution_mode: for_each          # B path
-    ...
+```
+prepare_manifest  →  for_each_ingest  →  validate
 ```
 
-**Decision rule baked into LHP.** Default `execution_mode: for_each` (lower risk, smaller delta). Operators opt into `sdp_dynamic` when flow count × cold-start-cost justifies it, or when Lakeflow MV downstream consumers need SDP-managed lineage.
+The per-iteration worker is the existing `src/lhp/templates/load/jdbc_watermark_job.py.j2` template with one conditional header block to unpack `dbutils.jobs.taskValues`. Below the header the L2 §5.3 state-machine body is unchanged. Public `lhp_watermark` API is reused verbatim.
 
-**Cost & effort.** ≈ 4 sprints — superset of A + B minus shared state-machine code (`prepare_manifest`, registry schema, HWM logic all shared). Roughly A + 80% of B due to reuse.
+**Five binding requirements (condensed; see design doc for full spec):**
 
-**Where it wins.**
-- Maximum optionality: LHP users pick the right tool per source.
-- Graceful ramp: start flowgroups on `for_each`, migrate individual high-volume ones to `sdp_dynamic` as evidence accumulates.
-- No premature commitment: if SDP streaming-table-over-foreign-catalog support ships (open question), A1 can be extended without deprecating B.
+- **R1.** Per-table manifest row; HWM read live by worker via `WatermarkManager.get_latest_watermark(source_system_id, schema_name, table_name, load_group)`. No HWM snapshot in the manifest row.
+- **R1a.** `prepare_manifest` MERGEs on `(batch_id, action_name)` for idempotency; DAB task retries produce fresh `batch_id`.
+- **R2.** Task values carry only iteration key (`source_system_id, schema_name, table_name, action_name, load_group, batch_id`, ~200 B/entry). Codegen validates `len(actions) ≤ 300` against DAB's ~48 KB taskValue ceiling.
+- **R3.** Worker uses production contract verbatim — `derive_run_id` → `insert_new` outside try → JDBC + landing inside try → `mark_landed` → `mark_complete` outside try. HIPAA hashing hook location is between JDBC read and landing write; hook code ships separately.
+- **R4.** Failed iterations call `mark_failed` then `raise`, so DAB `for_each_task.task.max_retries` is honoured. Validate uses latest-per-key aggregation to tolerate retry-induced duplicate rows.
+- **R5.** Strict validate gate: landing parity only (bronze parity is a downstream concern). `completed == expected`, `failed == 0`, `in_flight == 0`, scoped to this batch via the manifest-table-join on `batch_id`.
 
-**Where it hurts.**
-- Maintenance cost: two code paths, two test matrices, two operator runbooks.
-- Decision overhead at flowgroup-authoring time: engineers must understand both models to choose.
-- Risk of per-mode feature drift (e.g. retry semantics, observability conventions).
+**Four tightening corrections vs raw Spike B:**
 
-**Minimum bar before shipping.** Clear decision framework in LHP docs: "use `sdp_dynamic` when N ≥ X AND cold-start-cost fraction > Y%; otherwise `for_each`." X and Y derived empirically post-integration.
+- **(a) Tier 1 scope.** Tier 1 closes cross-source poisoning only; Tier 2 is a B2 prerequisite, not optional future mitigation.
+- **(b) Retry contract.** Spike B's `ingest_one.py` swallowed exceptions, which prevented DAB from observing iteration failures. B2 returns to the production template's raise-on-failure semantics (`jdbc_watermark_job.py.j2:255-262` already does this correctly). DAB retry becomes operationally real once that divergence is removed.
+- **(c) Manifest shape.** Task values carry the small iteration key (~200 B/entry), not full manifest rows. Worker reads its row from the manifest table at iteration start and re-resolves env substitutions at runtime. Cap at `len(actions) ≤ 300` enforced at codegen.
+- **(d) Idempotency primitive.** B2 uses run-scoped landing (`<landing_root>/_lhp_runs/<run_id>/`) per ADR-003, which is deterministic overwrite per `(run_id, source_table)`. AutoLoader consumes the landing zone downstream. Spike B's direct-to-bronze `saveAsTable` is not the pattern B2 uses.
+
+**Reusable from spike.** `spikes/jdbc-sdp-b/tasks/prepare_manifest.py` and `tasks/validate.py` — conceptually; both are rewritten against the `lhp_watermark` API and the manifest schema in the design doc. Not a direct port.
+
+**Cost & effort.** ~1.5 sprints once Tier 2 is in. Closer to LHP's existing per-table model. Reuses all of `load/jdbc_watermark_job.py.j2`'s body.
+
+**Where it wins (vs A1).** Per-iteration UI visibility; explicit tunable concurrency; single debug surface; native DAB retry honestly observable once raise-on-failure is in; smallest LHP integration delta; no SDP pipeline resource to manage per env.
+
+**Where it hurts (vs A1).** Per-iteration cold-start cost scales with N. At N ≥ 100 cold-starts become measurable overhead relative to A1's warm-cluster single-pipeline model. Wall-clock is 2.3× A1's at N=61 and the gap widens with N. Both concerns are acceptable at the team's current N ≤ 100 target and are the basis for A1's deferral triggers.
+
+**Serverless quota caveats.** DAB `for_each_task` hard limits: 100 concurrent iterations and 5,000 total per job run. B2 codegen caps concurrency at 100 and actions at 300; larger flowgroups need a split strategy before they can ship.
+
+### Deferred: Option A1 (Lakeflow optimisation path)
+
+Keep A1 spike intact for a future reconsideration. Revisit only when all three triggers hold:
+
+1. Production B2 flowgroups consistently exceed 0.5 wall-clock minutes per table at N ≥ 100 measured over a 4-week window.
+2. Total B2 cold-start cost exceeds the team's established DBU/month baseline (placeholder until captured).
+3. SDP streaming-table over foreign-catalog incremental support is generally available.
+
+**Preconditions before re-validation (if triggered):**
+
+- Run-isolation proof for dynamic flows across concurrent pipeline updates.
+- Append/accumulation semantics proven on MVs over foreign catalogs for incremental (non-full) loads.
+- Event-log permission model validated in production-equivalent workspace.
+- HIPAA hashing integration path demonstrated (B2 defines the hook; A1 would need the equivalent inside the SDP flow body).
+
+Until all of the above hold, A1 stays parked. The A1 spike artifacts (`spikes/jdbc-sdp-a1/`) remain on this branch as historical reference; do not migrate them to `watermark`.
+
+### Option C — Adopt both under `execution_mode` (NOT ADOPTED)
+
+Option C (ship both A1 and B2 generators, pick per flowgroup) is not adopted now. Maintenance cost of two code paths with two test matrices and two operator runbooks is not justified at the current N ≤ 100 scale. Reconsider only if A1 is later validated against its triggers **and** a fleet of production B2 flowgroups already exists — at that point Option C becomes "add A1 as an opt-in to a proven B2 baseline," which is a different project shape with better-understood constraints.
 
 ### Decision criteria matrix
 
-| Criterion | Option A | Option B | Option C |
+Reframed to reflect the B2-adopt decision. Rows are informational; no live tradeoff to resolve.
+
+| Criterion | Option A1 (deferred) | Option B2 (adopted) | Option C (not adopted) |
 |-----------|----------|----------|----------|
-| LHP team capacity | Need 3 sprints + SDP expertise | Need 1.5 sprints | Need 4 sprints + carry two paths |
-| Target N per flowgroup | 100+ favors A | 10–100 favors B | Any |
-| Operator familiarity with SDP | Required | Not required | Required for A-mode flowgroups |
-| Migration from existing LHP templates | Full rewrite of execution layer | Extension of existing | Extension + additive SDP layer |
-| Cost sensitivity (per-run DBU) | A best at large N | B best at small N | Optimize per-flowgroup |
+| Status | Deferred pending 3 triggers | Ships as default after Tier 2 | Not adopted |
+| Team capacity needed | 3 sprints + SDP expertise | 1.5 sprints post-Tier-2 | 4 sprints (A1 + B2 dual) |
+| Target N per flowgroup | 100+ favourable | 1–300 (codegen-capped) | Any |
+| Operator familiarity with SDP | Required | Not required | Required for A1 slice |
+| Migration from existing LHP templates | Full rewrite of execution layer | Extension via `execution_mode: for_each` + two new task templates | Extension + additive SDP layer |
+| Cost sensitivity (per-run DBU) | Wins at N ≥ 100 on warm cluster | Within budget at N ≤ 100 | Optimise per-flowgroup |
 | Debug surface complexity tolerance | Accepts 2-surface debugging | Prefers single pane | Accepts mixed |
-| SDP streaming-table uncertainty | Hard-bet on MV path | No SDP dependency | Hedges: B today, A later |
+| SDP streaming-table-over-foreign-catalog dependency | Hard dependency when revisited | No SDP dependency | Hedges |
 | Future-proofing vs Databricks direction | Aligned (Lakeflow declarative) | Neutral | Hedges |
 
-### What to decide
+### What to decide (resolved)
 
-1. **LHP integration path:** A, B, or C.
-2. **Rollout phasing:** which existing flowgroups migrate first, on what timeline.
-3. **Deprecation policy for `load/jdbc_watermark_job.py.j2`:** kept as fallback (backward-compat), retired after migration, or replaced in-place.
+1. **LHP integration path:** B2 (adopted). A1 deferred; C not adopted.
+2. **Rollout phasing:** per-flowgroup adoption. New jdbc_watermark_v2 flowgroups default to `execution_mode: for_each` post-Tier-2. Existing static-emission flowgroups migrate on demand, not as a fleet push.
+3. **Deprecation policy for the existing static emission path:** kept as fallback indefinitely. `execution_mode` defaults to static when absent so legacy flowgroups remain byte-for-byte unchanged.
 
 ---
 
 ## Concrete Next Actions
 
-Path-independent items and per-path carry-overs. Owners placeholder; assign per team structure. Status shown for completed items.
-
 ### Completed (2026-04-24)
 
 1. **Tier 1 HWM isolation fix** — DONE (commit `63bcfdb`, quick task `260424-dwc`).
-   Added `source_system_id` parameter to `get_current_hwm` in both spike `prepare_manifest.py` copies; filter binds the value via `spark.sql args=`. V1 probe proved the filter excludes a synthetic poisoning row from a different `source_system_id`. No DDL required. Plan at `docs/planning/tier-1-hwm-fix.md`.
+   Added `source_system_id` parameter to `get_current_hwm` in both spike `prepare_manifest.py` copies; filter binds the value via `spark.sql args=`. V1 probe proved the filter excludes a synthetic poisoning row. Plan at `docs/planning/tier-1-hwm-fix.md`.
 
-### Path-independent (do before committing to A/B/C)
+2. **Comparison doc reframe to B2-adopt / A1-deferred** — DONE (this revision).
 
-2. **Document A1 SDP-MV findings + Tier 1 decision in ADR** (Owner: `@tech-lead`, Effort: 2h)
-   Capture: SDP MVs over foreign catalogs work for batch watermark ingestion when Tier 1 is applied; the first A1 run failed due to HWM poisoning across a shared registry, not an SDP framework defect; Tier 1 closed the hazard via query-level filter; Tier 2/3 remain available if future multi-tenancy requires stronger isolation. ADR is the decision's load-bearing rationale and guards against re-litigating the "A1 is broken" conclusion.
+3. **B2 design spec** — DONE (`docs/planning/b2-watermark-scale-out-design.md`).
 
-### Path A carry-overs (only if Option A or C selected)
+4. **Tier 2 migration plan** — DONE (`docs/planning/tier-2-hwm-load-group-fix.md`).
 
-3. **Fix `^v[a-z]` view-regex over-filter** (Owner: `@eng`, Effort: 1h)
-   Replace regex in `spikes/jdbc-sdp-a1/tasks/fixtures_discovery.py` with explicit view-name allowlist. Restores the 7 AW tables (`vendor`, `unitmeasure`, etc.) to A1's working set.
+### B2 prerequisite (do before B2 integration commit)
 
-4. **Parallelise `fixtures_discovery` schema queries** (Owner: `@eng`, Effort: 2h)
-   Current 5 sequential `SHOW TABLES` calls dominate wall clock (1,401 s). Thread-pool over schemas drops this to <30 s. Also applies to B and C if their discovery reuses the same code.
+5. **Tier 2 `load_group` migration** (Owner: `@eng`, Effort: 1–2 days)
+   Add `load_group STRING` column to `watermarks`. Extend `WatermarkManager.insert_new / mark_* / get_latest_watermark / get_recoverable_landed_run` with `load_group: Optional[str] = None` kwarg. Backfill existing rows to `'legacy'`. Thread flowgroup name through to every manager call in `jdbc_watermark_job.py.j2`. V1/V2/V3 verification per `docs/planning/tier-2-hwm-load-group-fix.md`. **Blocks B2 integration commit.**
 
-5. **A1 N=100+ validation run** (Owner: `@tech-lead`, Effort: 1 sprint)
-   A1's per-flow cost advantage is material only at large N. Before committing Option A, run a 100-table scale test with Tier 1 applied to confirm the cost delta justifies A1's integration complexity.
+### B2 integration surface (once Tier 2 is in)
 
-### Path B carry-overs (only if Option B or C selected)
+6. **Extend `FlowGroup.workflow` schema** (Owner: `@eng`, Effort: 0.5 day) — accept `execution_mode: "for_each"` and `concurrency: int`.
 
-6. **`saveAsTable` idempotency fix** (Owner: `@eng`, Effort: 2h)
-   `spikes/jdbc-sdp-b/tasks/ingest_one.py`: check `tableExists`, branch `insertInto` vs `saveAsTable`. Resolves the `TABLE_OR_VIEW_ALREADY_EXISTS` failure surfaced on retry of a cancelled partial run.
+7. **Extend `LoadActionValidator._validate_jdbc_watermark_v2_source`** (Owner: `@eng`, Effort: 1 day) — when `execution_mode == "for_each"`: enforce shared `source_system_id`, shared landing root, shared `wm_catalog.wm_schema`, `len(actions) ≤ 300`, `1 ≤ concurrency ≤ 100`.
 
-7. **Batched `prepare_manifest` HWM lookup** (Owner: `@eng`, Effort: 4h)
-   Replace the 73-iteration Python loop with a single `SELECT schema_name, table_name, MAX(watermark_value) ... GROUP BY ...` query. Drops prepare_manifest from 403 s to <30 s. Also applies to A1's copy if it becomes the single source of truth for Option C.
+8. **Branch `workflow_resource.py` on `execution_mode`** (Owner: `@eng`, Effort: 1 day) — emit three-task topology when `for_each`; keep static emission otherwise.
+
+9. **New task templates** (Owner: `@eng`, Effort: 2 days) — `prepare_manifest.py.j2` (manifest MERGE + taskValue emit) and `validate.py.j2` (batch-scoped validate query).
+
+10. **Conditional header block in `jdbc_watermark_job.py.j2`** (Owner: `@eng`, Effort: 0.5 day) — unpack `taskValues` when present; fall through to static-render otherwise.
+
+11. **Plumb `load_group` and `execution_mode` through `generators/load/jdbc_watermark_job.py`** (Owner: `@eng`, Effort: 0.5 day).
+
+### Deferred A1 backlog (only if A1 triggers fire)
+
+12. **Fix `^v[a-z]` view-regex over-filter** — Replace regex in `spikes/jdbc-sdp-a1/tasks/fixtures_discovery.py` with explicit view-name allowlist.
+
+13. **Parallelise `fixtures_discovery` schema queries** — Thread-pool over schemas to drop 1,401 s → <30 s.
+
+14. **A1 N=100+ validation run** — A 100-table scale test with Tier 1+Tier 2 applied to measure whether A1's cost delta justifies the integration complexity.
 
 ### Cleanup
 
-8. **Drop retest backup tables after 7-day retention** (Owner: `@eng`, Effort: 15m, Schedule: 2026-05-01)
-   `devtest_edp_orchestration.jdbc_spike.{watermark_registry_bak,manifest_bak,hwm_ceiling_snapshot,source_row_counts}_retest_1777031969`. Retention window gives time for the final decision to land without losing the ability to rebuild the retest baseline.
+15. **Drop retest backup tables after 7-day retention** (Owner: `@eng`, Effort: 15m, Schedule: 2026-05-01)
+    `devtest_edp_orchestration.jdbc_spike.{watermark_registry_bak,manifest_bak,hwm_ceiling_snapshot,source_row_counts}_retest_1777031969`.
+
+---
+
+## A1-deferral trigger metric
+
+Revisit Option A1 only when all three hold:
+
+1. Production B2 flowgroups consistently exceed **0.5 wall-clock minutes per table** at N ≥ 100, measured over a 4-week window.
+2. Total B2 cold-start cost exceeds the team's established DBU/month baseline (placeholder pending baseline capture by the cost-tracking owner).
+3. SDP streaming-table over foreign-catalog incremental support is generally available (currently uncertain; resolved either by Databricks roadmap announcement or a targeted spike).
+
+Until all three trigger conditions are true, A1 stays deferred. The metric anchors the next reconsideration on observable evidence rather than memory.
 
 ---
 
 ## Open Questions Deferred
 
 - **SDP streaming tables + foreign catalog:** Can SDP streaming tables read from
-  `pg_supabase` (Lakehouse Federation) incrementally? If yes, A1's concurrency
-  advantage (single pipeline update, no per-table cold start) is fully recoverable
-  without the MV silent-trap risk. Requires a targeted spike.
+  `pg_supabase` (Lakehouse Federation) incrementally? Resolution blocks A1 trigger #3.
 
 - **`abandoned` row provenance (B):** Some manifest rows transition to `abandoned`
-  status without explicit notebook code. May be Databricks Jobs platform behavior
-  when a job run is cancelled mid-for_each. Needs investigation to confirm it does
-  not cause HWM double-advance or data duplication on rerun.
+  status without explicit notebook code. Likely Databricks Jobs platform behavior
+  when a job run is cancelled mid-for_each. B2's retry-aware validate (R5) handles
+  this without needing root-cause resolution; capture for future observability work.
 
-- **Concurrency ceiling at N=100+:** Both spikes tested up to N=63/61. B's for_each
-  approach may hit serverless quota limits at high concurrency. A1 avoids per-table
-  cold start but requires HWM isolation (Tier 1+) before production use.
+- **Concurrency ceiling at N ≥ 100:** B2 codegen caps `concurrency` at 100 (DAB hard limit) and `len(actions)` at 300 (taskValue size ceiling). Flowgroups beyond 300 actions need a split strategy; deferred until a real case surfaces.
 
-- **HIPAA hashing integration:** Neither spike exercised the devtest
-  SHA-256 salt+pepper column-masking path. Hashing must run inside the iteration
-  (ingest_one.py) before the `saveAsTable` write. Column detection uses Key Vault
-  secret scope; spike integration test needed.
+- **HIPAA hashing integration:** B2 defines the hook insertion point (between JDBC read and landing write, inside the try block, before `mark_landed`). Implementation is a separate phase; no code change ships in the B2 design doc.
 
-- **Incremental load correctness on static datasets:** AW ModifiedDate values are
+- **Incremental load correctness on static datasets:** AW `ModifiedDate` values are
   static (max 2014). Production watermark validation should use a live or synthetic
   source with advancing timestamps to test true incremental correctness. Both spikes
-  used AW solely for scale (N=63), not for incremental correctness.
+  used AW solely for scale (N ≈ 63), not for incremental correctness.
 
 ---
 
-## Appendix — HWM Poisoning as an Operational Hazard
+## Appendix — HWM Poisoning: Historical Context and Tiered Mitigations
 
-### What It Is
+This appendix is retained for historical continuity. Tier 1 is shipped; Tier 2 is scheduled as a B2 prerequisite (not the optional future mitigation the original draft described); Tier 3 remains deferred.
 
-Both spikes share a single `watermark_registry` table keyed on `(schema_name, table_name, source_system_id)`. If two source systems (or two pipelines against the same source system) share registry rows — either via identical `(schema_name, table_name)` or because `source_system_id` is not filtered in the HWM lookup — one pipeline's completed HWMs can be read as the starting point for another pipeline's first run. The second pipeline sees a HWM at the dataset ceiling and returns zero rows on every table, silently, with no error.
+### What it is
 
-In this spike, Spike B ran first against `pg_supabase` and advanced all AW HWMs. A1's `get_current_hwm` in `prepare_manifest.py` (lines 104–117) takes only `schema_name` + `table_name` + a status literal — it does not filter by `source_system_id`. B and A1 share the same AW schema+table namespace. B's rows were read as A1's starting HWMs. Result: A1 returned zero rows on a static dataset.
+Both spikes share a single `watermark_registry` table. If two pipelines share registry rows — either via identical `(schema_name, table_name)` across sources (Tier 1 hazard) or across flowgroups within the same source (Tier 2 hazard) — one pipeline's completed HWMs can be read as the starting point for another pipeline's first run. The second pipeline sees a HWM at the dataset ceiling and returns zero rows on every table, silently, with no error.
 
-This hazard exists in both spikes as currently written. It will recur whenever:
-- Two pipelines ingest from the same source schema+table combination.
-- A pipeline is re-run after another pipeline has already advanced the HWMs.
-- A registry is shared across dev/qa/prod environments without namespace isolation.
+In the original A1 spike run, Spike B ran first against `pg_supabase` and advanced all AW HWMs. A1's `get_current_hwm` took only `schema_name + table_name + status` — it did not filter by `source_system_id` (Tier 1 gap, since closed). Result: A1 returned zero rows on a static dataset.
 
-### Tiered Mitigations
+### Tiered mitigations
 
-**Tier 1 (code-only, no DDL) — Minimum adoption before LHP integration:**  
-Add `source_system_id` parameter to `get_current_hwm` in `prepare_manifest.py`. Pass the value from the manifest row's `source_catalog` column (already populated). The WHERE clause becomes:
+**Tier 1 (code-only, no DDL) — SHIPPED 2026-04-24 (commit `63bcfdb`).**
+Filter `get_current_hwm` by `source_system_id`. Closes cross-source poisoning (e.g., `pg_supabase` vs `freesql_catalog` sharing a schema+table name). Does **not** close same-source cross-flowgroup poisoning.
 
-```sql
-WHERE schema_name = :schema_name
-  AND table_name  = :table_name
-  AND source_system_id = :source_system_id
-  AND status = 'completed'
-ORDER BY updated_at DESC
-LIMIT 1
-```
+**Tier 2 (DDL + code) — B2 prerequisite; scheduled (`docs/planning/tier-2-hwm-load-group-fix.md`).**
+Add `load_group STRING` column to the watermarks table. `load_group` = LHP flowgroup field's value, verbatim. Extend `WatermarkManager` methods with `load_group: Optional[str] = None` kwarg (back-compat). Closes the hazard between different LHP flowgroups ingesting from the same source. **Must land before any B2 integration commit.**
 
-This closes the cross-federation hazard (e.g., `pg_supabase` vs `freesql_catalog` sharing the same schema+table name) with no DDL change. Effort: ~2h including tests.
+**Tier 3 (structural, heaviest) — deferred.**
+Per-integration registry tables (one Delta table per load group). Complete isolation with no filter-key coupling. Higher operational cost: DDL per new pipeline; no cross-pipeline HWM queries. Reconsider only if Tier 2's row-level isolation creates query-performance concerns at N ≥ 1000 flowgroups.
 
-**Tier 2 (DDL + code) — Recommended for multi-pipeline LHP deployments:**  
-Add a `load_group` column to `watermark_registry` (e.g., pipeline name or flowgroup identifier). Backfill from the manifest `run_id` prefix. Filter in `get_current_hwm` by `(source_system_id, load_group)`. Closes the hazard between different LHP pipelines ingesting from the same source system. Effort: ~1 day including migration script.
+### Backup retention note
 
-**Tier 3 (structural, heaviest) — For full isolation at large scale:**  
-Per-integration registry tables (one Delta table per load group, e.g., `watermark_registry_pg_supabase_pipeline_x`). Complete isolation with no filter-key coupling. Higher operational cost: DDL per new pipeline, no cross-pipeline HWM queries. Appropriate only if Tier 2's row-level isolation creates query-performance concerns at N=1000+.
-
-**Recommendation:** Apply Tier 1 as the minimum before either spike is promoted to LHP integration. Tier 2 before multi-pipeline production use.
-
-### Backup Retention Note
-
-The following scratch tables from retest `retest_1777031969` can be dropped 7 days after this document lands unchallenged. Retention is on the operator.
+The following scratch tables from retest `retest_1777031969` can be dropped 7 days after this document lands unchallenged (schedule: 2026-05-01).
 
 - `devtest_edp_orchestration.jdbc_spike.watermark_registry_bak_retest_1777031969`
 - `devtest_edp_orchestration.jdbc_spike.manifest_bak_retest_1777031969`
