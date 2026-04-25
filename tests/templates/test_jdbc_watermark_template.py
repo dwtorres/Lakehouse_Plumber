@@ -66,6 +66,7 @@ def _default_context(**overrides: Any) -> Dict[str, Any]:
         "jdbc_driver": "org.postgresql.Driver",
         "jdbc_table": '"Production"."Product"',
         "landing_path": "/Volumes/bronze_catalog/bronze/landing/product",
+        "load_group": "crm_bronze::load_product_jdbc",
     }
     ctx.update(overrides)
     return ctx
