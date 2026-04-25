@@ -277,3 +277,91 @@ def test_get_latest_rejects_adversarial_load_group() -> None:
         "validator must reject before any SQL was issued; "
         f"got {spark.statements}"
     )
+
+
+# ---------- Tier 2 four-cell parametrize matrix -----------------------------
+
+
+@pytest.mark.parametrize(
+    "load_group",
+    [None, "legacy", "pipe_a::fg_a", "pipe_a::fg_b"],
+)
+def test_get_latest_load_group_matrix_emits_three_way_filter(
+    load_group: Optional[str],
+) -> None:
+    """Across the full migration matrix (None, legacy backfill row, two
+    sibling B2 composites), the three-way ``load_group`` clause must
+    always render with both arms substituting the same SQL value.
+
+    The probe set below mixes all four values so a real Spark would
+    isolate per-cell rows; the mock asserts only on SQL composition,
+    which is the load-bearing contract for runtime isolation.
+    """
+    spark = _RecordingSpark(
+        rows=[
+            {
+                "run_id": f"job-{i}-task-1-attempt-1",
+                "watermark_value": f"2025-06-0{i}T12:00:00.000000+00:00",
+                "watermark_time": f"2025-06-0{i}T12:00:00.000000+00:00",
+                "row_count": 100,
+                "status": "completed",
+                "bronze_stage_complete": True,
+                "silver_stage_complete": True,
+            }
+            for i in range(1, 5)
+        ]
+    )
+    wm = _make_wm(spark)
+    wm.get_latest_watermark(**_kwargs(load_group=load_group))
+    sql = spark.statements[-1]
+
+    expected_literal = "NULL" if load_group is None else f"'{load_group}'"
+    pattern = re.compile(
+        r"AND\s*\(\s*load_group\s*=\s*"
+        + re.escape(expected_literal)
+        + r"\s+OR\s+\(\s*"
+        + re.escape(expected_literal)
+        + r"\s+IS\s+NULL\s+AND\s+load_group\s+IS\s+NULL\s*\)\s*\)",
+        re.IGNORECASE,
+    )
+    assert pattern.search(sql), (
+        f"load_group={load_group!r} must emit three-way clause with "
+        f"{expected_literal} substituted in both arms; SQL: {sql}"
+    )
+    # For non-None composites, the literal must appear exactly twice in
+    # the load_group clause (left arm + right-arm IS NULL test). Skip for
+    # ``None`` because the substitution is bare ``NULL`` which collides
+    # with the SQL ``IS NULL`` keyword and inflates the count.
+    if load_group is not None:
+        lg_clause = pattern.search(sql)
+        assert lg_clause is not None
+        assert lg_clause.group(0).count(expected_literal) == 2, (
+            f"three-way filter must substitute {expected_literal} in both "
+            f"arms; got: {lg_clause.group(0)}"
+        )
+
+
+@pytest.mark.parametrize(
+    "load_group",
+    [None, "legacy", "pipe_a::fg_a", "pipe_a::fg_b"],
+)
+def test_get_latest_load_group_matrix_preserves_tier1_isolation(
+    load_group: Optional[str],
+) -> None:
+    """Tier 1 cross-source isolation must remain intact across every
+    Tier 2 ``load_group`` cell — the SQL still filters by
+    ``source_system_id``, ``schema_name``, ``table_name``, and
+    ``status='completed'`` regardless of the new axis.
+    """
+    spark = _RecordingSpark(rows=[])
+    wm = _make_wm(spark)
+    wm.get_latest_watermark(**_kwargs(load_group=load_group))
+    sql = spark.statements[-1]
+
+    # Tier 1 invariants: cross-source / cross-schema / cross-table isolation.
+    assert "'postgres_prod'" in sql, f"missing source_system_id literal; SQL: {sql}"
+    assert "'Production'" in sql, f"missing schema_name literal; SQL: {sql}"
+    assert "'Product'" in sql, f"missing table_name literal; SQL: {sql}"
+    assert re.search(
+        r"\bstatus\s*=\s*'completed'", sql, re.IGNORECASE
+    ), f"missing status guard; SQL: {sql}"

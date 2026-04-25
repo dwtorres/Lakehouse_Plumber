@@ -271,3 +271,42 @@ def test_mark_failed_rejects_adversarial_load_group() -> None:
             load_group="bad\x00value",
         )
     assert spark.statements == []
+
+
+# ---------- Tier 2 four-cell parametrize matrix -----------------------------
+
+
+@pytest.mark.parametrize(
+    "load_group",
+    [None, "legacy", "pipe_a::fg_a", "pipe_a::fg_b"],
+)
+def test_mark_failed_load_group_matrix_is_store_only(
+    load_group: Optional[str],
+) -> None:
+    """Across the full migration matrix, ``mark_failed`` keeps its UPDATE
+    WHERE shape (``run_id`` + non-terminal-success guard) regardless of
+    the ``load_group`` value. R3 store-only contract.
+    """
+    spark = _ScriptedSpark(script=[1])
+    wm = _make_wm(spark)
+
+    wm.mark_failed(
+        run_id="job-1-task-2-attempt-3",
+        error_class="IOError",
+        error_message="boom",
+        load_group=load_group,
+    )
+
+    update = next(s for s in spark.statements if "UPDATE" in s.upper())
+    assert "load_group" not in update.lower(), (
+        f"mark_failed UPDATE must not reference load_group "
+        f"(store-only kwarg) for load_group={load_group!r}; SQL: {update}"
+    )
+    # Non-terminal-success guard preserved across every cell.
+    pattern = re.compile(
+        r"status\s+IN\s*\(\s*'running'\s*,\s*'failed'\s*,\s*'timed_out'\s*\)",
+        re.IGNORECASE,
+    )
+    assert pattern.search(update), (
+        f"non-terminal-success guard must be preserved; SQL: {update}"
+    )

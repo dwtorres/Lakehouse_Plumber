@@ -207,6 +207,66 @@ class TestJDBCWatermarkV2Integration:
             "load_group=load_group" in block
         ), f"get_latest_watermark must thread load_group=load_group; got block:\n{block}"
 
+    @classmethod
+    def _assert_load_group_threaded(
+        cls, content: str, call_prefixes: tuple
+    ) -> None:
+        """Assert every ``wm.<method>(...)`` call in ``call_prefixes`` passes
+        ``load_group=load_group``.
+
+        Centralizes the per-call assertion so a regression in any single
+        ``WatermarkManager`` call site fails on this one test rather than
+        only on whichever focused test happens to cover that method.
+        Mirrors the four-cell parametrize matrix in
+        ``tests/lhp_watermark/`` by exercising all manager call sites the
+        generated notebook should thread ``load_group`` through.
+        """
+        missing: list = []
+        for prefix in call_prefixes:
+            block = cls._extract_call_block(content, prefix)
+            if "load_group=load_group" not in block:
+                missing.append((prefix, block))
+        assert not missing, (
+            "Generated notebook must thread load_group=load_group to every "
+            f"WatermarkManager call site. Missing kwarg in: "
+            + "; ".join(p for p, _ in missing)
+            + "\nFirst missing block:\n"
+            + (missing[0][1] if missing else "")
+        )
+
+    def test_extraction_notebook_threads_load_group_to_all_wm_calls(self, v2_project):
+        """Composite ``load_group`` must be threaded to every
+        ``WatermarkManager`` call site emitted by the JDBC template:
+        read-side (``get_latest_watermark``, ``get_recoverable_landed_run``),
+        write-side (``insert_new``, ``mark_landed``), and any state-machine
+        completion (``mark_complete``) the template renders.
+
+        Consolidates the U3-era per-method assertions (insert_new +
+        get_latest_watermark) into a single matrix-style assertion so a
+        regression in any one site surfaces here rather than depending on
+        which focused test happens to cover it.
+        """
+        _, output_dir = self._generate(v2_project)
+        notebook = (
+            output_dir / "crm_bronze_extract" / "__lhp_extract_load_product_jdbc.py"
+        )
+        content = notebook.read_text()
+        # Discover which wm.<method>(...) call sites the template renders;
+        # run the threaded-kwarg assertion against each present site.
+        candidate_prefixes = (
+            "wm.insert_new(",
+            "wm.get_latest_watermark(",
+            "wm.get_recoverable_landed_run(",
+            "wm.mark_landed(",
+            "wm.mark_complete(",
+        )
+        present = tuple(p for p in candidate_prefixes if p in content)
+        assert present, (
+            "Expected the JDBC extraction notebook to call at least one "
+            f"WatermarkManager method; none of {candidate_prefixes} found"
+        )
+        self._assert_load_group_threaded(content, present)
+
     def test_extraction_notebook_has_jdbc_read(self, v2_project):
         _, output_dir = self._generate(v2_project)
         notebook = (

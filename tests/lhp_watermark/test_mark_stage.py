@@ -174,20 +174,34 @@ def test_method_rejects_invalid_run_id_before_any_sql(method_name: str) -> None:
 @pytest.mark.parametrize(
     "method_name", ["mark_bronze_complete", "mark_silver_complete"]
 )
+@pytest.mark.parametrize(
+    "load_group",
+    [None, "legacy", "pipe_a::fg_a", "pipe_a::fg_b"],
+)
 def test_method_accepts_load_group_kwarg_without_changing_where(
     method_name: str,
+    load_group: Optional[str],
 ) -> None:
-    """Tier 2 (R3): ``load_group`` is store-only on the stage UPDATE.
-    Filter remains by ``run_id`` + terminal-failure guard only."""
+    """Tier 2 (R3): ``load_group`` is store-only on stage UPDATEs across
+    every cell of the migration matrix. Filter remains by ``run_id`` +
+    terminal-failure guard only — adding a ``load_group`` predicate here
+    would silently fail recovery when the row's stored ``load_group``
+    differs from the caller's (e.g. legacy NULL row, B2-rewritten run).
+    """
     spark = _ScriptedSpark(script=[1])
     wm = _make_wm(spark)
     getattr(wm, method_name)(
-        run_id="job-1-task-2-attempt-3", load_group="pipe_a::fg_a"
+        run_id="job-1-task-2-attempt-3", load_group=load_group
     )
     update = next(s for s in spark.statements if "UPDATE" in s.upper())
     assert "load_group" not in update.lower(), (
         f"{method_name} UPDATE must not reference load_group "
-        f"(store-only kwarg); SQL: {update}"
+        f"(store-only kwarg) for load_group={load_group!r}; SQL: {update}"
+    )
+    # Terminal-failure guard preserved across every cell.
+    assert _GUARD_PATTERN.search(update), (
+        f"{method_name}: terminal-failure guard must be preserved "
+        f"for load_group={load_group!r}; SQL: {update}"
     )
 
 
