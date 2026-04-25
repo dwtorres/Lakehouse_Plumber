@@ -142,6 +142,71 @@ class TestJDBCWatermarkV2Integration:
         assert "watermark_column_name=" in content  # required kwarg
         assert '"ModifiedDate"' in content  # WHERE clause quotes column for JDBC
 
+    # ------------------------------------------------------------------
+    # Tier 2 (U3): load_group composite threaded into the extraction notebook
+    # ------------------------------------------------------------------
+
+    def test_extraction_notebook_has_load_group_literal(self, v2_project):
+        """Generator emits ``load_group = "{pipeline}::{flowgroup}"`` at module
+        scope so every ``wm.<method>(...)`` call inside the notebook can pass
+        ``load_group=load_group``."""
+        _, output_dir = self._generate(v2_project)
+        notebook = (
+            output_dir / "crm_bronze_extract" / "__lhp_extract_load_product_jdbc.py"
+        )
+        content = notebook.read_text()
+        assert (
+            'load_group = "crm_bronze::product_ingestion"' in content
+        ), "Expected composite load_group literal at module scope"
+
+    @staticmethod
+    def _extract_call_block(content: str, call_prefix: str) -> str:
+        """Return the substring spanning ``call_prefix( ... )`` with correctly
+        balanced parentheses (so nested ``str(hwm_value)`` etc. don't fool a
+        naive ``content.find(")", idx)``).
+        """
+        idx = content.find(call_prefix)
+        assert idx >= 0, f"{call_prefix} not found in generated notebook"
+        # Walk forward from the opening '(' tracking depth.
+        depth = 0
+        start_paren = content.find("(", idx)
+        assert start_paren > idx
+        i = start_paren
+        while i < len(content):
+            ch = content[i]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return content[idx : i + 1]
+            i += 1
+        raise AssertionError(f"unterminated call block for {call_prefix}")
+
+    def test_extraction_notebook_threads_load_group_to_insert_new(self, v2_project):
+        """``wm.insert_new(...)`` must pass ``load_group=load_group``."""
+        _, output_dir = self._generate(v2_project)
+        notebook = (
+            output_dir / "crm_bronze_extract" / "__lhp_extract_load_product_jdbc.py"
+        )
+        content = notebook.read_text()
+        block = self._extract_call_block(content, "wm.insert_new(")
+        assert (
+            "load_group=load_group" in block
+        ), f"insert_new must thread load_group=load_group; got block:\n{block}"
+
+    def test_extraction_notebook_threads_load_group_to_get_latest(self, v2_project):
+        """``wm.get_latest_watermark(...)`` must pass ``load_group=load_group``."""
+        _, output_dir = self._generate(v2_project)
+        notebook = (
+            output_dir / "crm_bronze_extract" / "__lhp_extract_load_product_jdbc.py"
+        )
+        content = notebook.read_text()
+        block = self._extract_call_block(content, "wm.get_latest_watermark(")
+        assert (
+            "load_group=load_group" in block
+        ), f"get_latest_watermark must thread load_group=load_group; got block:\n{block}"
+
     def test_extraction_notebook_has_jdbc_read(self, v2_project):
         _, output_dir = self._generate(v2_project)
         notebook = (
