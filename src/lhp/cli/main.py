@@ -461,6 +461,60 @@ def sync_runtime(dest, check):
     SyncRuntimeCommand().execute(dest=dest, check=check)
 
 
+@cli.command("seed-load-group")
+@click.option(
+    "--env",
+    "-e",
+    required=True,
+    help="Environment name (must have a corresponding substitutions/<env>.yaml).",
+)
+@click.option(
+    "--flowgroup",
+    "-f",
+    required=True,
+    help="Path to the flowgroup YAML to seed (relative or absolute). "
+    "Falls back to a recursive name-match under pipelines/.",
+)
+@click.option(
+    "--apply",
+    is_flag=True,
+    default=False,
+    help="Execute the INSERTs via the Databricks SQL Statement Execution "
+    "API (requires databricks-sdk). Default is dry-run (SQL printed only).",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=True,
+    help="Print SQL to stdout without executing (default).",
+)
+@click.option(
+    "--catalog",
+    default=None,
+    help="Override watermark registry catalog (default: ${watermark_catalog} "
+    "from substitutions, falling back to 'metadata' per ADR-004).",
+)
+@click.option(
+    "--schema",
+    default=None,
+    help="Override watermark registry schema (default: ${watermark_schema} "
+    "from substitutions, falling back to '<env>_orchestration').",
+)
+@cli_error_boundary("Seed load_group SQL")
+def seed_load_group(env, flowgroup, apply, dry_run, catalog, schema):
+    """Emit Step 4a SELECT-preview + INSERT-seed SQL for a Tier 2 flowgroup migration."""
+    from .commands.seed_load_group_command import SeedLoadGroupCommand
+
+    SeedLoadGroupCommand().execute(
+        env=env,
+        flowgroup=flowgroup,
+        apply=apply,
+        dry_run=dry_run,
+        catalog=catalog,
+        schema=schema,
+    )
+
+
 # ============================================================================
 # Entry Point
 # ============================================================================
