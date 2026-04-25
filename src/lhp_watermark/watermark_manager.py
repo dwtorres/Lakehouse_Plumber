@@ -152,11 +152,32 @@ class WatermarkManager:
         """
         self.spark.conf.set("spark.sql.session.timeZone", "UTC")
 
+    # Tier 2 target shape for the watermarks Delta table (R1, R2):
+    #   - column ``load_group STRING`` (nullable; back-compat for legacy callers)
+    #   - liquid clustering on (source_system_id, load_group, schema_name, table_name)
+    # _TARGET_CLUSTERING is the ordered list against which DESCRIBE DETAIL output
+    # is compared on every init; mismatch triggers a single ALTER … CLUSTER BY.
+    _TARGET_CLUSTERING = (
+        "source_system_id",
+        "load_group",
+        "schema_name",
+        "table_name",
+    )
+
     def _ensure_table_exists(self) -> None:
         """
-        Ensure watermarks table exists with proper schema.
+        Ensure watermarks table exists with the Tier 2 schema + clustering.
 
-        Creates the Delta table with liquid clustering if it does not exist.
+        - Brand-new tables: ``CREATE TABLE`` with ``load_group STRING`` and
+          liquid clustering on ``(source_system_id, load_group, schema_name,
+          table_name)`` (R1, R2).
+        - Pre-existing tables: probe column list via ``DESCRIBE TABLE`` and
+          add ``load_group`` only if missing; probe clustering via
+          ``DESCRIBE DETAIL`` and re-cluster only if the current key
+          differs from the target. Both probes short-circuit when the
+          target shape is already in place — zero ALTER SQL on subsequent
+          inits (idempotent, no metadata churn).
+
         Unity Catalog DDL only.
         """
         self._ensure_utc_session()
@@ -189,10 +210,11 @@ class WatermarkManager:
                     error_message STRING,
                     created_at TIMESTAMP NOT NULL,
                     completed_at TIMESTAMP,
+                    load_group STRING,
                     CONSTRAINT pk_watermarks PRIMARY KEY (run_id)
                 )
                 USING DELTA
-                CLUSTER BY (source_system_id, schema_name, table_name)
+                CLUSTER BY (source_system_id, load_group, schema_name, table_name)
                 TBLPROPERTIES (
                     'delta.enableChangeDataFeed' = 'true',
                     'delta.autoOptimize.optimizeWrite' = 'true',
@@ -203,6 +225,97 @@ class WatermarkManager:
 
             duration_ms = (time.time() - start_time) * 1000
             logger.info("Watermarks table created successfully (%.1f ms)", duration_ms)
+            return
+
+        # Pre-existing table path: conditional ALTERs gated on probes.
+        if not self._has_load_group_column():
+            self._add_load_group_column()
+
+        if not self._clustering_matches_target():
+            self._alter_clustering_to_target()
+
+        duration_ms = (time.time() - start_time) * 1000
+        logger.debug(
+            "Watermarks table existence/shape check complete (%.1f ms)",
+            duration_ms,
+        )
+
+    def _has_load_group_column(self) -> bool:
+        """Probe column list via ``DESCRIBE TABLE``; return True if ``load_group`` present.
+
+        ``DESCRIBE TABLE`` returns one row per column with a ``col_name``
+        field; partition-info trailing rows have empty/sentinel names which
+        the membership check tolerates.
+        """
+        rows = self.spark.sql(f"DESCRIBE TABLE {self.table_name}").collect()
+        for row in rows:
+            try:
+                col_name = row["col_name"]
+            except (KeyError, IndexError, TypeError):
+                continue
+            if col_name == "load_group":
+                return True
+        return False
+
+    def _clustering_matches_target(self) -> bool:
+        """Probe Delta clustering via ``DESCRIBE DETAIL``; True iff matches target.
+
+        Target order is ``_TARGET_CLUSTERING``. Any mismatch — different
+        columns, different order, or absence of clustering — returns False
+        and triggers a re-cluster.
+        """
+        rows = self.spark.sql(f"DESCRIBE DETAIL {self.table_name}").collect()
+        if not rows:
+            return False
+        first = rows[0]
+        try:
+            current = first["clusteringColumns"]
+        except (KeyError, IndexError, TypeError):
+            return False
+        if current is None:
+            return False
+        return tuple(current) == self._TARGET_CLUSTERING
+
+    def _add_load_group_column(self) -> None:
+        """Emit ``ALTER TABLE … ADD COLUMNS (load_group STRING)``; surface concurrency errors typed."""
+        logger.info(
+            "Adding load_group column to watermarks table: %s", self.table_name
+        )
+        sql = f"ALTER TABLE {self.table_name} ADD COLUMNS (load_group STRING)"
+        try:
+            self.spark.sql(sql)
+        except BaseException as exc:  # noqa: BLE001 — typed surface below
+            logger.error(
+                "ALTER TABLE ADD COLUMNS failed on %s: %s", self.table_name, exc
+            )
+            if _is_concurrent_commit_exception(exc):
+                raise WatermarkConcurrencyError(
+                    run_id=f"ddl:{self.table_name}",
+                    attempts=1,
+                ) from exc
+            raise
+
+    def _alter_clustering_to_target(self) -> None:
+        """Emit ``ALTER TABLE … CLUSTER BY (...)``; surface concurrency errors typed."""
+        target = ", ".join(self._TARGET_CLUSTERING)
+        logger.info(
+            "Switching clustering on watermarks table %s to (%s)",
+            self.table_name,
+            target,
+        )
+        sql = f"ALTER TABLE {self.table_name} CLUSTER BY ({target})"
+        try:
+            self.spark.sql(sql)
+        except BaseException as exc:  # noqa: BLE001 — typed surface below
+            logger.error(
+                "ALTER TABLE CLUSTER BY failed on %s: %s", self.table_name, exc
+            )
+            if _is_concurrent_commit_exception(exc):
+                raise WatermarkConcurrencyError(
+                    run_id=f"ddl:{self.table_name}",
+                    attempts=1,
+                ) from exc
+            raise
 
     def get_latest_watermark(
         self,
