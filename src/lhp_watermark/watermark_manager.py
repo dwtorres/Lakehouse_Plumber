@@ -78,6 +78,41 @@ def _render_watermark_literal(value: Optional[Union[str, int, Decimal]]) -> str:
     return sql_numeric_literal(value)
 
 
+def _render_load_group_literal(load_group: Optional[str]) -> str:
+    """Render a ``load_group`` value as a SQL literal or ``NULL``.
+
+    ``load_group`` is data-shaped (e.g. ``'pipe_a::fg_a'``) — validate via
+    ``SQLInputValidator.string`` (the identifier validator rejects ``::``).
+    ``None`` becomes SQL ``NULL`` so legacy callers and pre-Tier-2 rows
+    keep matching the right arm of the three-way filter.
+    """
+    if load_group is None:
+        return "NULL"
+    SQLInputValidator.string(load_group)
+    return sql_literal(load_group)
+
+
+def _compose_load_group_clause(load_group: Optional[str]) -> str:
+    """Compose the three-way ``load_group`` WHERE arm (R4).
+
+    Always emits both arms so legacy callers (``load_group=None``) and B2
+    callers (explicit composite) coexist during migration. Runtime collapses
+    based on ``load_group``:
+
+    - ``load_group is None`` → both literal substitutions are SQL ``NULL``,
+      the left arm evaluates to ``NULL = NULL`` (false in three-valued
+      logic), the right arm collapses to ``IS NULL`` and matches legacy +
+      pre-Tier-2 NULL-load_group rows.
+    - ``load_group`` is a composite (e.g. ``'pipe_a::fg_a'``) → left arm
+      matches the row's ``load_group``; right arm degenerates to false.
+
+    Composes through ``sql_literal`` (never f-string concatenation of user
+    data); ``load_group`` is validated by ``_render_load_group_literal``.
+    """
+    lg_sql = _render_load_group_literal(load_group)
+    return f"AND ( load_group = {lg_sql} OR ({lg_sql} IS NULL AND load_group IS NULL) )"
+
+
 class WatermarkManager:
     """
     Manages watermarks for incremental data ingestion.
@@ -322,6 +357,7 @@ class WatermarkManager:
         source_system_id: str,
         schema_name: str,
         table_name: str,
+        load_group: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Return the most recent terminal-success watermark, or ``None``.
@@ -340,6 +376,11 @@ class WatermarkManager:
             source_system_id: Source system identifier.
             schema_name: Schema name.
             table_name: Table name.
+            load_group: Optional Tier 2 axis value
+                (e.g. ``f"{{pipeline}}::{{flowgroup}}"``). ``None`` (default,
+                legacy callers) matches NULL-load_group rows via the right
+                arm of the three-way filter. Non-None matches only rows
+                with that exact ``load_group`` value (R3, R4).
 
         Returns:
             Dict with watermark details or ``None``.
@@ -356,6 +397,8 @@ class WatermarkManager:
         SQLInputValidator.identifier(schema_name)
         SQLInputValidator.identifier(table_name)
 
+        load_group_clause = _compose_load_group_clause(load_group)
+
         query = f"""
             SELECT
                 run_id,
@@ -370,6 +413,7 @@ class WatermarkManager:
               AND schema_name = {sql_literal(schema_name)}
               AND table_name = {sql_literal(table_name)}
               AND status = 'completed'
+              {load_group_clause}
             ORDER BY watermark_time DESC, run_id DESC
             LIMIT 1
         """
@@ -414,18 +458,30 @@ class WatermarkManager:
         source_system_id: str,
         schema_name: str,
         table_name: str,
+        load_group: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Return the latest landed-but-not-finalized run for a table key.
 
         This is the recovery hook for jdbc_watermark_v2 extraction notebooks.
         If a durable landed batch exists but finalization failed, the next run
         can finalize it before opening JDBC again.
+
+        Args:
+            source_system_id: Source system identifier.
+            schema_name: Schema name.
+            table_name: Table name.
+            load_group: Optional Tier 2 axis value. Three-way filter
+                semantics match ``get_latest_watermark`` (R3, R4): ``None``
+                matches NULL-load_group rows; non-None matches only the
+                exact composite.
         """
         self._ensure_utc_session()
 
         SQLInputValidator.identifier(source_system_id)
         SQLInputValidator.identifier(schema_name)
         SQLInputValidator.identifier(table_name)
+
+        load_group_clause = _compose_load_group_clause(load_group)
 
         query = f"""
             SELECT
@@ -439,6 +495,7 @@ class WatermarkManager:
               AND schema_name = {sql_literal(schema_name)}
               AND table_name = {sql_literal(table_name)}
               AND status = 'landed_not_committed'
+              {load_group_clause}
             ORDER BY created_at DESC, run_id DESC
             LIMIT 1
         """
@@ -474,6 +531,7 @@ class WatermarkManager:
         row_count: int = 0,
         extraction_type: str = "incremental",
         previous_watermark_value: Optional[Union[str, int, Decimal]] = None,
+        load_group: Optional[str] = None,
     ) -> None:
         """
         Atomically insert a new watermark row in ``status='running'``.
@@ -502,6 +560,12 @@ class WatermarkManager:
             row_count: Number of rows processed.
             extraction_type: One of 'incremental', 'full', 'snapshot', 'merge'.
             previous_watermark_value: Previous watermark value for reference.
+            load_group: Optional Tier 2 axis value
+                (e.g. ``f"{{pipeline}}::{{flowgroup}}"``). ``None`` (legacy
+                callers) writes SQL ``NULL`` into the row. Non-None values
+                are validated via ``SQLInputValidator.string`` and persisted
+                so subsequent reads filtered by the same ``load_group``
+                isolate this run from cross-flowgroup collisions (R3).
 
         Raises:
             WatermarkValidationError: An input failed type/format validation.
@@ -526,6 +590,7 @@ class WatermarkManager:
         wm_col_sql = (
             sql_literal(watermark_column_name) if watermark_column_name else "NULL"
         )
+        load_group_sql = _render_load_group_literal(load_group)
         ts_literal = sql_timestamp_literal(datetime.now(tz=timezone.utc))
 
         merge_sql = f"""
@@ -545,7 +610,8 @@ class WatermarkManager:
                     false AS bronze_stage_complete,
                     false AS silver_stage_complete,
                     'running' AS status,
-                    {ts_literal} AS created_at
+                    {ts_literal} AS created_at,
+                    {load_group_sql} AS load_group
             ) AS s
             ON t.run_id = s.run_id
             WHEN NOT MATCHED THEN INSERT (
@@ -553,14 +619,14 @@ class WatermarkManager:
                 table_name, watermark_column_name, watermark_value,
                 previous_watermark_value, row_count, extraction_type,
                 bronze_stage_complete, silver_stage_complete, status,
-                created_at
+                created_at, load_group
             )
             VALUES (
                 s.run_id, s.watermark_time, s.source_system_id, s.schema_name,
                 s.table_name, s.watermark_column_name, s.watermark_value,
                 s.previous_watermark_value, s.row_count, s.extraction_type,
                 s.bronze_stage_complete, s.silver_stage_complete, s.status,
-                s.created_at
+                s.created_at, s.load_group
             )
         """
 
@@ -621,6 +687,7 @@ class WatermarkManager:
         run_id: str,
         error_class: str,
         error_message: str,
+        load_group: Optional[str] = None,
     ) -> None:
         """
         Transition a run to ``status='failed'`` with truncated error fields.
@@ -636,6 +703,12 @@ class WatermarkManager:
             error_class: Exception class name (e.g. ``type(e).__name__``);
                 stored verbatim, length-validated.
             error_message: Error description; truncated at 4096 characters.
+            load_group: Tier 2 axis value (R3). Store-only here — the
+                UPDATE filters by ``run_id`` exclusively, so the kwarg
+                neither alters the WHERE shape nor the SET clause; it is
+                accepted to keep call-site signatures uniform across the
+                state machine. Validated when non-None so a malformed
+                value raises before any SQL is emitted.
 
         Raises:
             WatermarkValidationError: Inputs failed validation.
@@ -646,6 +719,8 @@ class WatermarkManager:
 
         SQLInputValidator.uuid_or_job_run_id(run_id)
         SQLInputValidator.string(error_class, max_len=512)
+        if load_group is not None:
+            SQLInputValidator.string(load_group)
         # error_message can legitimately contain quotes and longer text; the
         # 4096-char cap (FR-L-02) is the only validation. Normalise control
         # chars defensively by replacing them with spaces so the validator
@@ -689,13 +764,24 @@ class WatermarkManager:
         run_id: str,
         watermark_value: Union[str, int, Decimal],
         row_count: int,
+        load_group: Optional[str] = None,
     ) -> None:
-        """Persist that files were durably landed but not yet finalized."""
+        """Persist that files were durably landed but not yet finalized.
+
+        Args:
+            run_id: Run identifier.
+            watermark_value: Final watermark value from the landed batch.
+            row_count: Number of rows landed.
+            load_group: Tier 2 axis value (R3). Store-only — the UPDATE
+                filters by ``run_id`` exclusively. Validated when non-None.
+        """
         self._ensure_utc_session()
         start_time = time.time()
 
         SQLInputValidator.uuid_or_job_run_id(run_id)
         SQLInputValidator.numeric(row_count)
+        if load_group is not None:
+            SQLInputValidator.string(load_group)
 
         wm_val_sql = _render_watermark_literal(watermark_value)
         run_id_lit = sql_literal(run_id)
@@ -723,7 +809,11 @@ class WatermarkManager:
             duration_ms,
         )
 
-    def mark_bronze_complete(self, run_id: str) -> None:
+    def mark_bronze_complete(
+        self,
+        run_id: str,
+        load_group: Optional[str] = None,
+    ) -> None:
         """
         Mark bronze stage complete; auto-promote status if silver is already done.
 
@@ -734,6 +824,9 @@ class WatermarkManager:
 
         Args:
             run_id: Run identifier.
+            load_group: Tier 2 axis value (R3). Store-only — propagated to
+                ``_stage_complete``; the UPDATE filters by ``run_id``
+                exclusively.
 
         Raises:
             WatermarkValidationError: ``run_id`` failed validation.
@@ -744,9 +837,14 @@ class WatermarkManager:
             stage_flag="bronze_stage_complete",
             other_flag="silver_stage_complete",
             log_msg="Bronze stage marked complete",
+            load_group=load_group,
         )
 
-    def mark_silver_complete(self, run_id: str) -> None:
+    def mark_silver_complete(
+        self,
+        run_id: str,
+        load_group: Optional[str] = None,
+    ) -> None:
         """
         Mark silver stage complete; auto-promote status if bronze is already done.
 
@@ -757,6 +855,7 @@ class WatermarkManager:
             stage_flag="silver_stage_complete",
             other_flag="bronze_stage_complete",
             log_msg="Silver stage marked complete",
+            load_group=load_group,
         )
 
     def _stage_complete(
@@ -766,6 +865,7 @@ class WatermarkManager:
         stage_flag: str,
         other_flag: str,
         log_msg: str,
+        load_group: Optional[str] = None,
     ) -> None:
         """Shared implementation for bronze/silver stage-complete UPDATE.
 
@@ -773,11 +873,18 @@ class WatermarkManager:
         sibling whose value triggers status auto-promotion to 'completed'.
         Both are internal column names — never user input — so they are
         not interpolated through SQLInputValidator.
+
+        ``load_group`` is store-only — accepted for signature uniformity
+        across the state machine; the UPDATE filters by ``run_id`` only.
+        Validated when non-None so a malformed value raises before SQL
+        composition.
         """
         self._ensure_utc_session()
         start_time = time.time()
 
         SQLInputValidator.uuid_or_job_run_id(run_id)
+        if load_group is not None:
+            SQLInputValidator.string(load_group)
         run_id_lit = sql_literal(run_id)
         ts_literal = sql_timestamp_literal(datetime.now(tz=timezone.utc))
 
@@ -803,6 +910,7 @@ class WatermarkManager:
         run_id: str,
         watermark_value: Union[str, int, Decimal],
         row_count: int,
+        load_group: Optional[str] = None,
     ) -> None:
         """
         Transition a run from ``status='running'`` to ``status='completed'``.
@@ -820,6 +928,8 @@ class WatermarkManager:
             watermark_value: Final watermark value from the landed batch
                 (str / int / Decimal). ``float`` is rejected.
             row_count: Number of rows extracted.
+            load_group: Tier 2 axis value (R3). Store-only — the UPDATE
+                filters by ``run_id`` exclusively. Validated when non-None.
 
         Raises:
             WatermarkValidationError: An input failed validation.
@@ -830,6 +940,8 @@ class WatermarkManager:
 
         SQLInputValidator.uuid_or_job_run_id(run_id)
         SQLInputValidator.numeric(row_count)
+        if load_group is not None:
+            SQLInputValidator.string(load_group)
 
         wm_val_sql = _render_watermark_literal(watermark_value)
         ts_literal = sql_timestamp_literal(datetime.now(tz=timezone.utc))

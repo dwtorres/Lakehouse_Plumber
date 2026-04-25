@@ -222,3 +222,52 @@ def test_error_message_with_embedded_single_quote_is_safely_quoted() -> None:
     update = next(s for s in spark.statements if "UPDATE" in s.upper())
     # Doubled-quote form: 'o''reilly''s batch failed'
     assert "'o''reilly''s batch failed'" in update
+
+
+# ---------- Tier 2 load_group store-only ------------------------------------
+
+
+def test_mark_failed_accepts_load_group_kwarg_without_changing_where() -> None:
+    """Tier 2 (R3): ``load_group`` is store-only — the UPDATE filters by
+    ``run_id`` + status guard only."""
+    spark = _ScriptedSpark(script=[1])
+    wm = _make_wm(spark)
+    wm.mark_failed(
+        run_id="job-1-task-2-attempt-3",
+        error_class="IOError",
+        error_message="boom",
+        load_group="pipe_a::fg_a",
+    )
+    update = next(s for s in spark.statements if "UPDATE" in s.upper())
+    assert "load_group" not in update.lower(), (
+        "mark_failed UPDATE must not reference load_group "
+        f"(store-only kwarg); SQL: {update}"
+    )
+
+
+def test_mark_failed_signature_appends_load_group_as_last_kwarg() -> None:
+    """Tier 2 (R3): ``load_group`` is last kwarg, default ``None``."""
+    import inspect
+
+    from lhp_watermark import WatermarkManager
+
+    sig = inspect.signature(WatermarkManager.mark_failed)
+    params = list(sig.parameters.keys())
+    assert params[-1] == "load_group", f"load_group must be last kwarg; got {params}"
+    assert sig.parameters["load_group"].default is None
+
+
+def test_mark_failed_rejects_adversarial_load_group() -> None:
+    """Validator rejects control chars before SQL composition."""
+    from lhp_watermark import WatermarkValidationError
+
+    spark = _ScriptedSpark(script=[])
+    wm = _make_wm(spark)
+    with pytest.raises(WatermarkValidationError):
+        wm.mark_failed(
+            run_id="job-1-task-2-attempt-3",
+            error_class="IOError",
+            error_message="boom",
+            load_group="bad\x00value",
+        )
+    assert spark.statements == []

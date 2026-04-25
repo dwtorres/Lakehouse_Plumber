@@ -134,17 +134,22 @@ def test_method_succeeds_on_one_affected(method_name: str) -> None:
 @pytest.mark.parametrize(
     "method_name", ["mark_bronze_complete", "mark_silver_complete"]
 )
-def test_signature_takes_run_id_only(method_name: str) -> None:
+def test_signature_takes_run_id_and_load_group(method_name: str) -> None:
+    """Tier 2 (R3): adds ``load_group`` as the last kwarg with default
+    ``None`` so legacy callers continue to work unchanged. No positional
+    churn — ``run_id`` stays the only positional parameter."""
     import inspect
 
     from lhp_watermark import WatermarkManager
 
     sig = inspect.signature(getattr(WatermarkManager, method_name))
-    # self + run_id
     assert list(sig.parameters.keys()) == [
         "self",
         "run_id",
-    ], f"{method_name}: signature must remain (self, run_id)"
+        "load_group",
+    ], f"{method_name}: signature must be (self, run_id, load_group)"
+    lg = sig.parameters["load_group"]
+    assert lg.default is None, f"{method_name}: load_group must default to None"
 
 
 # ---------- input validation -------------------------------------------------
@@ -160,4 +165,43 @@ def test_method_rejects_invalid_run_id_before_any_sql(method_name: str) -> None:
     wm = _make_wm(spark)
     with pytest.raises(WatermarkValidationError):
         getattr(wm, method_name)(run_id="job-1 OR 1=1 --")
+    assert spark.statements == []
+
+
+# ---------- Tier 2 load_group store-only ------------------------------------
+
+
+@pytest.mark.parametrize(
+    "method_name", ["mark_bronze_complete", "mark_silver_complete"]
+)
+def test_method_accepts_load_group_kwarg_without_changing_where(
+    method_name: str,
+) -> None:
+    """Tier 2 (R3): ``load_group`` is store-only on the stage UPDATE.
+    Filter remains by ``run_id`` + terminal-failure guard only."""
+    spark = _ScriptedSpark(script=[1])
+    wm = _make_wm(spark)
+    getattr(wm, method_name)(
+        run_id="job-1-task-2-attempt-3", load_group="pipe_a::fg_a"
+    )
+    update = next(s for s in spark.statements if "UPDATE" in s.upper())
+    assert "load_group" not in update.lower(), (
+        f"{method_name} UPDATE must not reference load_group "
+        f"(store-only kwarg); SQL: {update}"
+    )
+
+
+@pytest.mark.parametrize(
+    "method_name", ["mark_bronze_complete", "mark_silver_complete"]
+)
+def test_method_rejects_adversarial_load_group(method_name: str) -> None:
+    """Validator rejects control chars in ``load_group`` before SQL."""
+    from lhp_watermark import WatermarkValidationError
+
+    spark = _ScriptedSpark(script=[])
+    wm = _make_wm(spark)
+    with pytest.raises(WatermarkValidationError):
+        getattr(wm, method_name)(
+            run_id="job-1-task-2-attempt-3", load_group="bad\x00value"
+        )
     assert spark.statements == []

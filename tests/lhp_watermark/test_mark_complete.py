@@ -222,3 +222,47 @@ def test_mark_complete_signature_requires_watermark_value() -> None:
     assert (
         param.default is inspect.Parameter.empty
     ), "watermark_value must be required; remove the Optional default"
+
+
+# ---------- Tier 2 load_group store-only ------------------------------------
+
+
+def test_mark_complete_accepts_load_group_kwarg_without_changing_where() -> None:
+    """Tier 2 (R3): ``load_group`` is store-only on this UPDATE. The WHERE
+    clause filters by ``run_id`` + recoverable-state guard only — no
+    load_group filter."""
+    spark = _ScriptedSpark(script=[1])
+    wm = _make_wm(spark)
+
+    wm.mark_complete(**_kwargs(load_group="pipe_a::fg_a"))
+
+    update = next(s for s in spark.statements if "UPDATE" in s.upper())
+    # WHERE shape unchanged — no load_group filter or SET column.
+    assert "load_group" not in update.lower(), (
+        "mark_complete UPDATE must not reference load_group "
+        f"(store-only kwarg); SQL: {update}"
+    )
+
+
+def test_mark_complete_signature_appends_load_group_as_last_kwarg() -> None:
+    """Tier 2 (R3): ``load_group`` is the last kwarg with default ``None`` —
+    no positional churn for existing callers."""
+    import inspect
+
+    from lhp_watermark import WatermarkManager
+
+    sig = inspect.signature(WatermarkManager.mark_complete)
+    params = list(sig.parameters.keys())
+    assert params[-1] == "load_group", f"load_group must be last kwarg; got {params}"
+    assert sig.parameters["load_group"].default is None
+
+
+def test_mark_complete_rejects_adversarial_load_group() -> None:
+    """``SQLInputValidator.string`` rejects control chars before any SQL."""
+    from lhp_watermark import WatermarkValidationError
+
+    spark = _ScriptedSpark(script=[])
+    wm = _make_wm(spark)
+    with pytest.raises(WatermarkValidationError):
+        wm.mark_complete(**_kwargs(load_group="bad\x00value"))
+    assert spark.statements == []
