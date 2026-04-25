@@ -70,10 +70,13 @@ table_name = SQLInputValidator.string({{ table_name|tojson }})
 watermark_column = SQLInputValidator.string({{ watermark_column|tojson }})
 jdbc_table = SQLInputValidator.string({{ jdbc_table|tojson }})
 
+load_group = {{ load_group|tojson }}
+
 hwm_result = wm.get_latest_watermark(
     source_system_id=source_system_id,
     schema_name=schema_name,
     table_name=table_name,
+    load_group=load_group,
 )
 hwm_value = hwm_result["watermark_value"] if hwm_result else None
 landing_root = {{ landing_path|tojson }}
@@ -94,6 +97,7 @@ recoverable = wm.get_recoverable_landed_run(
     source_system_id=source_system_id,
     schema_name=schema_name,
     table_name=table_name,
+    load_group=load_group,
 )
 if recoverable:
     recovered_value = recoverable["watermark_value"] or ""
@@ -109,6 +113,7 @@ if recoverable:
         run_id=recoverable["run_id"],
         watermark_value=recovered_value,
         row_count=recovered_count,
+        load_group=load_group,
     )
     _log_phase(
         "recovery_finalize_complete",
@@ -186,6 +191,7 @@ wm.insert_new(
     row_count=0,
     extraction_type=extraction_type,
     previous_watermark_value=str(hwm_value) if hwm_value is not None else None,
+    load_group=load_group,
 )
 
 extraction_succeeded = False
@@ -258,6 +264,7 @@ except Exception as e:
         run_id=run_id,
         error_class=type(e).__name__,
         error_message=str(e)[:4096],
+        load_group=load_group,
     )
     raise
 
@@ -284,6 +291,7 @@ if extraction_succeeded:
             run_id=run_id,
             watermark_value=completion_value_sql,
             row_count=row_count,
+            load_group=load_group,
         )
         _log_phase(
             "finalization_commit_start",
@@ -294,6 +302,7 @@ if extraction_succeeded:
             run_id=run_id,
             watermark_value=completion_value_sql,
             row_count=row_count,
+            load_group=load_group,
         )
         _log_phase(
             "finalization_commit_complete",

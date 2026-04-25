@@ -247,6 +247,11 @@ class JDBCWatermarkJobGenerator(BaseActionGenerator):
             "jdbc_driver": source_config.get("driver", ""),
             "jdbc_table": source_config.get("table", ""),
             "landing_path": action.landing_path or "",
+            "load_group": (
+                f"{flowgroup.pipeline}::{flowgroup.flowgroup}"
+                if flowgroup
+                else ""
+            ),
         }
 
         # Render extraction notebook

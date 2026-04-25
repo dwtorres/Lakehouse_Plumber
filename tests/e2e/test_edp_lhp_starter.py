@@ -154,6 +154,19 @@ class TestEdpLhpStarterGeneration:
             f'schema="{wm_schema}"' in extract_src
         ), f"Extract notebook for {env} must bind WatermarkManager to schema={wm_schema!r}; got:\n{extract_src[:2000]}"
 
+        # 3a. Tier 2 (U3): the composite ``load_group`` literal is
+        #     ``{pipeline}::{flowgroup}`` and is env-independent — the same
+        #     value lands identically in devtest/qa/prod because neither
+        #     ``pipeline`` nor ``flowgroup`` participate in env substitution.
+        assert (
+            'load_group = "edp_bronze_jdbc_ingestion::customer_bronze"'
+            in extract_src
+        ), (
+            f"Extract notebook for {env} must bind composite load_group "
+            f"literal 'edp_bronze_jdbc_ingestion::customer_bronze'; got:\n"
+            f"{extract_src[:2000]}"
+        )
+
         # 4. Bronze JDBC extract notebook lands under the per-env landing
         #    volume root.
         assert (

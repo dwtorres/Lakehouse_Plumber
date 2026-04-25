@@ -6,6 +6,8 @@ import re
 from typing import Any, List, Optional
 from unittest.mock import MagicMock
 
+import pytest
+
 
 class _FakeResult:
     def __init__(self, payload: Any) -> None:
@@ -97,3 +99,151 @@ def test_get_recoverable_landed_run_filters_by_status() -> None:
     assert recoverable["status"] == "landed_not_committed"
     query = next(s for s in spark.statements if "SELECT" in s.upper())
     assert "status = 'landed_not_committed'" in query
+
+
+# ---------- Tier 2 load_group threading -------------------------------------
+
+
+def test_mark_landed_accepts_load_group_kwarg_without_changing_where() -> None:
+    """``load_group`` is store-only on UPDATEs — accepted to keep call-site
+    signatures uniform but the WHERE clause keeps filtering by ``run_id``
+    (and ``status='running'``) only.
+    """
+    spark = _ScriptedSpark(script=[1])
+    wm = _make_wm(spark)
+
+    wm.mark_landed(
+        run_id="job-1-task-2-attempt-3",
+        watermark_value="2025-06-01T12:00:00.000000+00:00",
+        row_count=42,
+        load_group="pipe_a::fg_a",
+    )
+
+    update = next(s for s in spark.statements if "UPDATE" in s.upper())
+    # WHERE shape unchanged — no load_group filter.
+    assert "load_group" not in update.lower(), (
+        "mark_landed UPDATE must not reference load_group "
+        f"(store-only kwarg); SQL: {update}"
+    )
+
+
+def test_get_recoverable_landed_run_with_composite_load_group_emits_three_way() -> None:
+    """B2 caller filters to a specific composite — the three-way clause
+    appears alongside the existing status filter."""
+    spark = _ScriptedSpark(script=[None])
+    wm = _make_wm(spark)
+
+    wm.get_recoverable_landed_run(
+        source_system_id="postgres_prod",
+        schema_name="Production",
+        table_name="Product",
+        load_group="pipe_a::fg_a",
+    )
+
+    query = next(s for s in spark.statements if "SELECT" in s.upper())
+    assert "status = 'landed_not_committed'" in query
+    pattern = re.compile(
+        r"AND\s*\(\s*load_group\s*=\s*'pipe_a::fg_a'\s+OR\s+"
+        r"\(\s*'pipe_a::fg_a'\s+IS\s+NULL\s+AND\s+load_group\s+IS\s+NULL\s*\)\s*\)",
+        re.IGNORECASE,
+    )
+    assert pattern.search(query), (
+        f"missing three-way load_group clause; SQL: {query}"
+    )
+
+
+def test_get_recoverable_landed_run_with_load_group_none_collapses_to_null() -> None:
+    """Legacy caller — ``load_group=None`` (default) → both substitutions
+    are SQL ``NULL`` so the right arm matches NULL-load_group rows."""
+    spark = _ScriptedSpark(script=[None])
+    wm = _make_wm(spark)
+
+    wm.get_recoverable_landed_run(
+        source_system_id="postgres_prod",
+        schema_name="Production",
+        table_name="Product",
+    )
+
+    query = next(s for s in spark.statements if "SELECT" in s.upper())
+    pattern = re.compile(
+        r"AND\s*\(\s*load_group\s*=\s*NULL\s+OR\s+"
+        r"\(\s*NULL\s+IS\s+NULL\s+AND\s+load_group\s+IS\s+NULL\s*\)\s*\)",
+        re.IGNORECASE,
+    )
+    assert pattern.search(query), (
+        f"load_group=None must emit both arms with NULL substitutions; SQL: {query}"
+    )
+
+
+# ---------- Tier 2 four-cell parametrize matrix -----------------------------
+
+
+@pytest.mark.parametrize(
+    "load_group",
+    [None, "legacy", "pipe_a::fg_a", "pipe_a::fg_b"],
+)
+def test_get_recoverable_landed_run_load_group_matrix_three_way_filter(
+    load_group: Optional[str],
+) -> None:
+    """``get_recoverable_landed_run`` must honor the three-way load_group
+    filter for every cell in the migration matrix; the SELECT WHERE must
+    substitute the same value into both arms.
+    """
+    spark = _ScriptedSpark(script=[None])
+    wm = _make_wm(spark)
+
+    wm.get_recoverable_landed_run(
+        source_system_id="postgres_prod",
+        schema_name="Production",
+        table_name="Product",
+        load_group=load_group,
+    )
+
+    query = next(s for s in spark.statements if "SELECT" in s.upper())
+    expected_literal = "NULL" if load_group is None else f"'{load_group}'"
+    pattern = re.compile(
+        r"AND\s*\(\s*load_group\s*=\s*"
+        + re.escape(expected_literal)
+        + r"\s+OR\s+\(\s*"
+        + re.escape(expected_literal)
+        + r"\s+IS\s+NULL\s+AND\s+load_group\s+IS\s+NULL\s*\)\s*\)",
+        re.IGNORECASE,
+    )
+    assert pattern.search(query), (
+        f"load_group={load_group!r} must emit three-way clause "
+        f"with {expected_literal} in both arms; SQL: {query}"
+    )
+    # status='landed_not_committed' guard preserved across every cell.
+    assert "status = 'landed_not_committed'" in query, (
+        f"landed-recovery filter must keep status guard; SQL: {query}"
+    )
+
+
+@pytest.mark.parametrize(
+    "load_group",
+    [None, "legacy", "pipe_a::fg_a", "pipe_a::fg_b"],
+)
+def test_mark_landed_load_group_matrix_is_store_only(
+    load_group: Optional[str],
+) -> None:
+    """``mark_landed`` accepts ``load_group`` for signature uniformity but
+    is store-only — the WHERE clause filters by ``run_id`` only across
+    every cell in the migration matrix. A regression that filters by
+    ``load_group`` here would break recovery for legacy rows whose
+    ``load_group`` is NULL while the caller passes a B2 composite.
+    """
+    spark = _ScriptedSpark(script=[1])
+    wm = _make_wm(spark)
+
+    wm.mark_landed(
+        run_id="job-1-task-2-attempt-3",
+        watermark_value="2025-06-01T12:00:00.000000+00:00",
+        row_count=42,
+        load_group=load_group,
+    )
+
+    update = next(s for s in spark.statements if "UPDATE" in s.upper())
+    assert "load_group" not in update.lower(), (
+        f"mark_landed UPDATE must not reference load_group "
+        f"(store-only kwarg) for load_group={load_group!r}; SQL: {update}"
+    )

@@ -142,6 +142,131 @@ class TestJDBCWatermarkV2Integration:
         assert "watermark_column_name=" in content  # required kwarg
         assert '"ModifiedDate"' in content  # WHERE clause quotes column for JDBC
 
+    # ------------------------------------------------------------------
+    # Tier 2 (U3): load_group composite threaded into the extraction notebook
+    # ------------------------------------------------------------------
+
+    def test_extraction_notebook_has_load_group_literal(self, v2_project):
+        """Generator emits ``load_group = "{pipeline}::{flowgroup}"`` at module
+        scope so every ``wm.<method>(...)`` call inside the notebook can pass
+        ``load_group=load_group``."""
+        _, output_dir = self._generate(v2_project)
+        notebook = (
+            output_dir / "crm_bronze_extract" / "__lhp_extract_load_product_jdbc.py"
+        )
+        content = notebook.read_text()
+        assert (
+            'load_group = "crm_bronze::product_ingestion"' in content
+        ), "Expected composite load_group literal at module scope"
+
+    @staticmethod
+    def _extract_call_block(content: str, call_prefix: str) -> str:
+        """Return the substring spanning ``call_prefix( ... )`` with correctly
+        balanced parentheses (so nested ``str(hwm_value)`` etc. don't fool a
+        naive ``content.find(")", idx)``).
+        """
+        idx = content.find(call_prefix)
+        assert idx >= 0, f"{call_prefix} not found in generated notebook"
+        # Walk forward from the opening '(' tracking depth.
+        depth = 0
+        start_paren = content.find("(", idx)
+        assert start_paren > idx
+        i = start_paren
+        while i < len(content):
+            ch = content[i]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return content[idx : i + 1]
+            i += 1
+        raise AssertionError(f"unterminated call block for {call_prefix}")
+
+    def test_extraction_notebook_threads_load_group_to_insert_new(self, v2_project):
+        """``wm.insert_new(...)`` must pass ``load_group=load_group``."""
+        _, output_dir = self._generate(v2_project)
+        notebook = (
+            output_dir / "crm_bronze_extract" / "__lhp_extract_load_product_jdbc.py"
+        )
+        content = notebook.read_text()
+        block = self._extract_call_block(content, "wm.insert_new(")
+        assert (
+            "load_group=load_group" in block
+        ), f"insert_new must thread load_group=load_group; got block:\n{block}"
+
+    def test_extraction_notebook_threads_load_group_to_get_latest(self, v2_project):
+        """``wm.get_latest_watermark(...)`` must pass ``load_group=load_group``."""
+        _, output_dir = self._generate(v2_project)
+        notebook = (
+            output_dir / "crm_bronze_extract" / "__lhp_extract_load_product_jdbc.py"
+        )
+        content = notebook.read_text()
+        block = self._extract_call_block(content, "wm.get_latest_watermark(")
+        assert (
+            "load_group=load_group" in block
+        ), f"get_latest_watermark must thread load_group=load_group; got block:\n{block}"
+
+    @classmethod
+    def _assert_load_group_threaded(
+        cls, content: str, call_prefixes: tuple
+    ) -> None:
+        """Assert every ``wm.<method>(...)`` call in ``call_prefixes`` passes
+        ``load_group=load_group``.
+
+        Centralizes the per-call assertion so a regression in any single
+        ``WatermarkManager`` call site fails on this one test rather than
+        only on whichever focused test happens to cover that method.
+        Mirrors the four-cell parametrize matrix in
+        ``tests/lhp_watermark/`` by exercising all manager call sites the
+        generated notebook should thread ``load_group`` through.
+        """
+        missing: list = []
+        for prefix in call_prefixes:
+            block = cls._extract_call_block(content, prefix)
+            if "load_group=load_group" not in block:
+                missing.append((prefix, block))
+        assert not missing, (
+            "Generated notebook must thread load_group=load_group to every "
+            f"WatermarkManager call site. Missing kwarg in: "
+            + "; ".join(p for p, _ in missing)
+            + "\nFirst missing block:\n"
+            + (missing[0][1] if missing else "")
+        )
+
+    def test_extraction_notebook_threads_load_group_to_all_wm_calls(self, v2_project):
+        """Composite ``load_group`` must be threaded to every
+        ``WatermarkManager`` call site emitted by the JDBC template:
+        read-side (``get_latest_watermark``, ``get_recoverable_landed_run``),
+        write-side (``insert_new``, ``mark_landed``), and any state-machine
+        completion (``mark_complete``) the template renders.
+
+        Consolidates the U3-era per-method assertions (insert_new +
+        get_latest_watermark) into a single matrix-style assertion so a
+        regression in any one site surfaces here rather than depending on
+        which focused test happens to cover it.
+        """
+        _, output_dir = self._generate(v2_project)
+        notebook = (
+            output_dir / "crm_bronze_extract" / "__lhp_extract_load_product_jdbc.py"
+        )
+        content = notebook.read_text()
+        # Discover which wm.<method>(...) call sites the template renders;
+        # run the threaded-kwarg assertion against each present site.
+        candidate_prefixes = (
+            "wm.insert_new(",
+            "wm.get_latest_watermark(",
+            "wm.get_recoverable_landed_run(",
+            "wm.mark_landed(",
+            "wm.mark_complete(",
+        )
+        present = tuple(p for p in candidate_prefixes if p in content)
+        assert present, (
+            "Expected the JDBC extraction notebook to call at least one "
+            f"WatermarkManager method; none of {candidate_prefixes} found"
+        )
+        self._assert_load_group_threaded(content, present)
+
     def test_extraction_notebook_has_jdbc_read(self, v2_project):
         _, output_dir = self._generate(v2_project)
         notebook = (

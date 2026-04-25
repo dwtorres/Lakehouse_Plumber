@@ -320,3 +320,174 @@ def test_run_id_is_emitted_via_sql_literal_with_doubled_quotes() -> None:
     from lhp_watermark.sql_safety import sql_literal
 
     assert sql_literal("o'reilly") == "'o''reilly'"
+
+
+# ---------- Tier 2 load_group threading -------------------------------------
+
+
+def test_insert_new_writes_load_group_into_merge_source_row() -> None:
+    """Composite load_group lands in MERGE source row + INSERT column list."""
+    spark = _ScriptedSpark(script=[1])
+    wm = _make_wm(spark)
+    spark.statements.clear()
+
+    wm.insert_new(**_valid_kwargs(load_group="pipe_a::fg_a"))
+
+    merge = next(s for s in spark.statements if "MERGE" in s.upper())
+    # Source row carries the literal under the load_group alias.
+    assert re.search(
+        r"'pipe_a::fg_a'\s+AS\s+load_group", merge, re.IGNORECASE
+    ), f"MERGE source row missing load_group literal; SQL: {merge}"
+    # INSERT column list includes load_group.
+    insert_cols = re.search(
+        r"WHEN\s+NOT\s+MATCHED\s+THEN\s+INSERT\s*\(([^)]+)\)",
+        merge,
+        re.IGNORECASE | re.DOTALL,
+    )
+    assert insert_cols is not None, f"could not find INSERT column list; SQL: {merge}"
+    assert "load_group" in insert_cols.group(1), (
+        f"INSERT column list must include load_group; got: {insert_cols.group(1)}"
+    )
+    # VALUES clause references s.load_group.
+    assert re.search(
+        r"s\.load_group", merge, re.IGNORECASE
+    ), f"VALUES clause missing s.load_group reference; SQL: {merge}"
+
+
+def test_insert_new_emits_null_load_group_when_caller_passes_none() -> None:
+    """Legacy caller passes no ``load_group`` (default None) → SQL NULL.
+
+    This is the back-compat path: existing flowgroups continue to write
+    NULL-load_group rows until U3 threads the composite through.
+    """
+    spark = _ScriptedSpark(script=[1])
+    wm = _make_wm(spark)
+    spark.statements.clear()
+
+    wm.insert_new(**_valid_kwargs())  # load_group omitted
+
+    merge = next(s for s in spark.statements if "MERGE" in s.upper())
+    assert re.search(
+        r"NULL\s+AS\s+load_group", merge, re.IGNORECASE
+    ), f"load_group=None must emit NULL literal in source row; SQL: {merge}"
+
+
+def test_insert_new_rejects_adversarial_load_group_before_any_sql() -> None:
+    """``SQLInputValidator.string`` rejects control chars and injection
+    vectors via the existing LHP-WM-003 validation surface."""
+    from lhp_watermark import WatermarkValidationError
+
+    spark = _ScriptedSpark(script=[])
+    wm = _make_wm(spark)
+    spark.statements.clear()
+
+    with pytest.raises(WatermarkValidationError):
+        wm.insert_new(**_valid_kwargs(load_group="bad\x00value"))
+    assert spark.statements == [], (
+        "validator must reject before SQL composition; "
+        f"statements: {spark.statements}"
+    )
+
+
+def test_insert_new_load_group_emitted_via_sql_literal_with_doubled_quotes() -> None:
+    """If a load_group somehow contained a single quote, ``sql_literal``
+    must double it. The validator does not strip quotes, so this is a
+    pure SQL-safety contract."""
+    spark = _ScriptedSpark(script=[1])
+    wm = _make_wm(spark)
+    spark.statements.clear()
+
+    wm.insert_new(**_valid_kwargs(load_group="o'reilly::fg"))
+
+    merge = next(s for s in spark.statements if "MERGE" in s.upper())
+    assert "'o''reilly::fg'" in merge, (
+        f"sql_literal must double embedded quotes in load_group; SQL: {merge}"
+    )
+
+
+# ---------- Tier 2 four-cell parametrize matrix -----------------------------
+
+
+@pytest.mark.parametrize(
+    "load_group",
+    [None, "legacy", "pipe_a::fg_a", "pipe_a::fg_b"],
+)
+def test_insert_new_load_group_matrix_threads_into_merge_source_row(
+    load_group: Optional[str],
+) -> None:
+    """Every cell in the migration matrix renders the correct literal
+    into the MERGE source row's ``load_group`` column:
+
+    - ``None`` (legacy caller) → ``NULL AS load_group``
+    - ``'legacy'`` (post-Step-3 backfill row identity)
+    - ``'pipe_a::fg_a'``, ``'pipe_a::fg_b'`` (sibling B2 composites that
+      collide on ``(schema, table)`` but isolate via load_group)
+
+    The assertion shape is shared so a regression in any cell surfaces
+    immediately rather than only in the cell currently exercised by a
+    focused test.
+    """
+    spark = _ScriptedSpark(script=[1])
+    wm = _make_wm(spark)
+    spark.statements.clear()
+
+    wm.insert_new(**_valid_kwargs(load_group=load_group))
+
+    merge = next(s for s in spark.statements if "MERGE" in s.upper())
+    expected_literal = "NULL" if load_group is None else f"'{load_group}'"
+    pattern = re.compile(
+        re.escape(expected_literal) + r"\s+AS\s+load_group", re.IGNORECASE
+    )
+    assert pattern.search(merge), (
+        f"load_group={load_group!r} must render as {expected_literal} "
+        f"in MERGE source row; SQL: {merge}"
+    )
+
+    # INSERT column list always contains load_group regardless of value.
+    insert_cols = re.search(
+        r"WHEN\s+NOT\s+MATCHED\s+THEN\s+INSERT\s*\(([^)]+)\)",
+        merge,
+        re.IGNORECASE | re.DOTALL,
+    )
+    assert insert_cols is not None
+    assert "load_group" in insert_cols.group(1), (
+        f"INSERT column list must include load_group regardless of value; "
+        f"got: {insert_cols.group(1)}"
+    )
+    # VALUES references s.load_group regardless of value.
+    assert re.search(
+        r"s\.load_group", merge, re.IGNORECASE
+    ), f"VALUES clause missing s.load_group reference; SQL: {merge}"
+
+
+@pytest.mark.parametrize(
+    "load_group",
+    [None, "legacy", "pipe_a::fg_a", "pipe_a::fg_b"],
+)
+def test_insert_new_load_group_matrix_preserves_run_id_match_predicate(
+    load_group: Optional[str],
+) -> None:
+    """Tier 2 (R3) is store-only on writes — the MERGE ``ON`` clause must
+    keep matching by ``run_id`` only across every load_group cell. Adding
+    a ``load_group`` axis to the match predicate would break L2 §5.3 and
+    invite duplicate rows under cross-pipeline run_id collisions.
+    """
+    spark = _ScriptedSpark(script=[1])
+    wm = _make_wm(spark)
+    spark.statements.clear()
+
+    wm.insert_new(**_valid_kwargs(load_group=load_group))
+
+    merge = next(s for s in spark.statements if "MERGE" in s.upper())
+    on_clause = re.search(
+        r"\bON\b\s+(.+?)WHEN\s+", merge, re.IGNORECASE | re.DOTALL
+    )
+    assert on_clause is not None, f"could not locate MERGE ON clause; SQL: {merge}"
+    on_text = on_clause.group(1)
+    assert "run_id" in on_text, (
+        f"MERGE ON clause must match by run_id; got: {on_text}"
+    )
+    assert "load_group" not in on_text, (
+        f"MERGE ON clause must NOT match by load_group (store-only on writes); "
+        f"got: {on_text}"
+    )
