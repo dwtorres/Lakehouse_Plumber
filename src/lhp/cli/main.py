@@ -608,8 +608,15 @@ def init_registry(env, catalog, schema, warehouse_id, profile, max_wait_seconds)
 @click.option(
     "--cluster-id",
     default=None,
-    help="Existing interactive cluster id (or set DATABRICKS_CLUSTER_ID env var). "
-    "Cluster must have lhp_watermark wheel installed.",
+    help="Existing cluster id to run the notebook on (or set DATABRICKS_CLUSTER_ID).",
+)
+@click.option(
+    "--lhp-workspace-path",
+    default=None,
+    help="Workspace path containing vendored lhp_watermark/ (per ADR-002 + "
+    "`lhp sync-runtime`). Notebook prepends this to sys.path before importing. "
+    "Or set LHP_WORKSPACE_PATH env var. Example: "
+    "/Workspace/Users/<principal>/.bundle/<bundle>/<env>/files",
 )
 @click.option(
     "--workspace-target",
@@ -642,6 +649,7 @@ def validate_tier2(
     probe_schema,
     probe_table_name,
     cluster_id,
+    lhp_workspace_path,
     workspace_target,
     profile,
     max_wait_seconds,
@@ -666,6 +674,7 @@ def validate_tier2(
         probe_schema=probe_schema,
         probe_table_name=probe_table_name,
         cluster_id=cluster_id,
+        lhp_workspace_path=lhp_workspace_path,
         workspace_target=workspace_target or DEFAULT_WORKSPACE_TARGET,
         profile=profile,
         max_wait_seconds=max_wait_seconds,

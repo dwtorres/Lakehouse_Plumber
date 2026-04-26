@@ -18,9 +18,17 @@ Workstream A's V5 ships transparently because the notebook is the same.
 For dress rehearsal (plan v5 §Phase 8.1 + B13), ``--catalog`` + ``--schema``
 + ``--probe-schema`` bypass env resolution.
 
+``lhp_watermark`` import path (per ADR-002): the notebook prepends
+``lhp_workspace_path`` (widget) to ``sys.path`` before importing
+``lhp_watermark``. Operator runs ``lhp sync-runtime`` + ``databricks bundle
+deploy`` to vendor the package into the bundle's workspace files, then
+passes ``--lhp-workspace-path /Workspace/.../files`` here. NO wheel
+install required — vendoring path is the supported flow.
+
 See:
   docs/plans/pr-approved-into-watermark-hazy-lamport.md §Phase 5 + §8.0
   scripts/validation/validate_tier2_load_group.py — V1-V5 source
+  ADR-002 — lhp_watermark vendoring (Path 5 Option A)
 """
 
 from __future__ import annotations
@@ -62,6 +70,7 @@ class ValidateTier2Command(BaseCommand):
         probe_schema: Optional[str] = None,
         probe_table_name: str = "watermarks_v1_probe",
         cluster_id: Optional[str] = None,
+        lhp_workspace_path: Optional[str] = None,
         workspace_target: str = DEFAULT_WORKSPACE_TARGET,
         profile: Optional[str] = None,
         max_wait_seconds: int = 1800,
@@ -77,9 +86,16 @@ class ValidateTier2Command(BaseCommand):
         if not cluster_id:
             raise click.ClickException(
                 "Set --cluster-id <id> or export DATABRICKS_CLUSTER_ID=<id>. "
-                "The notebook needs an interactive cluster with the "
-                "lhp_watermark wheel installed."
+                "The notebook needs a cluster to execute on."
             )
+
+        # ADR-002 vendoring path: notebook imports lhp_watermark by prepending
+        # lhp_workspace_path to sys.path. Operator runs `lhp sync-runtime` +
+        # `databricks bundle deploy` to vendor the package, then passes the
+        # workspace path here. Empty string = expect package on default
+        # sys.path (rare; only valid if cluster has site-packages match).
+        if lhp_workspace_path is None:
+            lhp_workspace_path = os.environ.get("LHP_WORKSPACE_PATH", "")
 
         notebook_source = self._locate_notebook_source()
         client = make_workspace_client(profile=profile or DEFAULT_DATABRICKS_PROFILE)
@@ -104,6 +120,7 @@ class ValidateTier2Command(BaseCommand):
                 schema=wm_schema,
                 probe_namespace=probe_namespace,
                 probe_table_name=probe_table_name,
+                lhp_workspace_path=lhp_workspace_path,
             )
             click.echo(f"-- run submitted: run_id={run_id}", err=True)
             exit_value = self._wait_for_run(
@@ -253,6 +270,7 @@ class ValidateTier2Command(BaseCommand):
         schema: str,
         probe_namespace: str,
         probe_table_name: str,
+        lhp_workspace_path: str = "",
     ) -> int:
         """Submit a one-off Jobs run executing the notebook with widget params.
 
@@ -284,6 +302,7 @@ class ValidateTier2Command(BaseCommand):
             "schema": probe_schema or schema,
             "probe_table_name": probe_table_name,
             "cleanup_on_success": "true",
+            "lhp_workspace_path": lhp_workspace_path,
         }
 
         task = SubmitTask(
