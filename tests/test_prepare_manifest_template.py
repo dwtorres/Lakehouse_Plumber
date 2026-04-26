@@ -1,4 +1,4 @@
-"""Tests for prepare_manifest.py.j2 notebook template (B2 R1, R1a, R2, R9).
+"""Tests for prepare_manifest.py.j2 notebook template (B2 R1, R1a, R2, R9, R10).
 
 Renders the template via Jinja2 and runs the rendered Python against mocked
 Spark/dbutils using runpy.run_path — no Databricks runtime required.
@@ -12,14 +12,19 @@ Scenarios:
   - TaskValue key naming: set() called once with key="iterations"
   - Bootstrap helper present: rendered source contains _lhp_watermark_bootstrap_syspath
   - LHP-MAN-001 error code present in template source
+  - R10 retention cell present: rendered source contains DELETE FROM + INTERVAL 30 DAYS
+  - R10 retention order: DELETE appears after MERGE in recorded SQL statements
+  - R10 retention deleted count logged: stdout reports correct deleted row count
 """
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
 import runpy
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -426,4 +431,88 @@ def test_lhp_man_001_error_code_in_template_source() -> None:
     assert "LHP-MAN-001" in source, (
         "prepare_manifest.py.j2 must contain LHP-MAN-001 error code "
         "(placeholder for ManifestConcurrencyError class, see U4-followup)"
+    )
+
+
+# ---------- test: R10 retention cell present in rendered source ---------------
+
+
+def test_retention_cell_present_in_rendered_source() -> None:
+    """Rendered notebook must contain DELETE FROM and INTERVAL 30 DAYS (R10).
+
+    Asserts the retention cell ships in every render regardless of action count.
+    Checks the rendered Python source (post-Jinja2 evaluation) — not the template
+    source — so any conditional wrapping of the cell would also be caught.
+    """
+    rendered = _render(_three_action_fixture())
+    assert "DELETE FROM" in rendered, (
+        "Rendered notebook missing 'DELETE FROM'; "
+        "R10 retention cell not present in prepare_manifest.py.j2"
+    )
+    assert "INTERVAL 30 DAYS" in rendered, (
+        "Rendered notebook missing 'INTERVAL 30 DAYS'; "
+        "R10 retention must use current_timestamp() - INTERVAL 30 DAYS"
+    )
+
+
+# ---------- test: R10 retention order (after MERGE) --------------------------
+
+
+def test_retention_runs_after_merge_in_sql_order() -> None:
+    """DELETE statement must appear after MERGE in the recorded SQL statement order (R10).
+
+    The retention cell is appended after the MERGE+taskValue cells per U9 spec;
+    this test locks in that ordering so a future template reorder is caught.
+    """
+    rendered = _render(_three_action_fixture())
+    spark = _RecordingSpark()
+    dbutils = _FakeDbutils(run_id="job-42-task-1-attempt-0")
+
+    _run_rendered(rendered, spark, dbutils)
+
+    merge_indices = [
+        i for i, s in enumerate(spark.statements)
+        if re.search(r"\bMERGE\b", s, re.IGNORECASE)
+    ]
+    delete_indices = [
+        i for i, s in enumerate(spark.statements)
+        if re.search(r"\bDELETE\b", s, re.IGNORECASE)
+    ]
+
+    assert merge_indices, (
+        f"No MERGE statement found in recorded SQL; statements: {spark.statements}"
+    )
+    assert delete_indices, (
+        f"No DELETE statement found in recorded SQL; statements: {spark.statements}"
+    )
+
+    last_merge_idx = max(merge_indices)
+    first_delete_idx = min(delete_indices)
+    assert first_delete_idx > last_merge_idx, (
+        f"DELETE (index {first_delete_idx}) must appear after MERGE (index {last_merge_idx}) "
+        f"in recorded SQL order; full statement list:\n"
+        + "\n---\n".join(spark.statements)
+    )
+
+
+# ---------- test: R10 retention deleted count logged -------------------------
+
+
+def test_retention_deleted_count_logged() -> None:
+    """When DELETE returns num_affected_rows=2, stdout must report 'deleted 2 rows' (R10)."""
+    rendered = _render(_three_action_fixture())
+    dbutils = _FakeDbutils(run_id="job-7-task-3-attempt-0")
+
+    # Script: DDL call → noop, MERGE call → noop, DELETE call → 2 affected rows.
+    # The template issues: (1) CREATE TABLE, (2) MERGE (via execute_with_concurrent_commit_retry),
+    # (3) DELETE for retention. Script entries are consumed in order.
+    spark = _RecordingSpark(script=["noop", "noop", 2])
+
+    captured = io.StringIO()
+    with patch("builtins.print", side_effect=lambda *a, **kw: captured.write(" ".join(str(x) for x in a) + "\n")):
+        _run_rendered(rendered, spark, dbutils)
+
+    output = captured.getvalue()
+    assert "manifest_retention: deleted 2 rows" in output, (
+        f"Expected 'manifest_retention: deleted 2 rows' in stdout; got:\n{output!r}"
     )

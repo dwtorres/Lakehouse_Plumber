@@ -223,5 +223,32 @@ dbutils.jobs.taskValues.set(key="iterations", value=json.dumps(_iterations))
 
 # COMMAND ----------
 
+# Step 11 (R10): retention — soft-delete manifest rows older than 30 days.
+# Runs at the start of every batch; idempotent and cheap (Delta soft-delete +
+# later VACUUM clears tombstones). DELETE is bounded: even at fleet scale
+# (300 actions × hourly batches × 30 days = 216k rows) the predicate is
+# selective on created_at + uses CLUSTER BY (batch_id) liquid clustering.
+# Sub-second precision on created_at avoids same-second boundary issues
+# (R12 supplemental).
+import logging as _retention_logger
+_retention_logger.getLogger(__name__).info(
+    "manifest_retention: starting 30-day DELETE on %s", manifest_table
+)
+retention_sql = (
+    f"DELETE FROM {manifest_table} "
+    f"WHERE created_at < current_timestamp() - INTERVAL 30 DAYS"
+)
+retention_result = spark.sql(retention_sql)
+# spark.sql DELETE returns a DataFrame with num_affected_rows; older
+# Spark/mocks may not surface it.
+try:
+    _row = retention_result.first()
+    _deleted = int(_row["num_affected_rows"]) if _row is not None else 0
+except (KeyError, IndexError, TypeError, AttributeError):
+    _deleted = 0
+print(f"manifest_retention: deleted {_deleted} rows older than 30 days")
+
+# COMMAND ----------
+
 # Log payload size for operator visibility into the 48 KB DAB taskValue ceiling.
 print(f"manifest entries: {len(_iterations)}, taskvalue payload bytes: {len(json.dumps(_iterations))}")
