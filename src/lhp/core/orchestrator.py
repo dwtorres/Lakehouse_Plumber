@@ -2022,6 +2022,22 @@ class ActionOrchestrator:
             except LHPError as e:
                 errors.append(f"CDC fan-in validation: {e}")
 
+            # Project-scope for_each invariants (composite uniqueness + mixed-mode).
+            # Needs the full project flowgroup list, not just this pipeline's subset,
+            # so that a composite collision across pipelines is caught.
+            try:
+                project_fg_list = (
+                    pre_discovered_all_flowgroups
+                    if pre_discovered_all_flowgroups is not None
+                    else flowgroups
+                )
+                project_errors = self.config_validator.validate_project_invariants(
+                    project_fg_list
+                )
+                errors.extend(str(e) for e in project_errors)
+            except LHPError as e:
+                errors.append(f"Project-scope for_each validation: {e}")
+
         except Exception as e:
             self.logger.debug("Pipeline validation failed", exc_info=True)
             errors.append(f"Pipeline validation failed: {e}")

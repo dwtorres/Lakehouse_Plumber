@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 from ..models.config import Action, ActionType, BATCH_ONLY_SOURCE_TYPES, FlowGroup, LoadSourceType, WriteTargetType
-from ..utils.error_formatter import LHPError
+from ..utils.error_formatter import ErrorCategory, LHPConfigError, LHPError
 from .action_registry import ActionRegistry
 from .config_field_validator import ConfigFieldValidator
 from .dependency_resolver import DependencyResolver
@@ -116,6 +116,12 @@ class ConfigValidator:
 
         # Cross-action readMode compatibility check
         self._validate_readmode_compatibility(flowgroup.actions)
+
+        # for_each execution-mode invariants (single-flowgroup scope)
+        try:
+            self._validate_for_each_invariants(flowgroup)
+        except LHPError:
+            raise
 
         # Validate template usage
         if flowgroup.use_template and not flowgroup.template_parameters:
@@ -299,6 +305,293 @@ class ConfigValidator:
             List of validation error messages
         """
         return self.cdc_fanin_validator.validate(flowgroups)
+
+    def _validate_for_each_invariants(self, flowgroup: FlowGroup) -> None:
+        """Raise LHPConfigError when a for_each flowgroup violates structural rules.
+
+        Checks run only when ``workflow.execution_mode == "for_each"`` so legacy
+        flowgroups that happen to use ``::`` in their names are not affected.
+
+        Args:
+            flowgroup: Fully-expanded (post-template, post-substitution) FlowGroup.
+
+        Raises:
+            LHPConfigError: LHP-CFG-031 (separator collision),
+                            LHP-CFG-033 (post-expansion structure).
+        """
+        execution_mode = (
+            (flowgroup.workflow or {}).get("execution_mode") if flowgroup.workflow else None
+        )
+        if execution_mode != "for_each":
+            return
+
+        # LHP-CFG-031: separator collision
+        for field_name, field_value in (
+            ("pipeline", flowgroup.pipeline),
+            ("flowgroup", flowgroup.flowgroup),
+        ):
+            if "::" in (field_value or ""):
+                raise LHPConfigError(
+                    category=ErrorCategory.CONFIG,
+                    code_number="031",
+                    title="Separator collision: '::' reserved for load_group composite",
+                    details=(
+                        f"The {field_name} '{field_value}' contains '::', which is "
+                        "reserved as the separator in the composite load_group key "
+                        "<pipeline>::<flowgroup> used by for_each B2 manifests. "
+                        "Rename the field to remove '::'."
+                    ),
+                    context={
+                        "field": field_name,
+                        "value": field_value,
+                        "execution_mode": "for_each",
+                    },
+                    suggestions=[
+                        f"Rename {field_name} to remove '::' so the composite "
+                        "load_group '<pipeline>::<flowgroup>' parses unambiguously.",
+                    ],
+                )
+
+        # LHP-CFG-033: post-expansion structural checks
+        actions = flowgroup.actions
+        action_count = len(actions)
+
+        # Action count bounds: 1–300 inclusive
+        if action_count == 0:
+            raise LHPConfigError(
+                category=ErrorCategory.CONFIG,
+                code_number="033",
+                title="for_each flowgroup has no actions after expansion",
+                details=(
+                    "A for_each flowgroup must expand to at least one action. "
+                    "The flowgroup is empty after template expansion and preset "
+                    "application — check use_template / template_parameters."
+                ),
+                context={
+                    "pipeline": flowgroup.pipeline,
+                    "flowgroup": flowgroup.flowgroup,
+                    "action_count": action_count,
+                },
+                suggestions=[
+                    "Verify that use_template references a valid template name.",
+                    "Ensure template_parameters produces at least one action.",
+                ],
+            )
+
+        if action_count > 300:
+            raise LHPConfigError(
+                category=ErrorCategory.CONFIG,
+                code_number="033",
+                title="for_each flowgroup exceeds 300-action limit",
+                details=(
+                    f"The flowgroup '{flowgroup.flowgroup}' in pipeline "
+                    f"'{flowgroup.pipeline}' expanded to {action_count} actions, "
+                    "which exceeds the maximum of 300 per for_each flowgroup."
+                ),
+                context={
+                    "pipeline": flowgroup.pipeline,
+                    "flowgroup": flowgroup.flowgroup,
+                    "action_count": action_count,
+                    "limit": 300,
+                },
+                suggestions=[
+                    "Split by source schema prefix or table subset into multiple "
+                    "flowgroups; batch-scoped manifest isolates them.",
+                ],
+            )
+
+        # Concurrency bounds when explicitly set (1–100 inclusive)
+        concurrency = (flowgroup.workflow or {}).get("concurrency")
+        if concurrency is not None:
+            if not isinstance(concurrency, int) or concurrency < 1 or concurrency > 100:
+                raise LHPConfigError(
+                    category=ErrorCategory.CONFIG,
+                    code_number="033",
+                    title="for_each workflow.concurrency out of bounds",
+                    details=(
+                        f"workflow.concurrency must be an integer between 1 and 100 "
+                        f"inclusive; got {concurrency!r}."
+                    ),
+                    context={
+                        "pipeline": flowgroup.pipeline,
+                        "flowgroup": flowgroup.flowgroup,
+                        "concurrency": concurrency,
+                    },
+                    suggestions=[
+                        "Set workflow.concurrency to a value in [1, 100], or omit it "
+                        "to use the default min(action_count, 10).",
+                    ],
+                )
+
+        # Shared-keys check: only jdbc_watermark_v2 actions carry these fields
+        wm_actions = [
+            a for a in actions
+            if isinstance(a.source, dict) and a.source.get("type") == "jdbc_watermark_v2"
+        ]
+        if len(wm_actions) > 1:
+            self._validate_for_each_shared_wm_keys(flowgroup, wm_actions)
+
+    def _validate_for_each_shared_wm_keys(
+        self, flowgroup: FlowGroup, wm_actions: list
+    ) -> None:
+        """Raise LHP-CFG-033 when jdbc_watermark_v2 actions disagree on shared keys.
+
+        All actions in a for_each flowgroup must share source_system_id,
+        landing_path root prefix, wm_catalog, and wm_schema.
+
+        Args:
+            flowgroup: FlowGroup being validated (used only for error context).
+            wm_actions: Subset of actions with source.type == jdbc_watermark_v2.
+
+        Raises:
+            LHPConfigError: LHP-CFG-033 when any shared key differs across actions.
+        """
+        def _wm_value(action: Action, key: str) -> Optional[str]:
+            """Extract a watermark config value; returns None when absent."""
+            if key in ("source_system_id",):
+                return getattr(action.watermark, "source_system_id", None)
+            if key == "wm_catalog":
+                return getattr(action.watermark, "catalog", None)
+            if key == "wm_schema":
+                return getattr(action.watermark, "schema", None)
+            return None
+
+        def _landing_root(action: Action) -> Optional[str]:
+            """Return the first two path segments of landing_path as the root prefix."""
+            path = action.landing_path or ""
+            parts = path.lstrip("/").split("/")
+            # /Volumes/<catalog>/<schema>/... → root = /Volumes/<catalog>/<schema>
+            if len(parts) >= 3 and parts[0] == "Volumes":
+                return "/" + "/".join(parts[:3])
+            return path or None
+
+        checks: List[Tuple[str, Any]] = [
+            ("source_system_id", [_wm_value(a, "source_system_id") for a in wm_actions]),
+            ("landing_path root", [_landing_root(a) for a in wm_actions]),
+            ("wm_catalog", [_wm_value(a, "wm_catalog") for a in wm_actions]),
+            ("wm_schema", [_wm_value(a, "wm_schema") for a in wm_actions]),
+        ]
+
+        for key_name, values in checks:
+            distinct = set(v for v in values if v is not None)
+            if len(distinct) > 1:
+                raise LHPConfigError(
+                    category=ErrorCategory.CONFIG,
+                    code_number="033",
+                    title=f"for_each actions disagree on shared key '{key_name}'",
+                    details=(
+                        f"All jdbc_watermark_v2 actions in a for_each flowgroup must "
+                        f"share the same '{key_name}'. Found distinct values: "
+                        f"{sorted(distinct)}."
+                    ),
+                    context={
+                        "pipeline": flowgroup.pipeline,
+                        "flowgroup": flowgroup.flowgroup,
+                        "key": key_name,
+                        "distinct_values": sorted(distinct),
+                    },
+                    suggestions=[
+                        f"Ensure all actions in this for_each flowgroup use the same "
+                        f"'{key_name}'. Split into separate flowgroups if the actions "
+                        f"belong to different source systems.",
+                    ],
+                )
+
+    def validate_project_invariants(
+        self, all_flowgroups: List[FlowGroup]
+    ) -> List[LHPError]:
+        """Run project-scope for_each validation across all flowgroups.
+
+        Covers two checks that require visibility across the full project:
+
+        * **LHP-CFG-032**: Two for_each flowgroups produce the same composite
+          ``<pipeline>::<flowgroup>`` (renamed mid-development collision).
+        * **LHP-CFG-033**: A pipeline mixes for_each and non-for_each flowgroups.
+
+        Per-flowgroup checks (LHP-CFG-031, count, concurrency, shared-keys) are
+        handled earlier inside ``_validate_for_each_invariants`` which is called
+        from ``validate_flowgroup``.
+
+        Args:
+            all_flowgroups: Every FlowGroup discovered in the project.
+
+        Returns:
+            List of LHPConfigError instances; empty when no violations found.
+        """
+        errors: List[LHPError] = []
+
+        for_each_fgs = [
+            fg for fg in all_flowgroups
+            if (fg.workflow or {}).get("execution_mode") == "for_each"
+        ]
+
+        # LHP-CFG-032: composite uniqueness
+        seen_composites: Dict[str, FlowGroup] = {}
+        for fg in for_each_fgs:
+            composite = f"{fg.pipeline}::{fg.flowgroup}"
+            if composite in seen_composites:
+                first = seen_composites[composite]
+                errors.append(
+                    LHPConfigError(
+                        category=ErrorCategory.CONFIG,
+                        code_number="032",
+                        title="Composite load_group is not unique within project",
+                        details=(
+                            f"Two for_each flowgroups produce the same composite key "
+                            f"'{composite}'. The B2 manifest uses this key as a "
+                            "unique row identifier; duplicates corrupt manifest state."
+                        ),
+                        context={
+                            "composite": composite,
+                            "first": f"pipeline='{first.pipeline}', flowgroup='{first.flowgroup}'",
+                            "second": f"pipeline='{fg.pipeline}', flowgroup='{fg.flowgroup}'",
+                        },
+                        suggestions=[
+                            "Rename the pipeline or flowgroup so the composite "
+                            "'<pipeline>::<flowgroup>' is unique across the project.",
+                        ],
+                    )
+                )
+            else:
+                seen_composites[composite] = fg
+
+        # LHP-CFG-033 (same-pipeline same-mode): pipeline may not mix for_each
+        # and non-for_each flowgroups
+        pipeline_modes: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+        for fg in all_flowgroups:
+            mode = (fg.workflow or {}).get("execution_mode") or "default"
+            pipeline_modes[fg.pipeline].append((fg.flowgroup, mode))
+
+        for pipeline_name, fg_modes in pipeline_modes.items():
+            modes_present = {mode for _, mode in fg_modes}
+            if "for_each" in modes_present and len(modes_present) > 1:
+                for_each_names = [n for n, m in fg_modes if m == "for_each"]
+                other_names = [n for n, m in fg_modes if m != "for_each"]
+                errors.append(
+                    LHPConfigError(
+                        category=ErrorCategory.CONFIG,
+                        code_number="033",
+                        title="Pipeline mixes for_each and non-for_each flowgroups",
+                        details=(
+                            f"Pipeline '{pipeline_name}' contains both for_each "
+                            "flowgroups and flowgroups without execution_mode. "
+                            "Mixed-mode pipelines are not supported because the "
+                            "B2 orchestrator cannot issue a single iterations "
+                            "taskValue that covers both execution paths."
+                        ),
+                        context={
+                            "pipeline": pipeline_name,
+                            "for_each_flowgroups": for_each_names,
+                            "other_flowgroups": other_names,
+                        },
+                        suggestions=[
+                            "Move non-for_each flowgroups to a separate pipeline, or "
+                            "convert all flowgroups in this pipeline to for_each.",
+                        ],
+                    )
+                )
+
+        return errors
 
     def validate_duplicate_pipeline_flowgroup(
         self, flowgroups: List[FlowGroup]

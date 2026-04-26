@@ -458,6 +458,99 @@ create the table.
 
    ADR-003 §Q5 for the full analysis of the ``UC LOCATION_OVERLAP`` failure mode.
 
+LHP-CFG-031: Separator Collision in for_each Pipeline or Flowgroup Name
+------------------------------------------------------------------------
+
+**When it occurs:** A flowgroup declares ``workflow.execution_mode: for_each`` and
+either the ``pipeline`` or the ``flowgroup`` field contains the literal ``::`` string.
+
+**Why it is an error:** The B2 batch-manifest system uses ``<pipeline>::<flowgroup>``
+as a composite row key. A ``::`` already present in either component makes the key
+unparseable and corrupt.
+
+**Common causes:**
+
+- Using ``::`` as a hierarchical separator in pipeline or flowgroup names before
+  the B2 feature was available
+- Copying a legacy flowgroup name convention to a new for_each flowgroup
+
+**Resolution:**
+
+Replace ``::`` with a different separator (e.g. ``-`` or ``_``) in the ``pipeline``
+or ``flowgroup`` field.
+
+.. code-block:: yaml
+   :caption: Before (triggers LHP-CFG-031)
+
+   pipeline: bronze::core
+   workflow:
+     execution_mode: for_each
+
+.. code-block:: yaml
+   :caption: After (fixed)
+
+   pipeline: bronze_core
+   workflow:
+     execution_mode: for_each
+
+**Note:** Legacy flowgroups that do *not* use ``execution_mode: for_each`` are not
+affected by this check and may continue using ``::`` in their names.
+
+LHP-CFG-032: Composite load_group Not Unique Within Project
+------------------------------------------------------------
+
+**When it occurs:** Two or more flowgroups that both declare
+``workflow.execution_mode: for_each`` produce the same composite key
+``<pipeline>::<flowgroup>``.
+
+**Why it is an error:** The B2 manifest stores one row per concrete action using the
+composite as a namespace identifier. Duplicate composites cause manifest rows from
+separate flowgroups to collide, corrupting watermark and iteration state.
+
+**Common causes:**
+
+- Renaming a flowgroup mid-development without checking for an existing flowgroup
+  with the same pipeline + flowgroup combination
+
+**Resolution:**
+
+Rename the ``pipeline`` or ``flowgroup`` field in one of the conflicting flowgroups
+so that the resulting composite ``<pipeline>::<flowgroup>`` is unique across the
+project.
+
+LHP-CFG-033: for_each Post-Expansion Structural Violation
+----------------------------------------------------------
+
+**When it occurs:** This code covers four distinct structural checks that run after
+template expansion for flowgroups with ``workflow.execution_mode: for_each``:
+
+1. **Action count out of bounds** — fewer than 1 or more than 300 actions.
+2. **Shared-key disagreement** — ``jdbc_watermark_v2`` actions in the same flowgroup
+   differ in ``source_system_id``, ``landing_path`` root prefix, ``wm_catalog``, or
+   ``wm_schema``.
+3. **Concurrency out of bounds** — ``workflow.concurrency`` is present and not in
+   ``[1, 100]``.
+4. **Mixed-mode pipeline** — a pipeline contains both ``for_each`` and non-``for_each``
+   flowgroups.
+
+**Why it is an error:** The B2 orchestrator issues a single ``iterations`` taskValue
+for the entire flowgroup and fans out over all actions in parallel. Structural
+inconsistencies prevent the manifest from being populated or the fan-out from being
+deterministic.
+
+**Resolutions by sub-check:**
+
+1. *Action count:* If zero, verify ``use_template`` + ``template_parameters`` produce
+   at least one action. If >300, split by source schema prefix or table subset into
+   multiple flowgroups — batch-scoped manifests isolate them.
+2. *Shared keys:* Ensure all actions in the flowgroup target the same source system
+   (``source_system_id``), landing zone root (``landing_path``), and watermark
+   catalog/schema. Split into separate flowgroups if they belong to different systems.
+3. *Concurrency:* Set ``workflow.concurrency`` to a value in ``[1, 100]``, or omit it
+   to use the default ``min(action_count, 10)``.
+4. *Mixed mode:* Move non-``for_each`` flowgroups to a separate pipeline, or convert
+   all flowgroups in the pipeline to ``for_each``.
+
 LHP-CFG-020: Bundle Resource Error
 -----------------------------------
 
