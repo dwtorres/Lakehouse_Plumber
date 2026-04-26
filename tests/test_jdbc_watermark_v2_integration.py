@@ -606,14 +606,14 @@ class TestJDBCWatermarkV2ForEachIntegration:
         """prepare_manifest aux file is written to generated/crm_bronze/."""
         project = _build_b2_project(tmp_path, _B2_FLOWGROUP_YAML_3)
         _, output_dir = self._generate(project)
-        pm = output_dir / "crm_bronze" / "__lhp_prepare_manifest_product_ingestion.py"
+        pm = output_dir / "crm_bronze_extract" / "__lhp_prepare_manifest_product_ingestion.py"
         assert pm.exists(), f"prepare_manifest aux file not found at {pm}"
 
     def test_b2_validate_aux_file_exists(self, tmp_path):
         """validate aux file is written to generated/crm_bronze/."""
         project = _build_b2_project(tmp_path, _B2_FLOWGROUP_YAML_3)
         _, output_dir = self._generate(project)
-        val = output_dir / "crm_bronze" / "__lhp_validate_product_ingestion.py"
+        val = output_dir / "crm_bronze_extract" / "__lhp_validate_product_ingestion.py"
         assert val.exists(), f"validate aux file not found at {val}"
 
     def test_b2_extraction_notebook_has_taskvale_header(self, tmp_path):
@@ -686,10 +686,10 @@ class TestJDBCWatermarkV2ForEachIntegration:
         output_dir = project / "generated"
         # No B2 aux files should be emitted for legacy mode
         assert not (
-            output_dir / "crm_bronze" / "__lhp_prepare_manifest_product_ingestion.py"
+            output_dir / "crm_bronze_extract" / "__lhp_prepare_manifest_product_ingestion.py"
         ).exists()
         assert not (
-            output_dir / "crm_bronze" / "__lhp_validate_product_ingestion.py"
+            output_dir / "crm_bronze_extract" / "__lhp_validate_product_ingestion.py"
         ).exists()
 
     # ------------------------------------------------------------------
@@ -886,7 +886,7 @@ class TestJDBCWatermarkV2ForEachIntegration:
         )
         project = _build_b2_project(tmp_path, flowgroup_yaml)
         _, output_dir = self._generate(project)
-        pm = output_dir / "crm_bronze" / "__lhp_prepare_manifest_product_ingestion.py"
+        pm = output_dir / "crm_bronze_extract" / "__lhp_prepare_manifest_product_ingestion.py"
         assert pm.exists(), "prepare_manifest aux file not found for 300-action flowgroup"
         content = pm.read_text()
         # Each of the 299 JDBC load actions contributes one entry in _manifest_rows
@@ -961,16 +961,16 @@ class TestJDBCWatermarkV2ForEachIntegration:
         # Dev project
         dev_project = _build_b2_project(tmp_path / "dev_proj", dev_yaml)
         _, dev_out = self._generate(dev_project, env="dev")
-        dev_pm = (dev_out / "crm_bronze" / "__lhp_prepare_manifest_product_ingestion.py").read_text()
+        dev_pm = (dev_out / "crm_bronze_extract" / "__lhp_prepare_manifest_product_ingestion.py").read_text()
         assert "dev_metadata" in dev_pm, "dev wm_catalog not found in prepare_manifest"
         assert "dev_orchestration" in dev_pm, "dev wm_schema not found in prepare_manifest"
-        dev_val = (dev_out / "crm_bronze" / "__lhp_validate_product_ingestion.py").read_text()
+        dev_val = (dev_out / "crm_bronze_extract" / "__lhp_validate_product_ingestion.py").read_text()
         assert "dev_metadata" in dev_val, "dev wm_catalog not found in validate"
 
         # Prod project
         prod_project = _build_b2_project(tmp_path / "prod_proj", prod_yaml)
         _, prod_out = self._generate(prod_project, env="prod")
-        prod_pm = (prod_out / "crm_bronze" / "__lhp_prepare_manifest_product_ingestion.py").read_text()
+        prod_pm = (prod_out / "crm_bronze_extract" / "__lhp_prepare_manifest_product_ingestion.py").read_text()
         assert "prod_metadata" in prod_pm, "prod wm_catalog not found in prepare_manifest"
         assert "prod_orchestration" in prod_pm, "prod wm_schema not found in prepare_manifest"
 
@@ -993,7 +993,7 @@ class TestJDBCWatermarkV2ForEachIntegration:
         )
         project = _build_b2_project(tmp_path, parity_yaml)
         _, output_dir = self._generate(project)
-        val = (output_dir / "crm_bronze" / "__lhp_validate_product_ingestion.py").read_text()
+        val = (output_dir / "crm_bronze_extract" / "__lhp_validate_product_ingestion.py").read_text()
         assert "parity_mismatches" in val, (
             "Expected parity SQL block in validate.py when parity_check: true; "
             "did not find 'parity_mismatches'"

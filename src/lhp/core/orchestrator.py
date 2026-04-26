@@ -1043,10 +1043,16 @@ class ActionOrchestrator:
                         None,
                     )
                     if flowgroup_for_aux and flowgroup_for_aux._auxiliary_files:
-                        # Extraction notebooks go to sibling _extract/ dir
-                        # (outside pipeline glob scope) to prevent DLT loading them
+                        # Extraction notebooks (worker, B2 prepare_manifest, B2
+                        # validate) go to sibling _extract/ dir (outside pipeline
+                        # glob scope) to prevent DLT loading them.
+                        _EXTRACT_AUX_PREFIXES = (
+                            "__lhp_extract_",
+                            "__lhp_prepare_manifest_",
+                            "__lhp_validate_",
+                        )
                         has_extract_aux = any(
-                            k.startswith("__lhp_extract_") and k.endswith(".py")
+                            k.startswith(_EXTRACT_AUX_PREFIXES) and k.endswith(".py")
                             for k in flowgroup_for_aux._auxiliary_files
                         )
                         if has_extract_aux:
@@ -1060,7 +1066,7 @@ class ActionOrchestrator:
                             aux_content,
                         ) in flowgroup_for_aux._auxiliary_files.items():
                             if aux_name.startswith(
-                                "__lhp_extract_"
+                                _EXTRACT_AUX_PREFIXES
                             ) and aux_name.endswith(".py"):
                                 aux_file = extract_dir / aux_name
                             else:
@@ -1143,11 +1149,17 @@ class ActionOrchestrator:
                         self.logger.info(f"Generated: {output_file}")
 
                         # Write auxiliary files (e.g. Python load placeholder)
-                        # Extraction notebooks go to sibling _extract/ dir
-                        # (outside pipeline glob scope) to prevent DLT loading them
+                        # Extraction notebooks (worker, B2 prepare_manifest, B2
+                        # validate) go to sibling _extract/ dir (outside pipeline
+                        # glob scope) to prevent DLT loading them.
                         if processed_flowgroup._auxiliary_files:
+                            _EXTRACT_AUX_PREFIXES = (
+                                "__lhp_extract_",
+                                "__lhp_prepare_manifest_",
+                                "__lhp_validate_",
+                            )
                             has_extract_aux = any(
-                                k.startswith("__lhp_extract_") and k.endswith(".py")
+                                k.startswith(_EXTRACT_AUX_PREFIXES) and k.endswith(".py")
                                 for k in processed_flowgroup._auxiliary_files
                             )
                             if has_extract_aux:
@@ -1161,7 +1173,7 @@ class ActionOrchestrator:
                                 aux_content,
                             ) in processed_flowgroup._auxiliary_files.items():
                                 if aux_name.startswith(
-                                    "__lhp_extract_"
+                                    _EXTRACT_AUX_PREFIXES
                                 ) and aux_name.endswith(".py"):
                                     aux_file = extract_dir / aux_name
                                 else:
