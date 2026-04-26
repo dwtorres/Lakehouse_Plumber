@@ -454,6 +454,13 @@ class ConfigValidator:
                 return getattr(action.watermark, "catalog", None)
             if key == "wm_schema":
                 return getattr(action.watermark, "schema", None)
+            if key == "watermark_type":
+                wm_type = getattr(action.watermark, "type", None)
+                # Pydantic stores enums as Enum instances; normalise to .value
+                # so set comparison works on plain strings across versions.
+                return getattr(wm_type, "value", wm_type)
+            if key == "watermark_operator":
+                return getattr(action.watermark, "operator", None)
             return None
 
         def _landing_root(action: Action) -> Optional[str]:
@@ -465,11 +472,17 @@ class ConfigValidator:
                 return "/" + "/".join(parts[:3])
             return path or None
 
+        # ``watermark_type`` and ``watermark_operator`` join the homogeneity
+        # check (devtest 2026-04-26 Anomaly A safety net): the worker template
+        # branches statically on both — heterogeneous values across actions
+        # would silently apply action[0]'s rendered branch to every iteration.
         checks: List[Tuple[str, Any]] = [
             ("source_system_id", [_wm_value(a, "source_system_id") for a in wm_actions]),
             ("landing_path root", [_landing_root(a) for a in wm_actions]),
             ("wm_catalog", [_wm_value(a, "wm_catalog") for a in wm_actions]),
             ("wm_schema", [_wm_value(a, "wm_schema") for a in wm_actions]),
+            ("watermark_type", [_wm_value(a, "watermark_type") for a in wm_actions]),
+            ("watermark_operator", [_wm_value(a, "watermark_operator") for a in wm_actions]),
         ]
 
         for key_name, values in checks:

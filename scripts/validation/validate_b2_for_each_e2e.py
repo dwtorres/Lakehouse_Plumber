@@ -77,6 +77,11 @@ dbutils.widgets.text(
     "(Optional) Absolute workspace path to prepend to sys.path when the lhp package is not installed",
 )
 dbutils.widgets.text("cleanup_on_success", "true", "Drop smoke bronze tables + delete test rows after PASS")
+dbutils.widgets.text(
+    "job_name",
+    "edp_b2_smoke_jdbc_workflow",
+    "Job name to validate (dev mode prefixes '[dev <user>] ' to the bundle job name)",
+)
 
 bundle_root = dbutils.widgets.get("bundle_root").strip().rstrip("/")
 wm_catalog = dbutils.widgets.get("wm_catalog").strip()
@@ -84,6 +89,7 @@ wm_schema = dbutils.widgets.get("wm_schema").strip()
 load_group = dbutils.widgets.get("load_group").strip()
 lhp_workspace_path = dbutils.widgets.get("lhp_workspace_path").strip()
 cleanup_on_success = dbutils.widgets.get("cleanup_on_success").strip().lower() == "true"
+job_name = dbutils.widgets.get("job_name").strip()
 
 # COMMAND ----------
 
@@ -115,6 +121,8 @@ _host = (
     .apiUrl()
     .get()
 )
+if _host and not _host.startswith(("http://", "https://")):
+    _host = f"https://{_host}"
 _token = (
     dbutils.notebook.entry_point.getDbutils()
     .notebook()
@@ -127,7 +135,10 @@ import urllib.request  # noqa: E402 — stdlib, always available
 
 
 def _api(method: str, path: str, body: Optional[Dict] = None) -> Dict:
-    url = f"{_host.rstrip('/')}/api/2.1{path}"
+    # Devtest 2026-04-26 fix: use Jobs API 2.2. The for_each iteration
+    # array on /jobs/runs/get?include_history=true is only populated by 2.2;
+    # 2.1 returns the parent run shape without nested iterations.
+    url = f"{_host.rstrip('/')}/api/2.2{path}"
     data = json.dumps(body).encode() if body else None
     req = urllib.request.Request(
         url,
@@ -230,29 +241,48 @@ def _cleanup() -> None:
 
 # COMMAND ----------
 
-_job_name = "edp_b2_smoke_jdbc_workflow"
+_job_name = job_name
 _job_id = _get_job_id(_job_name)
 _first_run = _get_latest_run(_job_id)
 _first_run_id = _first_run["run_id"]
 
-# Extract batch_id from the prepare_manifest task output taskValues.
-# prepare_manifest emits: dbutils.jobs.taskValues.set(key="iterations", value=...)
-# The batch_id is encoded in the manifest rows we query in V3.
+# Extract batch_id from the validate task's notebook exit JSON. Devtest
+# 2026-04-26 fix: the original implementation queried prepare_manifest's
+# notebook_output, which is empty (prepare_manifest emits a taskValue, not a
+# notebook.exit payload). validate.py.j2 emits batch_id inside its exit
+# JSON, so we read it from there. We also need the per-task run_ids to
+# inspect for_each iterations (V2) and the validate output (V5), so resolve
+# both up front.
 _batch_id: Optional[str] = None
+_for_each_run_id: Optional[int] = None
+_validate_run_id: Optional[int] = None
+_validate_result_str: str = ""
 try:
     _tasks_resp = _api("GET", f"/jobs/runs/get?run_id={_first_run_id}&include_history=true")
     for _task in _tasks_resp.get("tasks", []):
-        if _task.get("task_key") == "prepare_manifest":
-            # Attempt to retrieve batch_id from task notebook output.
-            _nb_output = _task.get("notebook_output", {})
-            _result_str = _nb_output.get("result", "")
-            try:
-                _task_result = json.loads(_result_str)
-                _batch_id = _task_result.get("batch_id")
-            except (json.JSONDecodeError, TypeError):
-                pass
-except Exception:  # noqa: BLE001 — non-fatal; V3 falls back to load_group filter
-    pass
+        tk = _task.get("task_key")
+        if tk == "for_each_ingest":
+            _for_each_run_id = _task.get("run_id")
+        elif tk == "validate":
+            _validate_run_id = _task.get("run_id")
+    if _validate_run_id is not None:
+        _v_out = _api("GET", f"/jobs/runs/get-output?run_id={_validate_run_id}")
+        _validate_result_str = (_v_out.get("notebook_output") or {}).get("result", "")
+        try:
+            _batch_id = (json.loads(_validate_result_str) or {}).get("batch_id")
+        except (json.JSONDecodeError, TypeError):
+            pass
+    if _batch_id is None:
+        # Fall back to the most recent batch_id for this load_group from
+        # b2_manifests, ordered by created_at to handle non-sortable UUIDs.
+        _row = spark.sql(
+            f"SELECT batch_id FROM {wm_catalog}.{wm_schema}.b2_manifests "
+            f"WHERE load_group = '{load_group}' "
+            f"ORDER BY created_at DESC LIMIT 1"
+        ).collect()
+        _batch_id = _row[0]["batch_id"] if _row else None
+except Exception as _e:  # noqa: BLE001 — non-fatal; downstream invariants will surface gaps
+    print(f"warning: pre-flight resolution failed: {_e!r}")
 
 print(f"first_run_id={_first_run_id}  batch_id={_batch_id}")
 
@@ -285,28 +315,28 @@ def v1_workflow_shape() -> Dict[str, Any]:
 
 
 def v2_for_each_iterations() -> Dict[str, Any]:
+    # Devtest 2026-04-26 fix: iteration sub-runs hang off the for_each
+    # task's OWN run_id, not the parent workflow run_id. The parent run's
+    # tasks[] entry exposes that nested run_id; query it with
+    # include_history=true to get .iterations[].
+    if _for_each_run_id is None:
+        return {"ok": False, "error": "for_each_ingest task run_id not resolved"}
     run_detail = _api(
         "GET",
-        f"/jobs/runs/get?run_id={_first_run_id}&include_history=true",
+        f"/jobs/runs/get?run_id={_for_each_run_id}&include_history=true",
     )
-    for_each_task = next(
-        (t for t in run_detail.get("tasks", []) if t["task_key"] == "for_each_ingest"),
-        None,
-    )
-    if for_each_task is None:
-        return {"ok": False, "error": "for_each_ingest task not found in run"}
-
-    iterations = for_each_task.get("iterations", [])
+    iterations = run_detail.get("iterations", [])
     total = len(iterations)
     succeeded = [it for it in iterations if it.get("state", {}).get("result_state") == "SUCCESS"]
     failed = [it for it in iterations if it.get("state", {}).get("result_state") != "SUCCESS"]
 
     return {
+        "for_each_run_id": _for_each_run_id,
         "total_iterations": total,
         "succeeded_n": len(succeeded),
         "failed_iterations": [
             {
-                "index": it.get("iteration_index"),
+                "run_id": it.get("run_id"),
                 "result_state": it.get("state", {}).get("result_state"),
             }
             for it in failed
@@ -324,29 +354,25 @@ def v2_for_each_iterations() -> Dict[str, Any]:
 
 
 def v3_manifest_rows() -> Dict[str, Any]:
-    # Prefer batch_id filter if we captured it; fall back to load_group + run_id prefix.
-    if _batch_id:
-        query = f"""
-            SELECT COUNT(*) AS cnt, COLLECT_LIST(action_name) AS actions
-            FROM {wm_catalog}.{wm_schema}.b2_manifests
-            WHERE batch_id = '{_batch_id}'
-        """
-        context = {"filter": "batch_id", "batch_id": _batch_id}
-    else:
-        query = f"""
-            SELECT COUNT(*) AS cnt, COLLECT_LIST(action_name) AS actions
-            FROM {wm_catalog}.{wm_schema}.b2_manifests
-            WHERE load_group = '{load_group}'
-              AND run_id LIKE 'job-%'
-        """
-        context = {"filter": "load_group+run_id_prefix", "load_group": load_group}
-
+    # Devtest 2026-04-26 fix: the prior fallback queried `run_id` which is
+    # not a column on b2_manifests (only `worker_run_id` is). Pre-flight now
+    # always resolves _batch_id (validate JSON, then created_at fallback);
+    # the secondary fallback is gone because there is no safe column to
+    # filter on without batch_id.
+    if not _batch_id:
+        return {"ok": False, "error": "_batch_id unresolved during pre-flight"}
+    query = f"""
+        SELECT COUNT(*) AS cnt, COLLECT_LIST(action_name) AS actions
+        FROM {wm_catalog}.{wm_schema}.b2_manifests
+        WHERE batch_id = '{_batch_id}'
+    """
     row = spark.sql(query).first()
     cnt = int(row["cnt"])
     actions = sorted(row["actions"] or [])
 
     return {
-        **context,
+        "filter": "batch_id",
+        "batch_id": _batch_id,
         "observed_count": cnt,
         "expected_count": 3,
         "actions": actions,
@@ -363,13 +389,23 @@ def v3_manifest_rows() -> Dict[str, Any]:
 
 
 def v4_watermark_rows() -> Dict[str, Any]:
+    # Devtest 2026-04-26 fix: watermarks has no `action_name` column. Join
+    # b2_manifests → watermarks via worker_run_id = run_id, then surface
+    # action_name from manifest. Filter strictly by the resolved batch_id.
+    if not _batch_id:
+        return {"ok": False, "error": "_batch_id unresolved during pre-flight"}
     rows = spark.sql(
         f"""
-        SELECT action_name, status, row_count, run_id
-        FROM {wm_catalog}.{wm_schema}.watermarks
-        WHERE load_group = '{load_group}'
-          AND run_id LIKE 'job-%'
-        ORDER BY action_name
+        SELECT m.action_name,
+               w.status,
+               w.row_count,
+               w.run_id,
+               w.table_name
+        FROM {wm_catalog}.{wm_schema}.b2_manifests m
+        JOIN {wm_catalog}.{wm_schema}.watermarks w
+          ON w.run_id = m.worker_run_id
+        WHERE m.batch_id = '{_batch_id}'
+        ORDER BY m.action_name
         """
     ).collect()
 
@@ -378,12 +414,14 @@ def v4_watermark_rows() -> Dict[str, Any]:
     nonzero = [r for r in completed if int(r["row_count"]) > 0]
 
     return {
+        "batch_id": _batch_id,
         "total_rows": total,
         "completed_n": len(completed),
         "nonzero_row_count_n": len(nonzero),
         "rows": [
             {
                 "action_name": r["action_name"],
+                "table_name": r["table_name"],
                 "status": r["status"],
                 "row_count": int(r["row_count"]),
                 "run_id": r["run_id"],
@@ -403,19 +441,12 @@ def v4_watermark_rows() -> Dict[str, Any]:
 
 
 def v5_validate_task_exit_json() -> Dict[str, Any]:
-    run_detail = _api(
-        "GET",
-        f"/jobs/runs/get?run_id={_first_run_id}&include_history=true",
-    )
-    validate_task = next(
-        (t for t in run_detail.get("tasks", []) if t["task_key"] == "validate"),
-        None,
-    )
-    if validate_task is None:
-        return {"ok": False, "error": "validate task not found in run"}
-
-    nb_output = validate_task.get("notebook_output", {})
-    result_str = nb_output.get("result", "")
+    # Devtest 2026-04-26 fix: notebook_output is empty when fetched off the
+    # parent run; you must call /jobs/runs/get-output against the validate
+    # task's own run_id (resolved during pre-flight as _validate_result_str).
+    result_str = _validate_result_str
+    if not result_str:
+        return {"ok": False, "error": "validate task output empty (run_id unresolved or task did not exit JSON)"}
 
     try:
         summary = json.loads(result_str)
@@ -448,8 +479,9 @@ def v5_validate_task_exit_json() -> Dict[str, Any]:
 
 
 def r12_second_run_zero_duplicates() -> Dict[str, Any]:
-    # Trigger a second synchronous run of the same job.
-    run_resp = _api("POST", "/jobs/runs/now", {"job_id": _job_id})
+    # Devtest 2026-04-26 fix: the Jobs 2.1 endpoint is /jobs/run-now (with a
+    # hyphen), not /jobs/runs/now. The previous spelling returned HTTP 404.
+    run_resp = _api("POST", "/jobs/run-now", {"job_id": _job_id})
     second_run_id = run_resp["run_id"]
     print(f"R12: triggered second run_id={second_run_id} — waiting for completion...")
 
@@ -466,40 +498,59 @@ def r12_second_run_zero_duplicates() -> Dict[str, Any]:
             ),
         }
 
-    # Capture batch_id from second run's prepare_manifest output.
+    # Devtest 2026-04-26 fix: source second_batch_id from validate task's
+    # exit JSON (not prepare_manifest, which emits no result), and join into
+    # watermarks for row_count — b2_manifests tracks orchestration state but
+    # not row_count.
     second_batch_id: Optional[str] = None
     try:
         second_detail = _api(
             "GET",
             f"/jobs/runs/get?run_id={second_run_id}&include_history=true",
         )
-        for task in second_detail.get("tasks", []):
-            if task.get("task_key") == "prepare_manifest":
-                nb_output = task.get("notebook_output", {})
-                try:
-                    task_result = json.loads(nb_output.get("result", ""))
-                    second_batch_id = task_result.get("batch_id")
-                except (json.JSONDecodeError, TypeError):
-                    pass
-    except Exception:  # noqa: BLE001
-        pass
-
-    # Assert every load action's row_count = 0 in b2_manifests for second run.
-    if second_batch_id:
-        filter_clause = f"batch_id = '{second_batch_id}'"
-    else:
-        filter_clause = (
-            f"load_group = '{load_group}'"
-            f" AND run_id LIKE 'job-%'"
-            f" AND run_id != '{_first_run_id}'"
+        validate_run_id = next(
+            (
+                t.get("run_id")
+                for t in second_detail.get("tasks", [])
+                if t.get("task_key") == "validate"
+            ),
+            None,
         )
+        if validate_run_id is not None:
+            v_out = _api("GET", f"/jobs/runs/get-output?run_id={validate_run_id}")
+            v_result = (v_out.get("notebook_output") or {}).get("result", "")
+            try:
+                second_batch_id = (json.loads(v_result) or {}).get("batch_id")
+            except (json.JSONDecodeError, TypeError):
+                pass
+    except Exception as _e:  # noqa: BLE001
+        print(f"R12 warning: could not resolve second_batch_id: {_e!r}")
+    if not second_batch_id:
+        # Fall back to most-recent created_at for this load_group, excluding
+        # the first batch we already validated.
+        _row = spark.sql(
+            f"SELECT batch_id FROM {wm_catalog}.{wm_schema}.b2_manifests "
+            f"WHERE load_group = '{load_group}' AND batch_id <> '{_batch_id}' "
+            f"ORDER BY created_at DESC LIMIT 1"
+        ).collect()
+        second_batch_id = _row[0]["batch_id"] if _row else None
+    if not second_batch_id:
+        return {
+            "ok": False,
+            "second_run_id": second_run_id,
+            "error": "could not resolve second_batch_id from validate output or manifest fallback",
+        }
 
+    # Per-action row_count comes from watermarks joined through manifest
+    # (b2_manifests has no row_count column).
     rows = spark.sql(
         f"""
-        SELECT action_name, row_count
-        FROM {wm_catalog}.{wm_schema}.b2_manifests
-        WHERE {filter_clause}
-        ORDER BY action_name
+        SELECT m.action_name, COALESCE(w.row_count, 0) AS row_count
+        FROM {wm_catalog}.{wm_schema}.b2_manifests m
+        LEFT JOIN {wm_catalog}.{wm_schema}.watermarks w
+          ON w.run_id = m.worker_run_id
+        WHERE m.batch_id = '{second_batch_id}'
+        ORDER BY m.action_name
         """
     ).collect()
 

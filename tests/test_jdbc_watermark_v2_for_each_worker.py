@@ -255,6 +255,11 @@ def _default_b2_iteration() -> Dict[str, str]:
         "batch_id": "job-10-task-20-attempt-0",
         "manifest_table": "metadata.devtest_orchestration.b2_manifests",
         "action_name": "load_orders",
+        # Anomaly A — these MUST be passed per-iteration so the shared B2 worker
+        # operates on the correct table/landing/watermark column for each spawn.
+        "jdbc_table": '"Sales"."Orders"',
+        "watermark_column": "ModifiedDate",
+        "landing_path": "/Volumes/landing/landing/landing/sales/orders",
     }
 
 
@@ -339,6 +344,126 @@ def test_b2_no_static_source_system_id_json_literal() -> None:
     # The static literal form is: SQLInputValidator.string("pg_prod")
     assert 'SQLInputValidator.string("pg_prod")' not in rendered, (
         "B2 render must not embed static source_system_id literal"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Anomaly A regression — B2 worker must source per-action attrs from iteration
+# kwargs, not from action[0]'s codegen-time literal. Three fields:
+#   jdbc_table, watermark_column, landing_path
+# ---------------------------------------------------------------------------
+
+
+def test_b2_jdbc_table_read_from_iteration_not_literal() -> None:
+    """Anomaly A: jdbc_table must be sourced from iteration[...] in B2 mode."""
+    rendered = _render(
+        execution_mode="for_each",
+        jdbc_table='"Sales"."Orders"',  # render-time literal that must NOT leak
+    )
+    assert 'iteration["jdbc_table"]' in rendered, (
+        "B2 render must read jdbc_table from iteration kwargs"
+    )
+    assert 'SQLInputValidator.string("\\"Sales\\".\\"Orders\\"")' not in rendered, (
+        "B2 render must NOT embed action[0]'s jdbc_table as a static literal"
+    )
+
+
+def test_b2_watermark_column_read_from_iteration_not_literal() -> None:
+    """Anomaly A: watermark_column must come from iteration in B2 mode."""
+    rendered = _render(
+        execution_mode="for_each",
+        watermark_column="ModifiedDate",
+    )
+    assert 'iteration["watermark_column"]' in rendered, (
+        "B2 render must read watermark_column from iteration kwargs"
+    )
+    assert 'SQLInputValidator.string("ModifiedDate")' not in rendered, (
+        "B2 render must NOT embed action[0]'s watermark_column as a static literal"
+    )
+
+
+def test_b2_landing_path_read_from_iteration_not_literal() -> None:
+    """Anomaly A: landing_root must come from iteration in B2 mode."""
+    leaked = "/Volumes/landing/landing/landing/sales/orders"
+    rendered = _render(execution_mode="for_each", landing_path=leaked)
+    assert 'iteration["landing_path"]' in rendered, (
+        "B2 render must read landing_path from iteration kwargs"
+    )
+    # Permit the path to appear in template comments only — but not as a Python
+    # literal landing_root assignment. The cheap, durable check is the
+    # assignment form rendered by the legacy branch.
+    assert f'landing_root = "{leaked}"' not in rendered, (
+        "B2 render must NOT assign landing_root from action[0]'s static literal"
+    )
+
+
+def test_legacy_jdbc_table_still_static_literal() -> None:
+    """Legacy mode keeps the per-action static literal — no regression."""
+    rendered = _render(execution_mode=None, jdbc_table='"Sales"."Orders"')
+    assert 'iteration["jdbc_table"]' not in rendered, (
+        "Legacy render must not introduce iteration kwargs lookups"
+    )
+    assert '"Sales"."Orders"' in rendered or '\\"Sales\\".\\"Orders\\"' in rendered, (
+        "Legacy render must embed jdbc_table as a Python literal"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Anomaly B regression — worker must transition manifest execution_status to
+# 'completed' on the success path and 'failed' on the except path so operators
+# (and downstream tooling) can read the manifest as an authoritative log.
+# ---------------------------------------------------------------------------
+
+
+def test_b2_worker_updates_manifest_to_completed_on_success() -> None:
+    """B2 success path: worker must emit UPDATE … SET execution_status = 'completed'."""
+    rendered = _render(execution_mode="for_each", watermark_operator=">")
+    assert "execution_status = 'completed'" in rendered, (
+        "B2 worker must UPDATE manifest execution_status to 'completed' "
+        "after mark_complete on the success path"
+    )
+
+
+def test_b2_worker_updates_manifest_to_failed_on_except() -> None:
+    """B2 except path: worker must emit UPDATE … SET execution_status = 'failed'."""
+    rendered = _render(execution_mode="for_each", watermark_operator=">")
+    assert "execution_status = 'failed'" in rendered, (
+        "B2 worker must UPDATE manifest execution_status to 'failed' before "
+        "re-raising in the except branch"
+    )
+
+
+def test_b2_runtime_emits_completed_update_on_success(monkeypatch: Any) -> None:
+    """Runtime: spark.sql receives an UPDATE … 'completed' statement on happy path.
+
+    Drives the rendered notebook through the recovery branch (parquet absent)
+    is too narrow; instead, mock _landing_has_parquet to True and stub the
+    JDBC read to return an empty schema. We assert the SQL stream contains the
+    completion UPDATE — this is the only signal the operator + validate task
+    has that the worker reached terminal-success state.
+    """
+    rendered = _render(execution_mode="for_each", watermark_operator=">")
+    spark = _RecordingSpark()
+    iteration = _default_b2_iteration()
+    dbutils = _FakeDbutils(run_id="job-1-task-2-attempt-0", iteration=iteration)
+
+    # We only care about SQL recording; if the rendered notebook attempts a
+    # real JDBC read, the test will fail with a recognisable error before
+    # the assertion — that's acceptable failure-first behaviour.
+    try:
+        _run_rendered(rendered, spark, dbutils)
+    except Exception:
+        # Either the bug is still present (no completion UPDATE issued) or
+        # JDBC read fails — the assertion below disambiguates.
+        pass
+
+    completed_updates = [
+        s for s in spark.statements
+        if "UPDATE" in s.upper() and "execution_status = 'completed'" in s
+    ]
+    assert len(completed_updates) >= 1, (
+        f"B2 worker must issue an UPDATE … 'completed' SQL statement on "
+        f"success; recorded SQL was:\n{spark.statements}"
     )
 
 

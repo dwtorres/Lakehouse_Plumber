@@ -96,21 +96,26 @@ _load_group = sql_literal(SQLInputValidator.string({{ load_group|tojson }}))
 
 # COMMAND ----------
 
-# Resolve batch_id: read MAX(batch_id) from b2_manifests filtered by load_group
-# within the last 24 hours. This is the only safe way to reconstruct prepare_
-# manifest's batch_id from a separate DAB task — derive_run_id(dbutils) would
-# return a different token because validate has a different task_run_id.
-# A NULL result means no rows were seeded for this load_group today → noop pass.
-_batch_id_row = spark.sql(
+# Resolve batch_id: pick the most-recently-created batch for this load_group
+# within the last 24 hours. derive_run_id(dbutils) cannot be reused here
+# because validate runs as a separate DAB task with a different
+# task_run_id. Devtest 2026-04-26 fix — the previous query used
+# MAX(batch_id) which sorts UUID-style batch_ids lexicographically; with
+# back-to-back runs that returned an OLDER batch when its UUID happened to
+# sort higher than the newest one. ORDER BY created_at DESC is the only
+# total order that matches operator intent.
+_batch_id_rows = spark.sql(
     f"""
-    SELECT MAX(batch_id) AS batch_id
+    SELECT batch_id
     FROM   {_manifest_table}
     WHERE  load_group = {_load_group}
       AND  created_at > current_timestamp() - INTERVAL 24 HOURS
+    ORDER BY created_at DESC
+    LIMIT 1
     """
-).collect()[0]
+).collect()
 
-_batch_id_raw = _batch_id_row["batch_id"]
+_batch_id_raw = _batch_id_rows[0]["batch_id"] if _batch_id_rows else None
 
 if _batch_id_raw is None:
     # No manifest rows for this load_group within the 24-hour window.

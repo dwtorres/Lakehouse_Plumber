@@ -466,6 +466,12 @@ class JDBCWatermarkJobGenerator(BaseActionGenerator):
                         host_match.group(1) if host_match else "unknown"
                     )
 
+                # Anomaly A regression net (devtest 2026-04-26) — every
+                # per-action source/destination value MUST flow through the
+                # iteration payload so the shared B2 worker can scope each
+                # iteration correctly. Keys here are mirrored in
+                # lhp.models.b2_iteration.B2_ITERATION_KEYS and asserted by
+                # tests/test_b2_iteration_contract.py.
                 actions_list.append(
                     {
                         "action_name": fg_action.name,
@@ -473,6 +479,11 @@ class JDBCWatermarkJobGenerator(BaseActionGenerator):
                         "schema_name": src.get("schema_name", ""),
                         "table_name": src.get("table_name", ""),
                         "load_group": load_group,
+                        "jdbc_table": src.get("table", ""),
+                        "watermark_column": (
+                            getattr(action_wm, "column", "") if action_wm else ""
+                        ),
+                        "landing_path": fg_action.landing_path or "",
                     }
                 )
 

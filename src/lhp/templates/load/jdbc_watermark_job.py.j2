@@ -65,7 +65,10 @@ wm = WatermarkManager(
 # '"Production"."Product"' for a Postgres pre-quoted identifier) round-trip
 # unchanged into the notebook source.
 {% if execution_mode == "for_each" %}
-# B2 for_each path — unpack iteration kwargs from taskValues / widgets
+# B2 for_each path — unpack iteration kwargs from taskValues / widgets.
+# Keys mirror lhp.models.b2_iteration.B2_ITERATION_KEYS — adding a key here
+# requires the matching emission in prepare_manifest.py.j2 (and a constant
+# update). tests/test_b2_iteration_contract.py enforces the symmetry.
 iteration_json = dbutils.widgets.get("__lhp_iteration")
 iteration = json.loads(iteration_json)
 source_system_id = SQLInputValidator.string(iteration["source_system_id"])
@@ -75,15 +78,24 @@ load_group = SQLInputValidator.string(iteration["load_group"])
 batch_id = SQLInputValidator.string(iteration["batch_id"])
 manifest_table = SQLInputValidator.identifier(iteration["manifest_table"])
 action_name = SQLInputValidator.string(iteration["action_name"])
+# Anomaly A (devtest 2026-04-26): the worker is shared across every action in
+# the flowgroup, so jdbc_table / watermark_column / landing_path MUST come
+# from the iteration payload, never from a codegen-time literal of the first
+# action. SecretCodeGenerator regex is sensitive to stray apostrophes in
+# comments — keep this block apostrophe-free.
+jdbc_table = SQLInputValidator.string(iteration["jdbc_table"])
+watermark_column = SQLInputValidator.string(iteration["watermark_column"])
+landing_root = iteration["landing_path"]
 {% else %}
 # legacy static path — keep existing literals
 source_system_id = SQLInputValidator.string({{ source_system_id|tojson }})
 schema_name = SQLInputValidator.string({{ schema_name|tojson }})
 table_name = SQLInputValidator.string({{ table_name|tojson }})
 load_group = {{ load_group|tojson }}
-{% endif %}
 watermark_column = SQLInputValidator.string({{ watermark_column|tojson }})
 jdbc_table = SQLInputValidator.string({{ jdbc_table|tojson }})
+landing_root = {{ landing_path|tojson }}
+{% endif %}
 
 hwm_result = wm.get_latest_watermark(
     source_system_id=source_system_id,
@@ -92,7 +104,6 @@ hwm_result = wm.get_latest_watermark(
     load_group=load_group,
 )
 hwm_value = hwm_result["watermark_value"] if hwm_result else None
-landing_root = {{ landing_path|tojson }}
 {% if execution_mode == "for_each" %}
 logged_action_name = action_name
 {% else %}
@@ -320,6 +331,23 @@ try:
 
     extraction_succeeded = True
 except Exception as e:
+{% if execution_mode == "for_each" %}
+    # Anomaly B (devtest 2026-04-26): mirror failure into b2_manifests so the
+    # manifest is an authoritative state log on its own, not a join-only
+    # surface coalesced against watermarks. Emitted BEFORE wm.mark_failed so
+    # the R4 mark_failed→raise slice stays byte-identical with the legacy
+    # branch (test_r4_raise_on_failure_block_verbatim_between_modes).
+    # Best-effort: a failure here must not mask the real exception below.
+    try:
+        # SQL is intentionally inlined on one logical line so every rendered
+        # line in this except-block stays indented (R4 helper invariant).
+        spark.sql(
+            f"UPDATE {manifest_table} SET execution_status = 'failed', updated_at = current_timestamp() "
+            f"WHERE batch_id = {sql_literal(batch_id)} AND action_name = {sql_literal(action_name)}"
+        )
+    except Exception:  # noqa: BLE001 — manifest mirror is best-effort
+        pass
+{% endif %}
     # FR-L-02: audit the failure, then re-raise so Workflow task-level retries fire.
     wm.mark_failed(
         run_id=run_id,
@@ -370,6 +398,15 @@ if extraction_succeeded:
             row_count=row_count,
             watermark_value=completion_value_sql,
         )
+{% if execution_mode == "for_each" %}
+        # Anomaly B (devtest 2026-04-26): transition manifest to 'completed'
+        # so b2_manifests is a standalone source of truth instead of being
+        # masked by validate.py's coalesce(worker_status, manifest_status).
+        spark.sql(
+            f"UPDATE {manifest_table} SET execution_status = 'completed', updated_at = current_timestamp() "
+            f"WHERE batch_id = {sql_literal(batch_id)} AND action_name = {sql_literal(action_name)}"
+        )
+{% endif %}
     except TerminalStateGuardError:
         # Row was moved to terminal failure upstream; leave it, propagate.
         raise

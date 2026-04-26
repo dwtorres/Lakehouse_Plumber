@@ -28,9 +28,12 @@ resources:
             inputs: "{% raw %}{{tasks.prepare_manifest.values.iterations}}{% endraw %}"
             concurrency: {{ concurrency }}
             task:
+              task_key: ingest_one
               notebook_task:
                 notebook_path: {{ worker_path }}
                 source: WORKSPACE
+                base_parameters:
+                  __lhp_iteration: "{% raw %}{{input}}{% endraw %}"
               max_retries: {{ max_retries }}
         - task_key: validate
           depends_on:

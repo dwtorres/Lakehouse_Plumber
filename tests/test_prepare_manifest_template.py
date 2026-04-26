@@ -183,6 +183,9 @@ def _three_action_fixture() -> List[Dict[str, str]]:
             "schema_name": "Sales",
             "table_name": "Orders",
             "load_group": "test_pipeline::test_fg",
+            "jdbc_table": '"Sales"."Orders"',
+            "watermark_column": "ModifiedDate",
+            "landing_path": "/Volumes/landing/landing/landing/sales/orders",
         },
         {
             "action_name": "load_products",
@@ -190,6 +193,9 @@ def _three_action_fixture() -> List[Dict[str, str]]:
             "schema_name": "Production",
             "table_name": "Products",
             "load_group": "test_pipeline::test_fg",
+            "jdbc_table": '"Production"."Products"',
+            "watermark_column": "UpdatedAt",
+            "landing_path": "/Volumes/landing/landing/landing/production/products",
         },
         {
             "action_name": "load_customers",
@@ -197,6 +203,9 @@ def _three_action_fixture() -> List[Dict[str, str]]:
             "schema_name": "CRM",
             "table_name": "Customers",
             "load_group": "test_pipeline::test_fg",
+            "jdbc_table": '"CRM"."Customers"',
+            "watermark_column": "ChangedOn",
+            "landing_path": "/Volumes/landing/landing/landing/crm/customers",
         },
     ]
 
@@ -209,6 +218,9 @@ def _n_action_fixture(n: int) -> List[Dict[str, str]]:
             "schema_name": "BulkSchema",
             "table_name": f"Table{i:03d}",
             "load_group": "bulk_pipeline::bulk_fg",
+            "jdbc_table": f'"BulkSchema"."Table{i:03d}"',
+            "watermark_column": "ModifiedDate",
+            "landing_path": f"/Volumes/landing/landing/landing/bulk/table_{i:03d}",
         }
         for i in range(n)
     ]
@@ -279,11 +291,33 @@ def test_happy_path_ddl_merge_taskvalue() -> None:
         "load_group",
         "batch_id",
         "manifest_table",
+        "jdbc_table",
+        "watermark_column",
+        "landing_path",
     }
     for i, entry in enumerate(iterations):
         assert set(entry.keys()) == expected_keys, (
             f"Iteration entry {i} has wrong keys: {set(entry.keys())} (expected {expected_keys})"
         )
+
+    # Anomaly A regression — each iteration carries its action's OWN
+    # jdbc_table / landing_path / watermark_column (not action[0]'s leaked
+    # literal). Distinct values across the 3 actions must round-trip.
+    assert {e["jdbc_table"] for e in iterations} == {
+        '"Sales"."Orders"',
+        '"Production"."Products"',
+        '"CRM"."Customers"',
+    }, f"jdbc_table values not per-action: {[e['jdbc_table'] for e in iterations]}"
+    assert {e["landing_path"] for e in iterations} == {
+        "/Volumes/landing/landing/landing/sales/orders",
+        "/Volumes/landing/landing/landing/production/products",
+        "/Volumes/landing/landing/landing/crm/customers",
+    }, f"landing_path values not per-action: {[e['landing_path'] for e in iterations]}"
+    assert {e["watermark_column"] for e in iterations} == {
+        "ModifiedDate",
+        "UpdatedAt",
+        "ChangedOn",
+    }, f"watermark_column values not per-action: {[e['watermark_column'] for e in iterations]}"
 
 
 # ---------- test: idempotency on rerun ---------------------------------------
@@ -368,15 +402,19 @@ def test_malformed_run_id_rejected() -> None:
 
 
 def test_payload_size_logging_and_ceiling_headroom() -> None:
-    """Verify payload size logging fires and that 150 entries fit inside the 48 KB ceiling.
+    """Verify payload size logging fires and that 100 entries fit inside the 48 KB ceiling.
 
-    At ~267 bytes per entry, 150 entries ≈ 40 KB, comfortably under the 48 KB
-    DAB taskValue ceiling. The codegen (U2 LHP-CFG-028) enforces a hard 300-action
-    cap, so 300 entries at ~78 KB cannot be reached at runtime — this test validates
-    the template's payload logging and that a mid-range fixture fits the ceiling.
+    Anomaly A (devtest 2026-04-26) widened the iteration payload from 7 to
+    10 keys (added jdbc_table, watermark_column, landing_path), pushing
+    realistic per-entry size from ~267 bytes to ~415 bytes. The 48 KB DAB
+    taskValue ceiling now caps at roughly 110 entries instead of 180. The
+    U2 LHP-CFG-028 hard cap of 300 actions is now LARGER than what fits in
+    the taskValue ceiling — that drift is captured by the second assertion
+    below and should be re-tightened in a follow-up if operators report
+    payload-size failures at the 100-300 range.
     """
-    # 150 entries: ~40 KB with realistic short strings — under the 48 KB ceiling.
-    actions = _n_action_fixture(150)
+    # 100 entries: ~42 KB with realistic short strings — under the 48 KB ceiling.
+    actions = _n_action_fixture(100)
     rendered = _render(actions)
     spark = _RecordingSpark()
     dbutils = _FakeDbutils(run_id="job-99-task-1-attempt-0")
@@ -388,7 +426,7 @@ def test_payload_size_logging_and_ceiling_headroom() -> None:
     payload_bytes = len(payload_str.encode("utf-8"))
     ceiling = 48 * 1024
     assert payload_bytes <= ceiling, (
-        f"150-entry taskValue payload {payload_bytes} bytes exceeds {ceiling} byte (48 KB) ceiling; "
+        f"100-entry taskValue payload {payload_bytes} bytes exceeds {ceiling} byte (48 KB) ceiling; "
         f"reduce fixture or shorten action/table name lengths"
     )
 

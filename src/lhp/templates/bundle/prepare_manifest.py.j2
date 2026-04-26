@@ -9,12 +9,15 @@
      pipeline_name   : str  — parent pipeline identifier
      flowgroup_name  : str  — flowgroup identifier
      actions         : list[dict] — post-expansion concrete action records;
-                        each dict has exactly these 5 keys:
+                        each dict has exactly these 8 keys:
                           action_name      : str
                           source_system_id : str
                           schema_name      : str
                           table_name       : str
                           load_group       : str
+                          jdbc_table       : str   (B2 Anomaly A regression)
+                          watermark_column : str   (B2 Anomaly A regression)
+                          landing_path     : str   (B2 Anomaly A regression)
    ──────────────────────────────────────────────────────────────────────────
    Control flow (B2 R1, R1a, R2, R9):
      1. UTC session timezone (FR-L-07)
@@ -199,9 +202,12 @@ execute_with_concurrent_commit_retry(
 
 # COMMAND ----------
 
-# R2: Build iterations JSON array — one entry per concrete action, exactly
-# 7 keys. The manifest_table value is included so the for_each worker can
-# reference the manifest table without needing separate codegen context.
+# R2: Build iterations JSON array — one entry per concrete action.
+# Frozen contract: keys MUST match lhp.models.b2_iteration.B2_ITERATION_KEYS.
+# Devtest 2026-04-26 (Anomaly A) added jdbc_table, watermark_column, and
+# landing_path to this payload so the shared B2 worker can scope each
+# iteration to the correct action instead of leaking literals from the
+# first action.
 _iterations = [
 {% for action in actions %}
     {
@@ -212,6 +218,9 @@ _iterations = [
         "load_group": {{ action.load_group|tojson }},
         "batch_id": batch_id,
         "manifest_table": manifest_table,
+        "jdbc_table": {{ action.jdbc_table|tojson }},
+        "watermark_column": {{ action.watermark_column|tojson }},
+        "landing_path": {{ action.landing_path|tojson }},
     },
 {% endfor %}
 ]

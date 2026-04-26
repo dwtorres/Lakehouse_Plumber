@@ -374,6 +374,44 @@ class TestSharedKeys:
         # Should not raise
         validator._validate_for_each_invariants(fg)
 
+    def test_error_disagreeing_watermark_type(self):
+        """Different watermark.type across actions in for_each → LHP-CFG-033.
+
+        Anomaly A safety net: the worker template branches statically on
+        watermark_type ({% if watermark_type == "timestamp" %}…), so all
+        actions in a for_each flowgroup MUST share the same type.
+        """
+        validator = ConfigValidator()
+        a1 = _wm_action(name="load_1")
+        a2 = _wm_action(name="load_2")
+        # Force a2's watermark to numeric to disagree.
+        a2.watermark.type = WatermarkType.NUMERIC
+        fg = _fg_for_each(actions=[a1, a2])
+        with pytest.raises(LHPConfigError) as exc_info:
+            validator._validate_for_each_invariants(fg)
+        err = exc_info.value
+        assert err.code == "LHP-CFG-033"
+        assert "watermark_type" in err.context.get("key", "")
+
+    def test_error_disagreeing_watermark_operator(self):
+        """Different watermark.operator across actions in for_each → LHP-CFG-033.
+
+        Anomaly A safety net: operator is rendered into the worker once at
+        codegen time. Heterogeneous operators across actions would silently
+        apply the first action's operator to every iteration.
+        """
+        validator = ConfigValidator()
+        a1 = _wm_action(name="load_1")
+        a2 = _wm_action(name="load_2")
+        a1.watermark.operator = ">"
+        a2.watermark.operator = ">="
+        fg = _fg_for_each(actions=[a1, a2])
+        with pytest.raises(LHPConfigError) as exc_info:
+            validator._validate_for_each_invariants(fg)
+        err = exc_info.value
+        assert err.code == "LHP-CFG-033"
+        assert "watermark_operator" in err.context.get("key", "")
+
 
 # ---------------------------------------------------------------------------
 # LHP-CFG-033: post-expansion structure — concurrency bounds
