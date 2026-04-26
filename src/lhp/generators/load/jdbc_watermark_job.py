@@ -183,6 +183,30 @@ def _check_landing_schema_overlap(
         )
 
 
+def _build_watermark_operator(watermark: Any, flowgroup: Any) -> str:
+    """Return watermark comparison operator honouring R12 B2 strict-'>' default.
+
+    Rules (in priority order):
+      1. Explicit override: watermark.operator != ">=" → use it verbatim.
+      2. B2 for_each mode + no explicit override: return ">".
+      3. Legacy static-emission or no watermark: return ">=".
+
+    The Pydantic default for WatermarkConfig.operator is ">="; we treat "=="
+    as "not overridden" because the field accepts only ">=" or ">".  An
+    operator explicitly set to ">=" in YAML is indistinguishable at this layer
+    — in B2 mode it still gets promoted to ">", which is the safe direction.
+    """
+    _b2_for_each = bool(
+        flowgroup
+        and flowgroup.workflow
+        and flowgroup.workflow.get("execution_mode") == "for_each"
+    )
+    if watermark and watermark.operator and watermark.operator != ">=":
+        # Explicit non-default override wins in all modes.
+        return watermark.operator
+    return ">" if _b2_for_each else ">="
+
+
 class JDBCWatermarkJobGenerator(BaseActionGenerator):
     """Generator for jdbc_watermark_v2 source type.
 
@@ -240,7 +264,16 @@ class JDBCWatermarkJobGenerator(BaseActionGenerator):
             "wm_schema": wm_schema,
             "watermark_column": watermark.column if watermark else "",
             "watermark_type": watermark.type.value if watermark else "timestamp",
-            "watermark_operator": watermark.operator if watermark else ">=",
+            # R12: B2 (execution_mode=for_each) defaults to strict ">" to prevent
+            # duplicate max-watermark boundary rows on second run (Direct-JDBC spike
+            # 2026-04-25 evidence). Legacy static-emission flowgroups keep ">=" for
+            # back-compat. Operator-explicit watermark.operator overrides both.
+            "watermark_operator": _build_watermark_operator(watermark, flowgroup),
+            "execution_mode": (
+                flowgroup.workflow.get("execution_mode")
+                if flowgroup and flowgroup.workflow
+                else None
+            ),
             "jdbc_url": jdbc_url,
             "jdbc_user": jdbc_user,
             "jdbc_password": jdbc_password,
