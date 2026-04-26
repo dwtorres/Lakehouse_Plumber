@@ -522,6 +522,329 @@ def seed_load_group(env, flowgroup, apply, dry_run, catalog, schema, warehouse_i
     )
 
 
+@cli.command("init-registry")
+@click.option(
+    "--env",
+    "-e",
+    default=None,
+    help="Environment name (resolves catalog/schema from substitutions/<env>.yaml). "
+    "Mutually exclusive with --catalog/--schema for the standard path.",
+)
+@click.option(
+    "--catalog",
+    default=None,
+    help="Override watermark registry catalog (rehearsal / B13 bypass).",
+)
+@click.option(
+    "--schema",
+    default=None,
+    help="Override watermark registry schema (rehearsal / B13 bypass).",
+)
+@click.option(
+    "--warehouse-id",
+    default=None,
+    help="Databricks SQL warehouse ID (or set DATABRICKS_WAREHOUSE_ID env var).",
+)
+@click.option(
+    "--profile",
+    default=None,
+    help="Databricks CLI profile (default: dbc-8e058692-373e per project memory).",
+)
+@click.option(
+    "--max-wait-seconds",
+    type=int,
+    default=600,
+    help="Hard cap on per-statement poll duration (default 600s).",
+)
+@cli_error_boundary("Init Tier 2 watermark registry")
+def init_registry(env, catalog, schema, warehouse_id, profile, max_wait_seconds):
+    """Trigger Tier 2 auto-DDL on the watermark registry via SQL Statement API.
+
+    Replaces the fragile pipeline-run trigger + workspace-cluster fallback
+    notebook from plan v5 §Phase 2.2 (B4, H10). Issues the same conditional
+    CREATE / ALTER SQL that WatermarkManager._ensure_table_exists would run,
+    but without a Spark session.
+    """
+    from .commands.init_registry_command import InitRegistryCommand
+
+    InitRegistryCommand().execute(
+        env=env,
+        catalog=catalog,
+        schema=schema,
+        warehouse_id=warehouse_id,
+        profile=profile,
+        max_wait_seconds=max_wait_seconds,
+    )
+
+
+@cli.command("validate-tier2")
+@click.option(
+    "--env",
+    "-e",
+    default=None,
+    help="Environment name (resolves catalog/schema from substitutions/<env>.yaml).",
+)
+@click.option(
+    "--catalog",
+    default=None,
+    help="Override watermark registry catalog (rehearsal / B13 bypass).",
+)
+@click.option(
+    "--schema",
+    default=None,
+    help="Override watermark registry schema (rehearsal / B13 bypass).",
+)
+@click.option(
+    "--probe-schema",
+    default=None,
+    help="Probe-table schema (default: <catalog>.<env>_validation per plan H3). "
+    "Format: <catalog>.<schema>.",
+)
+@click.option(
+    "--probe-table-name",
+    default="watermarks_v1_probe",
+    help="Probe-table bare name (default: watermarks_v1_probe).",
+)
+@click.option(
+    "--cluster-id",
+    default=None,
+    help="Existing interactive cluster id (or set DATABRICKS_CLUSTER_ID env var). "
+    "Cluster must have lhp_watermark wheel installed.",
+)
+@click.option(
+    "--workspace-target",
+    default=None,
+    help="Workspace path for the imported notebook "
+    "(default: /Shared/lhp_validation/validate_tier2_load_group).",
+)
+@click.option(
+    "--profile",
+    default=None,
+    help="Databricks CLI profile (default: dbc-8e058692-373e).",
+)
+@click.option(
+    "--max-wait-seconds",
+    type=int,
+    default=1800,
+    help="Hard cap on notebook-run poll duration (default 1800s).",
+)
+@click.option(
+    "--poll-interval-seconds",
+    type=int,
+    default=10,
+    help="Poll interval for run state (default 10s).",
+)
+@cli_error_boundary("Validate Tier 2 V1-V5")
+def validate_tier2(
+    env,
+    catalog,
+    schema,
+    probe_schema,
+    probe_table_name,
+    cluster_id,
+    workspace_target,
+    profile,
+    max_wait_seconds,
+    poll_interval_seconds,
+):
+    """Run V1-V5 validation against a Tier 2 watermark registry.
+
+    Workspace-imports scripts/validation/validate_tier2_load_group.py,
+    submits as a one-off Jobs run with widget params bound, polls until
+    terminal, parses the exit JSON. Exits 0 on PASS; non-zero with per-V
+    diagnostic on FAIL. Replaces plan v5 §Phase 5.4 manual notebook upload.
+    """
+    from .commands.validate_tier2_command import (
+        DEFAULT_WORKSPACE_TARGET,
+        ValidateTier2Command,
+    )
+
+    ValidateTier2Command().execute(
+        env=env,
+        catalog=catalog,
+        schema=schema,
+        probe_schema=probe_schema,
+        probe_table_name=probe_table_name,
+        cluster_id=cluster_id,
+        workspace_target=workspace_target or DEFAULT_WORKSPACE_TARGET,
+        profile=profile,
+        max_wait_seconds=max_wait_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+    )
+
+
+@cli.group("tier2-rollout")
+def tier2_rollout():
+    """Tier 2 rollout umbrella: preflight | backfill | optimize | rehearse | seed.
+
+    Per plan v5 §Workstream B (S5/S8). Use these subcommands to drive the
+    operator runbook phases via Python (uses databricks-sdk; replaces bash
+    polling helpers).
+    """
+
+
+@tier2_rollout.command("preflight")
+@click.option("--env", "-e", default=None)
+@click.option("--catalog", default=None)
+@click.option("--schema", default=None)
+@click.option("--warehouse-id", default=None)
+@click.option("--profile", default=None)
+@click.option("--max-wait-seconds", type=int, default=600)
+@cli_error_boundary("tier2-rollout preflight")
+def tier2_rollout_preflight(
+    env, catalog, schema, warehouse_id, profile, max_wait_seconds
+):
+    """§Phase 1.A + H23 protocol gate (read-only)."""
+    from .commands.tier2_rollout_command import Tier2RolloutCommand
+
+    Tier2RolloutCommand().preflight(
+        env=env,
+        catalog=catalog,
+        schema=schema,
+        warehouse_id=warehouse_id,
+        profile=profile,
+        max_wait_seconds=max_wait_seconds,
+    )
+
+
+@tier2_rollout.command("backfill")
+@click.option("--env", "-e", default=None)
+@click.option("--catalog", default=None)
+@click.option("--schema", default=None)
+@click.option("--warehouse-id", default=None)
+@click.option("--profile", default=None)
+@click.option("--max-wait-seconds", type=int, default=1800)
+@click.option(
+    "--skip-pre-check",
+    is_flag=True,
+    default=False,
+    help="Skip B6 pre-check (use only for re-runs after pre-check has passed).",
+)
+@cli_error_boundary("tier2-rollout backfill")
+def tier2_rollout_backfill(
+    env, catalog, schema, warehouse_id, profile, max_wait_seconds, skip_pre_check
+):
+    """§Phase 3: backfill load_group='legacy' WHERE NULL."""
+    from .commands.tier2_rollout_command import Tier2RolloutCommand
+
+    Tier2RolloutCommand().backfill(
+        env=env,
+        catalog=catalog,
+        schema=schema,
+        warehouse_id=warehouse_id,
+        profile=profile,
+        max_wait_seconds=max_wait_seconds,
+        skip_pre_check=skip_pre_check,
+    )
+
+
+@tier2_rollout.command("optimize")
+@click.option("--env", "-e", default=None)
+@click.option("--catalog", default=None)
+@click.option("--schema", default=None)
+@click.option("--warehouse-id", default=None)
+@click.option("--profile", default=None)
+@click.option(
+    "--full",
+    is_flag=True,
+    default=False,
+    help="Use OPTIMIZE FULL (required first run post-clustering-change per B5).",
+)
+@click.option("--max-wait-seconds", type=int, default=7200)
+@cli_error_boundary("tier2-rollout optimize")
+def tier2_rollout_optimize(
+    env, catalog, schema, warehouse_id, profile, full, max_wait_seconds
+):
+    """§Phase 4: OPTIMIZE [FULL] watermark registry."""
+    from .commands.tier2_rollout_command import Tier2RolloutCommand
+
+    Tier2RolloutCommand().optimize(
+        env=env,
+        catalog=catalog,
+        schema=schema,
+        warehouse_id=warehouse_id,
+        profile=profile,
+        full=full,
+        max_wait_seconds=max_wait_seconds,
+    )
+
+
+@tier2_rollout.command("rehearse")
+@click.option(
+    "--source-table",
+    required=True,
+    help="Live registry FQN (e.g. metadata.prod_orchestration.watermarks).",
+)
+@click.option(
+    "--target-schema",
+    required=True,
+    help="Rehearsal-clone schema FQN (e.g. metadata.prod_dryrun_orchestration). "
+    "Clone is created at <target_schema>.watermarks (table name MUST be 'watermarks' per L17).",
+)
+@click.option("--warehouse-id", default=None)
+@click.option("--profile", default=None)
+@click.option("--max-wait-seconds", type=int, default=7200)
+@click.option(
+    "--skip-optimize",
+    is_flag=True,
+    default=False,
+    help="Skip OPTIMIZE FULL on the rehearsal clone (faster, less realistic).",
+)
+@cli_error_boundary("tier2-rollout rehearse")
+def tier2_rollout_rehearse(
+    source_table,
+    target_schema,
+    warehouse_id,
+    profile,
+    max_wait_seconds,
+    skip_optimize,
+):
+    """§Phase 8.1: dress rehearsal — version-pinned deep clone + Tier 2 phases.
+
+    Does NOT bundle-deploy; does NOT exercise concurrent writers (H21).
+    """
+    from .commands.tier2_rollout_command import Tier2RolloutCommand
+
+    Tier2RolloutCommand().rehearse(
+        source_table=source_table,
+        target_schema=target_schema,
+        warehouse_id=warehouse_id,
+        profile=profile,
+        max_wait_seconds=max_wait_seconds,
+        skip_optimize=skip_optimize,
+    )
+
+
+@tier2_rollout.command("seed")
+@click.option("--env", "-e", required=True)
+@click.option("--flowgroup", "-f", required=True)
+@click.option("--apply", is_flag=True, default=False)
+@click.option("--dry-run", is_flag=True, default=True)
+@click.option("--catalog", default=None)
+@click.option("--schema", default=None)
+@click.option("--warehouse-id", default=None)
+@cli_error_boundary("tier2-rollout seed")
+def tier2_rollout_seed(env, flowgroup, apply, dry_run, catalog, schema, warehouse_id):
+    """§Phase 6 wrapper around `lhp seed-load-group` for umbrella parity.
+
+    Note (M9 unresolved): this delegates to the existing seed-load-group
+    command which uses ``wait_timeout=30s`` without polling. For long-running
+    apply paths, prefer running seed-load-group directly with explicit
+    timeout management until M9 is resolved in the seed CLI.
+    """
+    from .commands.seed_load_group_command import SeedLoadGroupCommand
+
+    SeedLoadGroupCommand().execute(
+        env=env,
+        flowgroup=flowgroup,
+        apply=apply,
+        dry_run=dry_run,
+        catalog=catalog,
+        schema=schema,
+        warehouse_id=warehouse_id,
+    )
+
+
 # ============================================================================
 # Entry Point
 # ============================================================================
