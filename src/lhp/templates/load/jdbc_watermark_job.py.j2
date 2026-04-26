@@ -46,7 +46,7 @@ from lhp_watermark import (  # noqa: E402  — import follows sys.path bootstrap
     WatermarkManager,
 )
 from lhp_watermark.runtime import derive_run_id  # noqa: E402
-from lhp_watermark.sql_safety import SQLInputValidator  # noqa: E402
+from lhp_watermark.sql_safety import SQLInputValidator, sql_literal  # noqa: E402
 
 # FR-L-07: DML against the watermark table must run in UTC.
 spark.conf.set("spark.sql.session.timeZone", "UTC")
@@ -64,13 +64,38 @@ wm = WatermarkManager(
 # tojson emits a Python-safe literal so values containing quotes (e.g.
 # '"Production"."Product"' for a Postgres pre-quoted identifier) round-trip
 # unchanged into the notebook source.
+{% if execution_mode == "for_each" %}
+# B2 for_each path — unpack iteration kwargs from taskValues / widgets.
+# Keys mirror lhp.models.b2_iteration.B2_ITERATION_KEYS — adding a key here
+# requires the matching emission in prepare_manifest.py.j2 (and a constant
+# update). tests/test_b2_iteration_contract.py enforces the symmetry.
+iteration_json = dbutils.widgets.get("__lhp_iteration")
+iteration = json.loads(iteration_json)
+source_system_id = SQLInputValidator.string(iteration["source_system_id"])
+schema_name = SQLInputValidator.string(iteration["schema_name"])
+table_name = SQLInputValidator.string(iteration["table_name"])
+load_group = SQLInputValidator.string(iteration["load_group"])
+batch_id = SQLInputValidator.string(iteration["batch_id"])
+manifest_table = SQLInputValidator.identifier(iteration["manifest_table"])
+action_name = SQLInputValidator.string(iteration["action_name"])
+# Anomaly A (devtest 2026-04-26): the worker is shared across every action in
+# the flowgroup, so jdbc_table / watermark_column / landing_path MUST come
+# from the iteration payload, never from a codegen-time literal of the first
+# action. SecretCodeGenerator regex is sensitive to stray apostrophes in
+# comments — keep this block apostrophe-free.
+jdbc_table = SQLInputValidator.string(iteration["jdbc_table"])
+watermark_column = SQLInputValidator.string(iteration["watermark_column"])
+landing_root = iteration["landing_path"]
+{% else %}
+# legacy static path — keep existing literals
 source_system_id = SQLInputValidator.string({{ source_system_id|tojson }})
 schema_name = SQLInputValidator.string({{ schema_name|tojson }})
 table_name = SQLInputValidator.string({{ table_name|tojson }})
+load_group = {{ load_group|tojson }}
 watermark_column = SQLInputValidator.string({{ watermark_column|tojson }})
 jdbc_table = SQLInputValidator.string({{ jdbc_table|tojson }})
-
-load_group = {{ load_group|tojson }}
+landing_root = {{ landing_path|tojson }}
+{% endif %}
 
 hwm_result = wm.get_latest_watermark(
     source_system_id=source_system_id,
@@ -79,8 +104,11 @@ hwm_result = wm.get_latest_watermark(
     load_group=load_group,
 )
 hwm_value = hwm_result["watermark_value"] if hwm_result else None
-landing_root = {{ landing_path|tojson }}
+{% if execution_mode == "for_each" %}
+logged_action_name = action_name
+{% else %}
 logged_action_name = {{ action_name|tojson }}
+{% endif %}
 
 
 def _log_phase(phase: str, **payload):
@@ -166,6 +194,20 @@ def _build_jdbc_query(hwm):
     SQLInputValidator.numeric(hwm_num)
     hwm_literal = str(hwm_num)
     {% endif %}
+    # R12 (B2): default operator is ">" for execution_mode: for_each.
+    # CAVEATS — operator awareness:
+    # 1. Sub-second precision: source watermark column should carry ms/μs precision.
+    #    Second-only sources risk losing rows on every re-run if writes share
+    #    the same second as max_wm.
+    # 2. Late-arriving records at exact max_wm timestamp: strict ">" skips them.
+    #    Operator may opt into a Δ-buffer subtraction in source query (e.g.
+    #    WHERE wm > max_wm - INTERVAL 5 MINUTE) for slow-emit sources.
+    # 3. Same-second collisions on high-volume second-precision sources:
+    #    composite tiebreaker (wm_col, pk) > (last_wm, last_pk) is a follow-up
+    #    if operator reports row loss.
+    # 4. UTC normalization: WatermarkManager._ensure_utc_session() enforces
+    #    spark.sql.session.timeZone='UTC' before any DML. The B2 worker path
+    #    inherits this via the same prelude.
     op = {{ watermark_operator|tojson }}
     if op not in (">=", ">", "<=", "<", "="):
         raise ValueError(f"unsupported watermark operator: {op!r}")
@@ -180,6 +222,33 @@ query = _build_jdbc_query(hwm_value)
 # FR-L-05 / L2 §5.3: insert_new is OUTSIDE the try block. A DuplicateRunError
 # here means no watermark row was created for this invocation, so mark_failed
 # has nothing to transition and must not be called.
+{% if execution_mode == "for_each" %}
+# B2 manifest UPDATE: claim this attempt's worker_run_id (optimistic-concurrency).
+# DAB-retry-timeout race: if UPDATE matches zero, read back current state.
+worker_run_id = run_id
+update_sql = f"""
+UPDATE {manifest_table}
+SET    worker_run_id    = {sql_literal(worker_run_id)},
+       execution_status = 'running',
+       updated_at       = current_timestamp()
+WHERE  batch_id    = {sql_literal(batch_id)}
+  AND  action_name = {sql_literal(action_name)}
+  AND  ( worker_run_id IS NULL OR worker_run_id = {sql_literal(worker_run_id)} )
+"""
+update_result = spark.sql(update_sql)
+# If zero rows affected, another retry-attempt may already own this row.
+# Read back; if we're not the current owner, abort with a retry-friendly error.
+readback = spark.sql(
+    f"SELECT worker_run_id FROM {manifest_table} "
+    f"WHERE batch_id = {sql_literal(batch_id)} "
+    f"AND action_name = {sql_literal(action_name)}"
+).collect()
+if readback and readback[0]["worker_run_id"] not in (None, worker_run_id):
+    raise RuntimeError(
+        f"LHP-MAN-002: manifest row for batch_id={batch_id} action={action_name} "
+        f"already claimed by worker_run_id={readback[0]['worker_run_id']}"
+    )
+{% endif %}
 extraction_type = "full" if hwm_value is None else "incremental"
 wm.insert_new(
     run_id=run_id,
@@ -221,6 +290,9 @@ try:
     )
     _log_phase("jdbc_read_complete", extraction_type=extraction_type)
 
+    # HIPAA hook insertion point: between JDBC read and landing write.
+    # Implementation deferred to HIPAA milestone — no executable code in this milestone.
+
     _log_phase("landing_write_start", landing_path=run_landing_path)
     df.write.mode("overwrite").format("parquet").save(run_landing_path)
 
@@ -259,6 +331,23 @@ try:
 
     extraction_succeeded = True
 except Exception as e:
+{% if execution_mode == "for_each" %}
+    # Anomaly B (devtest 2026-04-26): mirror failure into b2_manifests so the
+    # manifest is an authoritative state log on its own, not a join-only
+    # surface coalesced against watermarks. Emitted BEFORE wm.mark_failed so
+    # the R4 mark_failed→raise slice stays byte-identical with the legacy
+    # branch (test_r4_raise_on_failure_block_verbatim_between_modes).
+    # Best-effort: a failure here must not mask the real exception below.
+    try:
+        # SQL is intentionally inlined on one logical line so every rendered
+        # line in this except-block stays indented (R4 helper invariant).
+        spark.sql(
+            f"UPDATE {manifest_table} SET execution_status = 'failed', updated_at = current_timestamp() "
+            f"WHERE batch_id = {sql_literal(batch_id)} AND action_name = {sql_literal(action_name)}"
+        )
+    except Exception:  # noqa: BLE001 — manifest mirror is best-effort
+        pass
+{% endif %}
     # FR-L-02: audit the failure, then re-raise so Workflow task-level retries fire.
     wm.mark_failed(
         run_id=run_id,
@@ -309,6 +398,15 @@ if extraction_succeeded:
             row_count=row_count,
             watermark_value=completion_value_sql,
         )
+{% if execution_mode == "for_each" %}
+        # Anomaly B (devtest 2026-04-26): transition manifest to 'completed'
+        # so b2_manifests is a standalone source of truth instead of being
+        # masked by validate.py's coalesce(worker_status, manifest_status).
+        spark.sql(
+            f"UPDATE {manifest_table} SET execution_status = 'completed', updated_at = current_timestamp() "
+            f"WHERE batch_id = {sql_literal(batch_id)} AND action_name = {sql_literal(action_name)}"
+        )
+{% endif %}
     except TerminalStateGuardError:
         # Row was moved to terminal failure upstream; leave it, propagate.
         raise

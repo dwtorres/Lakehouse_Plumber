@@ -81,6 +81,59 @@ class TestModels:
         assert preset.extends == "base_preset"
         assert preset.defaults.get("schema_evolution") == "addNewColumns"
 
+    def test_flowgroup_workflow_for_each_keys(self):
+        """B2 (R7): FlowGroup.workflow accepts execution_mode + concurrency + max_retries."""
+        flowgroup = FlowGroup(
+            pipeline="bronze",
+            flowgroup="customers_daily",
+            workflow={
+                "execution_mode": "for_each",
+                "concurrency": 10,
+                "max_retries": 1,
+            },
+            actions=[
+                Action(name="load", type=ActionType.LOAD, target="raw"),
+            ],
+        )
+        assert flowgroup.workflow is not None
+        assert flowgroup.workflow.get("execution_mode") == "for_each"
+        assert flowgroup.workflow.get("concurrency") == 10
+        assert flowgroup.workflow.get("max_retries") == 1
+
+    def test_flowgroup_workflow_absent(self):
+        """B2 (R7): FlowGroup.workflow defaults to None when omitted."""
+        flowgroup = FlowGroup(
+            pipeline="bronze",
+            flowgroup="legacy",
+            actions=[Action(name="load", type=ActionType.LOAD, target="raw")],
+        )
+        assert flowgroup.workflow is None
+
+    def test_flowgroup_workflow_coexists_with_extraction_mode(self):
+        """B2 (R7): execution_mode + existing extraction_mode key coexist in same workflow dict."""
+        flowgroup = FlowGroup(
+            pipeline="bronze",
+            flowgroup="hybrid",
+            workflow={
+                "extraction_mode": "serial",
+                "execution_mode": "for_each",
+                "concurrency": 5,
+            },
+            actions=[Action(name="load", type=ActionType.LOAD, target="raw")],
+        )
+        assert flowgroup.workflow.get("extraction_mode") == "serial"
+        assert flowgroup.workflow.get("execution_mode") == "for_each"
+
+    def test_flowgroup_workflow_unsupported_execution_mode_not_rejected_at_model(self):
+        """B2 (R7): Model layer accepts arbitrary execution_mode string. Validator (U2) rejects unsupported values."""
+        flowgroup = FlowGroup(
+            pipeline="bronze",
+            flowgroup="invalid",
+            workflow={"execution_mode": "invalid_mode"},
+            actions=[Action(name="load", type=ActionType.LOAD, target="raw")],
+        )
+        assert flowgroup.workflow.get("execution_mode") == "invalid_mode"
+
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"]) 
+    pytest.main([__file__, "-v"])

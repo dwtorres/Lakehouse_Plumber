@@ -166,8 +166,21 @@ Service principal credentials via OIDC federation are preferred over static clie
   - Root cause: the DLT pipeline's `_dlt_metadata/checkpoints/<stream>/` retains AutoLoader source state from the prior run. When the source path changes, the streaming query replays the old path from checkpoint.
   - Fix: `databricks bundle run -t <target> --full-refresh-all <pipeline_name>` — resets DLT checkpoints and runs a full backfill from the new source. After success, subsequent runs can drop `--full-refresh-all`.
 
+## B2 (for_each) dependency
+
+Flowgroups that declare `workflow.execution_mode: for_each` (B2 topology) generate
+additional files — `prepare_manifest.py`, `validate.py`, and a `worker/` directory —
+under `generated/<env>/<pipeline>/`. The same `lhp sync-runtime` + `bundle deploy`
+sequence covers these files; no extra deploy steps are required.
+
+B2 has one hard prerequisite: the Tier 2 load_group registry axis must be deployed
+per environment before B2 workflows run. Tier 2 devtest sign-off completed 2026-04-25
+(V1-V5 PASS). See [`docs/runbooks/b2-for-each-rollout.md`](./b2-for-each-rollout.md)
+for the full B2 adoption walkthrough and V-checklist.
+
 ## Related
 
 - [ADR-002](../adr/ADR-002-lhp-runtime-availability.md) — decision record (amended 2026-04-19)
 - [Phase plan](../../tasks/plan.md) — implementation plan + Phase 4 evidence
 - Reference bundle: [`github.com/dwtorres/Wumbo`](https://github.com/dwtorres/Wumbo) — `scooty_puff_junior` (working Path 5 Option A example)
+- [B2 for_each rollout runbook](./b2-for-each-rollout.md) — operator adoption guide for `execution_mode: for_each`

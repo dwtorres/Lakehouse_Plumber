@@ -27,6 +27,7 @@ include:
 sync:
   include:
   -   generated/${bundle.target}/*
+  -   lhp_watermark/**
 
 targets:
 

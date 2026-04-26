@@ -1043,10 +1043,16 @@ class ActionOrchestrator:
                         None,
                     )
                     if flowgroup_for_aux and flowgroup_for_aux._auxiliary_files:
-                        # Extraction notebooks go to sibling _extract/ dir
-                        # (outside pipeline glob scope) to prevent DLT loading them
+                        # Extraction notebooks (worker, B2 prepare_manifest, B2
+                        # validate) go to sibling _extract/ dir (outside pipeline
+                        # glob scope) to prevent DLT loading them.
+                        _EXTRACT_AUX_PREFIXES = (
+                            "__lhp_extract_",
+                            "__lhp_prepare_manifest_",
+                            "__lhp_validate_",
+                        )
                         has_extract_aux = any(
-                            k.startswith("__lhp_extract_") and k.endswith(".py")
+                            k.startswith(_EXTRACT_AUX_PREFIXES) and k.endswith(".py")
                             for k in flowgroup_for_aux._auxiliary_files
                         )
                         if has_extract_aux:
@@ -1060,7 +1066,7 @@ class ActionOrchestrator:
                             aux_content,
                         ) in flowgroup_for_aux._auxiliary_files.items():
                             if aux_name.startswith(
-                                "__lhp_extract_"
+                                _EXTRACT_AUX_PREFIXES
                             ) and aux_name.endswith(".py"):
                                 aux_file = extract_dir / aux_name
                             else:
@@ -1143,11 +1149,17 @@ class ActionOrchestrator:
                         self.logger.info(f"Generated: {output_file}")
 
                         # Write auxiliary files (e.g. Python load placeholder)
-                        # Extraction notebooks go to sibling _extract/ dir
-                        # (outside pipeline glob scope) to prevent DLT loading them
+                        # Extraction notebooks (worker, B2 prepare_manifest, B2
+                        # validate) go to sibling _extract/ dir (outside pipeline
+                        # glob scope) to prevent DLT loading them.
                         if processed_flowgroup._auxiliary_files:
+                            _EXTRACT_AUX_PREFIXES = (
+                                "__lhp_extract_",
+                                "__lhp_prepare_manifest_",
+                                "__lhp_validate_",
+                            )
                             has_extract_aux = any(
-                                k.startswith("__lhp_extract_") and k.endswith(".py")
+                                k.startswith(_EXTRACT_AUX_PREFIXES) and k.endswith(".py")
                                 for k in processed_flowgroup._auxiliary_files
                             )
                             if has_extract_aux:
@@ -1161,7 +1173,7 @@ class ActionOrchestrator:
                                 aux_content,
                             ) in processed_flowgroup._auxiliary_files.items():
                                 if aux_name.startswith(
-                                    "__lhp_extract_"
+                                    _EXTRACT_AUX_PREFIXES
                                 ) and aux_name.endswith(".py"):
                                     aux_file = extract_dir / aux_name
                                 else:
@@ -1835,11 +1847,13 @@ class ActionOrchestrator:
 
         workflow_gen = WorkflowResourceGenerator()
 
-        # Group all v2 actions by pipeline name across flowgroups
+        # Group all v2 actions + source flowgroups by pipeline name.
         pipeline_v2_actions: dict = defaultdict(list)
-        pipeline_name_map: dict = {}  # pipeline_name → first flowgroup (for metadata)
+        pipeline_name_map: dict = {}   # pipeline_name → first flowgroup (for metadata)
+        pipeline_v2_flowgroups: dict = defaultdict(list)  # pipeline_name → flowgroups
 
         for flowgroup in processed_flowgroups:
+            has_v2 = False
             for action in flowgroup.actions:
                 if (
                     isinstance(action.source, dict)
@@ -1847,12 +1861,50 @@ class ActionOrchestrator:
                     == LoadSourceType.JDBC_WATERMARK_V2.value
                 ):
                     pipeline_v2_actions[flowgroup.pipeline].append(action)
+                    has_v2 = True
                     if flowgroup.pipeline not in pipeline_name_map:
                         pipeline_name_map[flowgroup.pipeline] = flowgroup
+            if has_v2:
+                pipeline_v2_flowgroups[flowgroup.pipeline].append(flowgroup)
 
         for pipeline_name, v2_actions in pipeline_v2_actions.items():
             try:
-                # Build a synthetic flowgroup with all v2 actions for this pipeline
+                # Same-pipeline same-execution_mode guard (R8, U7).
+                # U2's LHP-CFG-033 mixed-mode check should catch this earlier at
+                # validator stage with friendlier copy. This is the safety net at
+                # codegen.
+                pipeline_fgs = pipeline_v2_flowgroups[pipeline_name]
+                modes = set()
+                for fg in pipeline_fgs:
+                    mode = (
+                        fg.workflow.get("execution_mode")
+                        if isinstance(fg.workflow, dict)
+                        else None
+                    ) or "<default>"
+                    modes.add(mode)
+                if len(modes) > 1:
+                    raise LHPConfigError(
+                        category=ErrorCategory.CONFIG,
+                        code_number="034",
+                        title="Mixed execution_mode flowgroups in same pipeline",
+                        details=(
+                            f"Pipeline '{pipeline_name}' contains flowgroups with "
+                            f"conflicting execution_mode values: {sorted(modes)}. "
+                            "B2 codegen requires all flowgroups in one pipeline share "
+                            "the same execution_mode."
+                        ),
+                        context={
+                            "pipeline": pipeline_name,
+                            "modes": sorted(modes),
+                        },
+                        suggestions=[
+                            "Move the for_each flowgroup(s) into a separate pipeline name.",
+                            "Or remove `workflow.execution_mode: for_each` to keep the "
+                            "legacy emission.",
+                        ],
+                    )
+
+                # Build a synthetic flowgroup with all v2 actions for this pipeline.
                 ref_fg = pipeline_name_map[pipeline_name]
                 merged_fg = FG(
                     pipeline=pipeline_name,
@@ -1866,6 +1918,9 @@ class ActionOrchestrator:
                 workflow_file = resources_dir / f"{pipeline_name}_workflow.yml"
                 smart_writer.write_if_changed(workflow_file, workflow_yaml)
                 self.logger.info(f"Generated workflow resource: {workflow_file}")
+            except LHPConfigError:
+                # Mixed-mode guard: propagate so the caller surfaces the error.
+                raise
             except Exception as e:
                 self.logger.warning(
                     f"Failed to generate workflow resource for "
@@ -2021,6 +2076,22 @@ class ActionOrchestrator:
                 errors.extend(cdc_errors)
             except LHPError as e:
                 errors.append(f"CDC fan-in validation: {e}")
+
+            # Project-scope for_each invariants (composite uniqueness + mixed-mode).
+            # Needs the full project flowgroup list, not just this pipeline's subset,
+            # so that a composite collision across pipelines is caught.
+            try:
+                project_fg_list = (
+                    pre_discovered_all_flowgroups
+                    if pre_discovered_all_flowgroups is not None
+                    else flowgroups
+                )
+                project_errors = self.config_validator.validate_project_invariants(
+                    project_fg_list
+                )
+                errors.extend(str(e) for e in project_errors)
+            except LHPError as e:
+                errors.append(f"Project-scope for_each validation: {e}")
 
         except Exception as e:
             self.logger.debug("Pipeline validation failed", exc_info=True)

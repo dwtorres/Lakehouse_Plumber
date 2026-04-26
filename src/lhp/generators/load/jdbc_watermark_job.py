@@ -5,6 +5,18 @@ Produces two artifacts from a single jdbc_watermark_v2 action:
    and writes Parquet to a landing path (stored as auxiliary file)
 2. A CloudFiles DLT stub that reads from the landing path (returned as
    the primary output, delegated to CloudFilesLoadGenerator)
+
+B2 for_each mode (R3, R5):
+  When flowgroup.workflow.execution_mode == "for_each", emits THREE per-
+  flowgroup auxiliary files instead of one per-action file:
+    __lhp_extract_<flowgroup>.py        — single worker notebook (all actions
+                                           iterate from taskValues at runtime)
+    __lhp_prepare_manifest_<flowgroup>.py — rendered prepare_manifest.py.j2
+    __lhp_validate_<flowgroup>.py       — rendered validate.py.j2
+  The per-action __lhp_extract_<action_name>.py key is NOT emitted in B2
+  mode. All three B2 aux files are written exactly once (idempotent guard
+  on _auxiliary_files key presence prevents duplicate renders on multi-action
+  flowgroups).
 """
 
 import logging
@@ -15,7 +27,7 @@ from typing import Any, Dict
 import black
 
 from ...core.base_generator import BaseActionGenerator
-from ...models.config import Action
+from ...models.config import Action, ActionType
 from ...utils.error_formatter import ErrorCategory, LHPConfigError
 
 logger = logging.getLogger(__name__)
@@ -183,6 +195,30 @@ def _check_landing_schema_overlap(
         )
 
 
+def _build_watermark_operator(watermark: Any, flowgroup: Any) -> str:
+    """Return watermark comparison operator honouring R12 B2 strict-'>' default.
+
+    Rules (in priority order):
+      1. Explicit override: watermark.operator != ">=" → use it verbatim.
+      2. B2 for_each mode + no explicit override: return ">".
+      3. Legacy static-emission or no watermark: return ">=".
+
+    The Pydantic default for WatermarkConfig.operator is ">="; we treat "=="
+    as "not overridden" because the field accepts only ">=" or ">".  An
+    operator explicitly set to ">=" in YAML is indistinguishable at this layer
+    — in B2 mode it still gets promoted to ">", which is the safe direction.
+    """
+    _b2_for_each = bool(
+        flowgroup
+        and flowgroup.workflow
+        and flowgroup.workflow.get("execution_mode") == "for_each"
+    )
+    if watermark and watermark.operator and watermark.operator != ">=":
+        # Explicit non-default override wins in all modes.
+        return watermark.operator
+    return ">" if _b2_for_each else ">="
+
+
 class JDBCWatermarkJobGenerator(BaseActionGenerator):
     """Generator for jdbc_watermark_v2 source type.
 
@@ -240,7 +276,16 @@ class JDBCWatermarkJobGenerator(BaseActionGenerator):
             "wm_schema": wm_schema,
             "watermark_column": watermark.column if watermark else "",
             "watermark_type": watermark.type.value if watermark else "timestamp",
-            "watermark_operator": watermark.operator if watermark else ">=",
+            # R12: B2 (execution_mode=for_each) defaults to strict ">" to prevent
+            # duplicate max-watermark boundary rows on second run (Direct-JDBC spike
+            # 2026-04-25 evidence). Legacy static-emission flowgroups keep ">=" for
+            # back-compat. Operator-explicit watermark.operator overrides both.
+            "watermark_operator": _build_watermark_operator(watermark, flowgroup),
+            "execution_mode": (
+                flowgroup.workflow.get("execution_mode")
+                if flowgroup and flowgroup.workflow
+                else None
+            ),
             "jdbc_url": jdbc_url,
             "jdbc_user": jdbc_user,
             "jdbc_password": jdbc_password,
@@ -283,11 +328,43 @@ class JDBCWatermarkJobGenerator(BaseActionGenerator):
                 f"Action '{action.name}': extraction notebook failed Black formatting"
             )
 
-        # Store as auxiliary file on the flowgroup
+        # Determine B2 for_each mode from flowgroup workflow config.
+        execution_mode = (
+            flowgroup.workflow.get("execution_mode")
+            if flowgroup and flowgroup.workflow
+            else None
+        )
+        is_b2_for_each = execution_mode == "for_each"
+
+        # Store extraction notebook as auxiliary file on the flowgroup.
+        # B2 mode: one worker per flowgroup (keyed by flowgroup name), not per
+        # action.  The conditional header added by U5 handles all table
+        # iterations from a single render via taskValues at runtime.
+        # The idempotent guard prevents duplicate renders when the generator
+        # is called once per action on a multi-action flowgroup.
         if flowgroup:
-            aux_key = f"__lhp_extract_{action.name}.py"
-            flowgroup._auxiliary_files[aux_key] = extraction_code
-            logger.debug(f"Stored extraction notebook as auxiliary file '{aux_key}'")
+            if is_b2_for_each:
+                aux_key = f"__lhp_extract_{flowgroup.flowgroup}.py"
+                if aux_key not in flowgroup._auxiliary_files:
+                    flowgroup._auxiliary_files[aux_key] = extraction_code
+                    logger.debug(
+                        f"B2: stored per-flowgroup extraction notebook '{aux_key}'"
+                    )
+            else:
+                aux_key = f"__lhp_extract_{action.name}.py"
+                flowgroup._auxiliary_files[aux_key] = extraction_code
+                logger.debug(
+                    f"Stored extraction notebook as auxiliary file '{aux_key}'"
+                )
+
+        # B2 for_each: emit prepare_manifest + validate aux files once per flowgroup.
+        if is_b2_for_each and flowgroup:
+            self._emit_b2_aux_files(
+                flowgroup=flowgroup,
+                wm_catalog=wm_catalog,
+                wm_schema=wm_schema,
+                context=context,
+            )
 
         # Delegate CloudFiles stub to CloudFilesLoadGenerator
         from .cloudfiles import CloudFilesLoadGenerator
@@ -334,3 +411,159 @@ class JDBCWatermarkJobGenerator(BaseActionGenerator):
         )
 
         return cloudfiles_gen.generate(cloudfiles_action, context)
+
+    def _emit_b2_aux_files(
+        self,
+        flowgroup: Any,
+        wm_catalog: str,
+        wm_schema: str,
+        context: Dict[str, Any],
+    ) -> None:
+        """Emit prepare_manifest + validate aux files for a B2 for_each flowgroup.
+
+        Both files are emitted at most once per flowgroup; the key-presence
+        guard makes this safe to call once per action on a multi-action
+        flowgroup.
+
+        Args:
+            flowgroup: The FlowGroup object whose _auxiliary_files dict is
+                populated.
+            wm_catalog: Resolved watermark Unity Catalog name.
+            wm_schema: Resolved watermark schema name.
+            context: Generation context (carries substitution_manager).
+        """
+        load_group = f"{flowgroup.pipeline}::{flowgroup.flowgroup}"
+        sub_mgr = context.get("substitution_manager")
+
+        # ── prepare_manifest ──────────────────────────────────────────────────
+        prepare_aux_key = f"__lhp_prepare_manifest_{flowgroup.flowgroup}.py"
+        if prepare_aux_key not in flowgroup._auxiliary_files:
+            # Build the concrete actions list from post-expansion LOAD actions
+            # that use jdbc_watermark_v2 as their source type.
+            actions_list = []
+            for fg_action in flowgroup.actions:
+                if getattr(fg_action, "type", None) != ActionType.LOAD:
+                    continue
+                src = (
+                    fg_action.source
+                    if isinstance(fg_action.source, dict)
+                    else {}
+                )
+                if src.get("type") != "jdbc_watermark_v2":
+                    continue
+
+                # Derive source_system_id using same logic as generate().
+                action_wm = getattr(fg_action, "watermark", None)
+                action_source_system_id = (
+                    getattr(action_wm, "source_system_id", None)
+                    if action_wm
+                    else None
+                )
+                if not action_source_system_id:
+                    url = src.get("url", "")
+                    host_match = re.search(r"//([^:/]+)", url)
+                    action_source_system_id = (
+                        host_match.group(1) if host_match else "unknown"
+                    )
+
+                # Anomaly A regression net (devtest 2026-04-26) — every
+                # per-action source/destination value MUST flow through the
+                # iteration payload so the shared B2 worker can scope each
+                # iteration correctly. Keys here are mirrored in
+                # lhp.models.b2_iteration.B2_ITERATION_KEYS and asserted by
+                # tests/test_b2_iteration_contract.py.
+                actions_list.append(
+                    {
+                        "action_name": fg_action.name,
+                        "source_system_id": action_source_system_id,
+                        "schema_name": src.get("schema_name", ""),
+                        "table_name": src.get("table_name", ""),
+                        "load_group": load_group,
+                        "jdbc_table": src.get("table", ""),
+                        "watermark_column": (
+                            getattr(action_wm, "column", "") if action_wm else ""
+                        ),
+                        "landing_path": fg_action.landing_path or "",
+                    }
+                )
+
+            prepare_context: Dict[str, Any] = {
+                "wm_catalog": wm_catalog,
+                "wm_schema": wm_schema,
+                "pipeline_name": flowgroup.pipeline,
+                "flowgroup_name": flowgroup.flowgroup,
+                "actions": actions_list,
+            }
+            prepare_code = self.render_template(
+                "bundle/prepare_manifest.py.j2", prepare_context
+            )
+
+            if sub_mgr:
+                from ...utils.secret_code_generator import SecretCodeGenerator
+
+                secret_refs = sub_mgr.get_secret_references()
+                if secret_refs:
+                    prepare_code = SecretCodeGenerator().generate_python_code(
+                        prepare_code, secret_refs
+                    )
+
+            try:
+                prepare_code = black.format_str(
+                    prepare_code, mode=black.Mode(line_length=88)
+                )
+            except black.InvalidInput:
+                logger.warning(
+                    f"Flowgroup '{flowgroup.flowgroup}': "
+                    "prepare_manifest notebook failed Black formatting"
+                )
+
+            flowgroup._auxiliary_files[prepare_aux_key] = prepare_code
+            logger.debug(
+                f"B2: stored prepare_manifest aux file '{prepare_aux_key}'"
+            )
+
+        # ── validate ──────────────────────────────────────────────────────────
+        validate_aux_key = f"__lhp_validate_{flowgroup.flowgroup}.py"
+        if validate_aux_key not in flowgroup._auxiliary_files:
+            parity_check_enabled = bool(
+                flowgroup.workflow.get("parity_check")
+                if flowgroup.workflow
+                else False
+            )
+            validate_context: Dict[str, Any] = {
+                "wm_catalog": wm_catalog,
+                "wm_schema": wm_schema,
+                "pipeline_name": flowgroup.pipeline,
+                "flowgroup_name": flowgroup.flowgroup,
+                "manifest_table": f"{wm_catalog}.{wm_schema}.b2_manifests",
+                "watermarks_table": f"{wm_catalog}.{wm_schema}.watermarks",
+                "load_group": load_group,
+                "parity_check_enabled": parity_check_enabled,
+            }
+            validate_code = self.render_template(
+                "bundle/validate.py.j2", validate_context
+            )
+
+            if sub_mgr:
+                from ...utils.secret_code_generator import SecretCodeGenerator
+
+                secret_refs = sub_mgr.get_secret_references()
+                if secret_refs:
+                    validate_code = SecretCodeGenerator().generate_python_code(
+                        validate_code, secret_refs
+                    )
+
+            try:
+                validate_code = black.format_str(
+                    validate_code, mode=black.Mode(line_length=88)
+                )
+            except black.InvalidInput:
+                logger.warning(
+                    f"Flowgroup '{flowgroup.flowgroup}': "
+                    "validate notebook failed Black formatting"
+                )
+
+            flowgroup._auxiliary_files[validate_aux_key] = validate_code
+            logger.debug(
+                f"B2: stored validate aux file '{validate_aux_key}'"
+            )

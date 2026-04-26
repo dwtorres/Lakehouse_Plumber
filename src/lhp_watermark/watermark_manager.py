@@ -8,7 +8,6 @@ Simplified port of data_platform WatermarkManager for Lakehouse Plumber.
 """
 
 import logging
-import random
 import re
 import time
 from datetime import datetime, timezone
@@ -17,6 +16,15 @@ from typing import Any, Dict, Optional, Union
 
 from pyspark.sql import SparkSession
 
+from lhp_watermark._merge_helpers import (
+    CONCURRENT_COMMIT_NAMES as _CONCURRENT_COMMIT_NAMES,
+    DEFAULT_BACKOFF_BASE_SECS as _INSERT_NEW_BACKOFF_BASE_SECS,
+    DEFAULT_BACKOFF_FACTOR as _INSERT_NEW_BACKOFF_FACTOR,
+    DEFAULT_BACKOFF_JITTER as _INSERT_NEW_BACKOFF_JITTER,
+    DEFAULT_RETRY_BUDGET as _INSERT_NEW_RETRY_BUDGET,
+    execute_with_concurrent_commit_retry,
+    is_concurrent_commit_exception as _is_concurrent_commit_exception,
+)
 from lhp_watermark.exceptions import (
     DuplicateRunError,
     TerminalStateGuardError,
@@ -33,33 +41,6 @@ logger = logging.getLogger(__name__)
 
 _IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_.\-]+$")
 _DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-
-# Delta concurrent-commit exception class names. Detection is by string
-# (not isinstance) because Delta is not installed in unit-test environments
-# and the exception may arrive Py4J-wrapped on Databricks.
-_CONCURRENT_COMMIT_NAMES = (
-    "ConcurrentAppendException",
-    "ConcurrentDeleteReadException",
-)
-
-# Retry budget for FR-L-05 / NFR-L-02. Reducing shard size is the right
-# response to genuine over-contention; raising the budget hides the cause.
-_INSERT_NEW_RETRY_BUDGET = 5
-_INSERT_NEW_BACKOFF_BASE_SECS = 0.1
-_INSERT_NEW_BACKOFF_FACTOR = 2.0
-_INSERT_NEW_BACKOFF_JITTER = 0.5  # ±50 % of the base delay
-
-
-def _is_concurrent_commit_exception(exc: BaseException) -> bool:
-    """Match Delta concurrent-commit exceptions by class name + message text.
-
-    Direct class match handles plain Python raises in tests; message match
-    catches the Py4J-wrapped form Databricks surfaces in production.
-    """
-    if type(exc).__name__ in _CONCURRENT_COMMIT_NAMES:
-        return True
-    msg = str(exc)
-    return any(name in msg for name in _CONCURRENT_COMMIT_NAMES)
 
 
 def _render_watermark_literal(value: Optional[Union[str, int, Decimal]]) -> str:
@@ -646,41 +627,26 @@ class WatermarkManager:
     def _merge_with_retry(self, merge_sql: str, *, run_id: str) -> int:
         """Execute a MERGE with Delta concurrent-commit retry (FR-L-05).
 
-        Returns ``num_affected_rows`` from the MERGE result. Re-raises any
-        non-concurrent-commit exception unchanged. Raises
-        ``WatermarkConcurrencyError`` when the retry budget is exhausted.
+        Thin wrapper over ``execute_with_concurrent_commit_retry`` that
+        raises ``WatermarkConcurrencyError`` (LHP-WM-004) on budget
+        exhaustion. The retry loop, backoff, and concurrent-commit
+        detection live in ``lhp_watermark._merge_helpers``.
         """
-        last_exc: Optional[BaseException] = None
-        for attempt in range(_INSERT_NEW_RETRY_BUDGET):
-            try:
-                result = self.spark.sql(merge_sql)
-                row = result.first() if result is not None else None
-                if row is None:
-                    # Older Spark versions / mocks may not surface the metric.
-                    # Treat as success — DuplicateRunError surfaces only when
-                    # the metric is explicitly zero.
-                    return 1
-                try:
-                    return int(row["num_affected_rows"])
-                except (KeyError, IndexError, TypeError):
-                    return 1
-            except BaseException as exc:  # noqa: BLE001 — re-raise unrelated below
-                if not _is_concurrent_commit_exception(exc):
-                    raise
-                last_exc = exc
-                if attempt + 1 < _INSERT_NEW_RETRY_BUDGET:
-                    base_delay = _INSERT_NEW_BACKOFF_BASE_SECS * (
-                        _INSERT_NEW_BACKOFF_FACTOR**attempt
-                    )
-                    jitter = (
-                        base_delay
-                        * _INSERT_NEW_BACKOFF_JITTER
-                        * (2 * random.random() - 1)
-                    )
-                    time.sleep(base_delay + jitter)
-        raise WatermarkConcurrencyError(
-            run_id=run_id, attempts=_INSERT_NEW_RETRY_BUDGET
-        ) from last_exc
+
+        def _on_exhausted(last_exc: Optional[BaseException]) -> None:
+            raise WatermarkConcurrencyError(
+                run_id=run_id, attempts=_INSERT_NEW_RETRY_BUDGET
+            ) from last_exc
+
+        return execute_with_concurrent_commit_retry(
+            self.spark,
+            merge_sql,
+            on_exhausted=_on_exhausted,
+            retry_budget=_INSERT_NEW_RETRY_BUDGET,
+            backoff_base_secs=_INSERT_NEW_BACKOFF_BASE_SECS,
+            backoff_factor=_INSERT_NEW_BACKOFF_FACTOR,
+            backoff_jitter=_INSERT_NEW_BACKOFF_JITTER,
+        )
 
     def mark_failed(
         self,

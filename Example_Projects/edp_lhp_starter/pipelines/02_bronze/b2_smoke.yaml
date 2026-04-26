@@ -1,0 +1,112 @@
+# B2 for_each smoke — load 3 small AdventureWorks HumanResources tables under
+# execution_mode: for_each + concurrency: 3. Validates the full B2 codegen
+# end-to-end against a real devtest workspace.
+#
+# Tables (all small, all carry ModifiedDate timestamp):
+#   - HumanResources.Department (16 rows)
+#   - HumanResources.Shift (3 rows)
+#   - HumanResources.JobCandidate (~13 rows)
+#
+# Distinct from customer_bronze.yaml which loads only Department under the
+# legacy static-emission path; this fixture exercises the B2 path.
+
+pipeline: edp_b2_smoke_jdbc
+flowgroup: b2_hr_smoke
+
+workflow:
+  execution_mode: for_each
+  concurrency: 3
+  max_retries: 1
+  parity_check: false  # disabled until landed-row source is wired up
+
+actions:
+
+  - name: load_department
+    type: load
+    source:
+      type: jdbc_watermark_v2
+      url: "${jdbc_url}"
+      user: "${secret:database/jdbc_user}"
+      password: "${secret:database/jdbc_password}"
+      driver: "${jdbc_driver}"
+      table: '"HumanResources"."Department"'
+      schema_name: "HumanResources"
+      table_name: "Department"
+    target: v_department_raw
+    landing_path: "${landing_volume_root}/b2_smoke/department"
+    watermark:
+      column: ModifiedDate
+      type: timestamp
+      # operator omitted — codegen defaults to ">" for execution_mode: for_each (R12)
+      source_system_id: pg_supabase_aw_b2
+      catalog: "${watermark_catalog}"
+      schema: "${watermark_schema}"
+
+  - name: load_shift
+    type: load
+    source:
+      type: jdbc_watermark_v2
+      url: "${jdbc_url}"
+      user: "${secret:database/jdbc_user}"
+      password: "${secret:database/jdbc_password}"
+      driver: "${jdbc_driver}"
+      table: '"HumanResources"."Shift"'
+      schema_name: "HumanResources"
+      table_name: "Shift"
+    target: v_shift_raw
+    landing_path: "${landing_volume_root}/b2_smoke/shift"
+    watermark:
+      column: ModifiedDate
+      type: timestamp
+      source_system_id: pg_supabase_aw_b2
+      catalog: "${watermark_catalog}"
+      schema: "${watermark_schema}"
+
+  - name: load_jobcandidate
+    type: load
+    source:
+      type: jdbc_watermark_v2
+      url: "${jdbc_url}"
+      user: "${secret:database/jdbc_user}"
+      password: "${secret:database/jdbc_password}"
+      driver: "${jdbc_driver}"
+      table: '"HumanResources"."JobCandidate"'
+      schema_name: "HumanResources"
+      table_name: "JobCandidate"
+    target: v_jobcandidate_raw
+    landing_path: "${landing_volume_root}/b2_smoke/jobcandidate"
+    watermark:
+      column: ModifiedDate
+      type: timestamp
+      source_system_id: pg_supabase_aw_b2
+      catalog: "${watermark_catalog}"
+      schema: "${watermark_schema}"
+
+  - name: write_department_bronze
+    type: write
+    source: v_department_raw
+    write_target:
+      type: streaming_table
+      catalog: "${bronze_catalog}"
+      schema: "${bronze_schema}"
+      table: b2_smoke_department
+      table_properties:
+        delta.enableChangeDataFeed: "true"
+
+  - name: write_shift_bronze
+    type: write
+    source: v_shift_raw
+    write_target:
+      type: streaming_table
+      catalog: "${bronze_catalog}"
+      schema: "${bronze_schema}"
+      table: b2_smoke_shift
+
+  - name: write_jobcandidate_bronze
+    type: write
+    source: v_jobcandidate_raw
+    write_target:
+      type: streaming_table
+      catalog: "${bronze_catalog}"
+      schema: "${bronze_schema}"
+      table: b2_smoke_jobcandidate
