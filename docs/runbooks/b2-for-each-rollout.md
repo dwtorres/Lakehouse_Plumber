@@ -297,6 +297,41 @@ running off-peak. They do not block extraction jobs.
 
 ---
 
+## E2E Smoke Validation (U12)
+
+A read-write devtest smoke notebook validates the B2 codegen against a live
+Databricks workspace before promoting to qa/prod. Notebook lives at
+`scripts/validation/validate_b2_for_each_e2e.py`.
+
+**Smoke fixture**: `Example_Projects/edp_lhp_starter/pipelines/02_bronze/b2_smoke.yaml`
+loads three small AdventureWorks HumanResources tables (Department, Shift,
+JobCandidate) under `execution_mode: for_each, concurrency: 3`.
+
+**Procedure**:
+
+1. `lhp generate -e devtest` from `Example_Projects/edp_lhp_starter/`
+2. `databricks bundle deploy --target devtest --profile dbc-8e058692-373e`
+3. `databricks bundle run edp_b2_smoke_jdbc_workflow --target devtest --profile dbc-8e058692-373e`
+4. Wait for completion (typical: 3-5 minutes for 3-table smoke).
+5. Open the smoke validation notebook in the workspace, set widgets, run all.
+6. Read final JSON exit; expect `status: pass` with V1-V5 + R12 second-run check all green.
+7. On success the notebook cleans up bronze tables + manifest + watermark rows
+   keyed on the test source_system_id `pg_supabase_aw_b2`.
+
+**Cleanup commands** (manual, on FAIL when notebook does not auto-clean):
+
+```sql
+DROP TABLE IF EXISTS devtest_edp_bronze.bronze.b2_smoke_department;
+DROP TABLE IF EXISTS devtest_edp_bronze.bronze.b2_smoke_shift;
+DROP TABLE IF EXISTS devtest_edp_bronze.bronze.b2_smoke_jobcandidate;
+DELETE FROM metadata.devtest_orchestration.watermarks
+  WHERE source_system_id = 'pg_supabase_aw_b2';
+DELETE FROM metadata.devtest_orchestration.b2_manifests
+  WHERE load_group = 'edp_b2_smoke_jdbc::b2_hr_smoke';
+```
+
+---
+
 ## Cross-references
 
 | Document | Role |
