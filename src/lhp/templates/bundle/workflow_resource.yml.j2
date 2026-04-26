@@ -5,7 +5,40 @@
    removed. Runtime library `lhp_watermark` ships via DAB workspace-file sync
    at `${workspace.file_path}/src/lhp_watermark/`; generated notebooks import
    it via PYTHONPATH. `source: WORKSPACE` on each notebook_task is required
-   because extraction notebooks live at workspace paths, not bundle paths. #}
+   because extraction notebooks live at workspace paths, not bundle paths.
+
+   B2 (execution_mode: for_each): three-task DAB topology.
+   prepare_manifest → for_each_ingest (DAB for_each_task) → validate.
+   {% raw %} below preserves the literal {{ tasks.prepare_manifest.values.iterations }}
+   reference that DAB resolves at runtime. #}
+{% if execution_mode == "for_each" %}
+resources:
+  jobs:
+    {{ pipeline_name }}_workflow:
+      name: {{ pipeline_name }}_workflow
+      tasks:
+        - task_key: prepare_manifest
+          notebook_task:
+            notebook_path: {{ prepare_manifest_path }}
+            source: WORKSPACE
+        - task_key: for_each_ingest
+          depends_on:
+            - task_key: prepare_manifest
+          for_each_task:
+            inputs: "{% raw %}{{tasks.prepare_manifest.values.iterations}}{% endraw %}"
+            concurrency: {{ concurrency }}
+            task:
+              notebook_task:
+                notebook_path: {{ worker_path }}
+                source: WORKSPACE
+              max_retries: {{ max_retries }}
+        - task_key: validate
+          depends_on:
+            - task_key: for_each_ingest
+          notebook_task:
+            notebook_path: {{ validate_path }}
+            source: WORKSPACE
+{% else %}
 resources:
   jobs:
     {{ pipeline_name }}_workflow:
@@ -30,3 +63,4 @@ resources:
 {% for task_name in dlt_depends_on %}
             - task_key: {{ task_name }}
 {% endfor %}
+{% endif %}

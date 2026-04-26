@@ -1835,11 +1835,13 @@ class ActionOrchestrator:
 
         workflow_gen = WorkflowResourceGenerator()
 
-        # Group all v2 actions by pipeline name across flowgroups
+        # Group all v2 actions + source flowgroups by pipeline name.
         pipeline_v2_actions: dict = defaultdict(list)
-        pipeline_name_map: dict = {}  # pipeline_name → first flowgroup (for metadata)
+        pipeline_name_map: dict = {}   # pipeline_name → first flowgroup (for metadata)
+        pipeline_v2_flowgroups: dict = defaultdict(list)  # pipeline_name → flowgroups
 
         for flowgroup in processed_flowgroups:
+            has_v2 = False
             for action in flowgroup.actions:
                 if (
                     isinstance(action.source, dict)
@@ -1847,12 +1849,50 @@ class ActionOrchestrator:
                     == LoadSourceType.JDBC_WATERMARK_V2.value
                 ):
                     pipeline_v2_actions[flowgroup.pipeline].append(action)
+                    has_v2 = True
                     if flowgroup.pipeline not in pipeline_name_map:
                         pipeline_name_map[flowgroup.pipeline] = flowgroup
+            if has_v2:
+                pipeline_v2_flowgroups[flowgroup.pipeline].append(flowgroup)
 
         for pipeline_name, v2_actions in pipeline_v2_actions.items():
             try:
-                # Build a synthetic flowgroup with all v2 actions for this pipeline
+                # Same-pipeline same-execution_mode guard (R8, U7).
+                # U2's LHP-CFG-033 mixed-mode check should catch this earlier at
+                # validator stage with friendlier copy. This is the safety net at
+                # codegen.
+                pipeline_fgs = pipeline_v2_flowgroups[pipeline_name]
+                modes = set()
+                for fg in pipeline_fgs:
+                    mode = (
+                        fg.workflow.get("execution_mode")
+                        if isinstance(fg.workflow, dict)
+                        else None
+                    ) or "<default>"
+                    modes.add(mode)
+                if len(modes) > 1:
+                    raise LHPConfigError(
+                        category=ErrorCategory.CONFIG,
+                        code_number="034",
+                        title="Mixed execution_mode flowgroups in same pipeline",
+                        details=(
+                            f"Pipeline '{pipeline_name}' contains flowgroups with "
+                            f"conflicting execution_mode values: {sorted(modes)}. "
+                            "B2 codegen requires all flowgroups in one pipeline share "
+                            "the same execution_mode."
+                        ),
+                        context={
+                            "pipeline": pipeline_name,
+                            "modes": sorted(modes),
+                        },
+                        suggestions=[
+                            "Move the for_each flowgroup(s) into a separate pipeline name.",
+                            "Or remove `workflow.execution_mode: for_each` to keep the "
+                            "legacy emission.",
+                        ],
+                    )
+
+                # Build a synthetic flowgroup with all v2 actions for this pipeline.
                 ref_fg = pipeline_name_map[pipeline_name]
                 merged_fg = FG(
                     pipeline=pipeline_name,
@@ -1866,6 +1906,9 @@ class ActionOrchestrator:
                 workflow_file = resources_dir / f"{pipeline_name}_workflow.yml"
                 smart_writer.write_if_changed(workflow_file, workflow_yaml)
                 self.logger.info(f"Generated workflow resource: {workflow_file}")
+            except LHPConfigError:
+                # Mixed-mode guard: propagate so the caller surfaces the error.
+                raise
             except Exception as e:
                 self.logger.warning(
                     f"Failed to generate workflow resource for "
