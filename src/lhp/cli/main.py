@@ -608,7 +608,19 @@ def init_registry(env, catalog, schema, warehouse_id, profile, max_wait_seconds)
 @click.option(
     "--cluster-id",
     default=None,
-    help="Existing cluster id to run the notebook on (or set DATABRICKS_CLUSTER_ID).",
+    help="Existing cluster id (or set DATABRICKS_CLUSTER_ID). Mutually exclusive with --serverless.",
+)
+@click.option(
+    "--serverless",
+    is_flag=True,
+    default=False,
+    help="Run notebook on serverless compute (no cluster required). "
+    "Default for envs without provisioned clusters.",
+)
+@click.option(
+    "--serverless-environment-version",
+    default="3",
+    help="Serverless environment client version (default: 3).",
 )
 @click.option(
     "--lhp-workspace-path",
@@ -649,6 +661,8 @@ def validate_tier2(
     probe_schema,
     probe_table_name,
     cluster_id,
+    serverless,
+    serverless_environment_version,
     lhp_workspace_path,
     workspace_target,
     profile,
@@ -674,6 +688,8 @@ def validate_tier2(
         probe_schema=probe_schema,
         probe_table_name=probe_table_name,
         cluster_id=cluster_id,
+        serverless=serverless,
+        serverless_environment_version=serverless_environment_version,
         lhp_workspace_path=lhp_workspace_path,
         workspace_target=workspace_target or DEFAULT_WORKSPACE_TARGET,
         profile=profile,

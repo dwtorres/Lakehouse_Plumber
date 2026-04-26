@@ -53,10 +53,27 @@ def _install_fake_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
             self.base_parameters = base_parameters
 
     class _FakeSubmitTask:
-        def __init__(self, *, task_key: str, notebook_task, existing_cluster_id: str) -> None:
+        def __init__(
+            self,
+            *,
+            task_key: str,
+            notebook_task,
+            existing_cluster_id: str | None = None,
+            environment_key: str | None = None,
+        ) -> None:
             self.task_key = task_key
             self.notebook_task = notebook_task
             self.existing_cluster_id = existing_cluster_id
+            self.environment_key = environment_key
+
+    class _FakeJobEnvironment:
+        def __init__(self, *, environment_key: str, spec) -> None:
+            self.environment_key = environment_key
+            self.spec = spec
+
+    class _FakeEnvironment:
+        def __init__(self, *, client: str | None = None) -> None:
+            self.client = client
 
     class _FakeWorkspaceClient:
         def __init__(self, profile: str | None = None) -> None:  # noqa: ARG002
@@ -80,13 +97,18 @@ def _install_fake_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
     jobs_mod = types.ModuleType("databricks.sdk.service.jobs")
     jobs_mod.NotebookTask = _FakeNotebookTask
     jobs_mod.SubmitTask = _FakeSubmitTask
+    jobs_mod.JobEnvironment = _FakeJobEnvironment
     jobs_mod.RunLifeCycleState = _FakeRunLifeCycleState
     jobs_mod.RunResultState = _FakeRunResultState
+
+    compute_mod = types.ModuleType("databricks.sdk.service.compute")
+    compute_mod.Environment = _FakeEnvironment
 
     service_pkg = types.ModuleType("databricks.sdk.service")
     service_pkg.sql = sql_mod
     service_pkg.workspace = workspace_mod
     service_pkg.jobs = jobs_mod
+    service_pkg.compute = compute_mod
 
     databricks_pkg = types.ModuleType("databricks")
     databricks_pkg.sdk = sdk_pkg
@@ -97,6 +119,7 @@ def _install_fake_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, "databricks.sdk.service.sql", sql_mod)
     monkeypatch.setitem(sys.modules, "databricks.sdk.service.workspace", workspace_mod)
     monkeypatch.setitem(sys.modules, "databricks.sdk.service.jobs", jobs_mod)
+    monkeypatch.setitem(sys.modules, "databricks.sdk.service.compute", compute_mod)
 
 
 def _patch_namespace(monkeypatch: pytest.MonkeyPatch, catalog: str, schema: str) -> None:
@@ -285,6 +308,73 @@ def test_parse_exit_value_invalid_json_raises(monkeypatch: pytest.MonkeyPatch) -
     cmd = ValidateTier2Command()
     with pytest.raises(click.ClickException, match="not valid JSON"):
         cmd._parse_exit_value("not-json{")
+
+
+def test_serverless_mode_submits_with_environments_no_cluster(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """--serverless flag emits JobEnvironment + environment_key, no existing_cluster_id."""
+    _install_fake_sdk(monkeypatch)
+    _patch_namespace(monkeypatch, "metadata", "devtest_orchestration")
+    _patch_notebook_source(monkeypatch, tmp_path)
+
+    from lhp.cli.commands.validate_tier2_command import ValidateTier2Command
+
+    fake_client = MagicMock()
+    submit_resp = MagicMock()
+    submit_resp.run_id = 7
+    fake_client.jobs.submit.return_value = submit_resp
+
+    exit_payload = json.dumps({"overall_verdict": "PASS", "failed_invariants": []})
+    run_resp, output_resp = _make_terminated_run("SUCCESS", exit_payload)
+    fake_client.jobs.get_run.return_value = run_resp
+    fake_client.jobs.get_run_output.return_value = output_resp
+
+    cmd = ValidateTier2Command()
+    cmd.setup_from_context = lambda: None
+    with patch(
+        "lhp.cli.commands.validate_tier2_command.make_workspace_client",
+        return_value=fake_client,
+    ):
+        cmd.execute(
+            catalog="metadata",
+            schema="devtest_orchestration",
+            cluster_id=None,  # no cluster
+            serverless=True,
+            poll_interval_seconds=0,
+        )
+
+    # Confirm submit was called with environments=[...] and task has environment_key
+    fake_client.jobs.submit.assert_called_once()
+    call = fake_client.jobs.submit.call_args
+    kwargs = call.kwargs
+    assert "environments" in kwargs
+    assert len(kwargs["environments"]) == 1
+    assert kwargs["environments"][0].environment_key == "serverless_env"
+    task = kwargs["tasks"][0]
+    assert task.environment_key == "serverless_env"
+    assert task.existing_cluster_id is None
+
+
+def test_no_compute_chosen_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Neither --serverless nor --cluster-id provided → fail with message."""
+    _install_fake_sdk(monkeypatch)
+    _patch_namespace(monkeypatch, "metadata", "devtest_orchestration")
+    monkeypatch.delenv("DATABRICKS_CLUSTER_ID", raising=False)
+
+    import click
+
+    from lhp.cli.commands.validate_tier2_command import ValidateTier2Command
+
+    cmd = ValidateTier2Command()
+    cmd.setup_from_context = lambda: None
+    with pytest.raises(click.ClickException, match="--serverless OR --cluster-id"):
+        cmd.execute(
+            catalog="metadata",
+            schema="devtest_orchestration",
+            cluster_id=None,
+            serverless=False,
+        )
 
 
 def test_run_terminates_failed_state_raises(

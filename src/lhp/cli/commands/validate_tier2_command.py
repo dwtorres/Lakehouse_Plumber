@@ -70,24 +70,34 @@ class ValidateTier2Command(BaseCommand):
         probe_schema: Optional[str] = None,
         probe_table_name: str = "watermarks_v1_probe",
         cluster_id: Optional[str] = None,
+        serverless: bool = False,
+        serverless_environment_version: str = "3",
         lhp_workspace_path: Optional[str] = None,
         workspace_target: str = DEFAULT_WORKSPACE_TARGET,
         profile: Optional[str] = None,
         max_wait_seconds: int = 1800,
         poll_interval_seconds: int = 10,
     ) -> None:
-        """Upload + execute the V1-V5 notebook; emit JSON; exit-code per verdict."""
+        """Upload + execute the V1-V5 notebook; emit JSON; exit-code per verdict.
+
+        Compute selection:
+          - --serverless (default for envs without provisioned clusters): use
+            serverless notebook compute via JobEnvironment + environment_key.
+          - --cluster-id: use existing interactive/job cluster.
+        Mutually exclusive; --serverless wins if both set.
+        """
         self.setup_from_context()
         wm_catalog, wm_schema = self._resolve_namespace(env, catalog, schema)
         probe_namespace = probe_schema or self._default_probe_schema(env, wm_catalog)
 
-        if not cluster_id:
-            cluster_id = os.environ.get("DATABRICKS_CLUSTER_ID")
-        if not cluster_id:
-            raise click.ClickException(
-                "Set --cluster-id <id> or export DATABRICKS_CLUSTER_ID=<id>. "
-                "The notebook needs a cluster to execute on."
-            )
+        if not serverless:
+            if not cluster_id:
+                cluster_id = os.environ.get("DATABRICKS_CLUSTER_ID")
+            if not cluster_id:
+                raise click.ClickException(
+                    "Provide --serverless OR --cluster-id <id> "
+                    "(or set DATABRICKS_CLUSTER_ID)."
+                )
 
         # ADR-002 vendoring path: notebook imports lhp_watermark by prepending
         # lhp_workspace_path to sys.path. Operator runs `lhp sync-runtime` +
@@ -116,6 +126,8 @@ class ValidateTier2Command(BaseCommand):
                 client=client,
                 workspace_target=workspace_target,
                 cluster_id=cluster_id,
+                serverless=serverless,
+                serverless_environment_version=serverless_environment_version,
                 catalog=wm_catalog,
                 schema=wm_schema,
                 probe_namespace=probe_namespace,
@@ -265,7 +277,9 @@ class ValidateTier2Command(BaseCommand):
         *,
         client: Any,
         workspace_target: str,
-        cluster_id: str,
+        cluster_id: Optional[str],
+        serverless: bool,
+        serverless_environment_version: str,
         catalog: str,
         schema: str,
         probe_namespace: str,
@@ -274,14 +288,14 @@ class ValidateTier2Command(BaseCommand):
     ) -> int:
         """Submit a one-off Jobs run executing the notebook with widget params.
 
-        Probe table fully-qualified name is the notebook's
-        ``<catalog>.<schema>.<probe_table_name>`` resolution. We pass the
-        probe namespace via the ``schema`` widget when redirecting (B9
-        rehearsal pattern); for the standard path the probe lands in the
-        registry's own schema unless ``probe_schema`` overrides it.
+        Compute selection: serverless (JobEnvironment + environment_key) or
+        existing_cluster_id. Probe table FQN is composed by the notebook from
+        ``<catalog>.<schema>.<probe_table_name>``; B9 rehearsal redirect uses
+        the probe schema's catalog/schema components.
         """
         try:
             from databricks.sdk.service.jobs import (
+                JobEnvironment,
                 NotebookTask,
                 SubmitTask,
             )
@@ -290,12 +304,6 @@ class ValidateTier2Command(BaseCommand):
                 f"databricks-sdk missing jobs types: {exc}"
             ) from exc
 
-        # Notebook widget names — match validate_tier2_load_group.py cell 0.
-        # Note: probe_table_name widget is the bare probe name; the notebook
-        # composes the FQN as <catalog>.<schema>.<probe_table_name>. To
-        # redirect to a separate probe schema, we set ``schema`` to the
-        # probe namespace's schema component. For standard path, schema is
-        # the registry schema.
         probe_catalog, probe_schema = _split_two_part(probe_namespace)
         notebook_params = {
             "catalog": probe_catalog or catalog,
@@ -305,18 +313,46 @@ class ValidateTier2Command(BaseCommand):
             "lhp_workspace_path": lhp_workspace_path,
         }
 
-        task = SubmitTask(
-            task_key="validate_tier2",
-            notebook_task=NotebookTask(
-                notebook_path=workspace_target,
-                base_parameters=notebook_params,
-            ),
-            existing_cluster_id=cluster_id,
-        )
-        run = client.jobs.submit(
-            run_name=f"lhp-validate-tier2-{int(time.time())}",
-            tasks=[task],
-        )
+        environments = None
+        if serverless:
+            try:
+                from databricks.sdk.service.compute import Environment
+            except ImportError as exc:
+                raise StatementExecutionError(
+                    f"databricks-sdk missing compute.Environment: {exc}"
+                ) from exc
+            env_key = "serverless_env"
+            environments = [
+                JobEnvironment(
+                    environment_key=env_key,
+                    spec=Environment(client=serverless_environment_version),
+                )
+            ]
+            task = SubmitTask(
+                task_key="validate_tier2",
+                notebook_task=NotebookTask(
+                    notebook_path=workspace_target,
+                    base_parameters=notebook_params,
+                ),
+                environment_key=env_key,
+            )
+        else:
+            task = SubmitTask(
+                task_key="validate_tier2",
+                notebook_task=NotebookTask(
+                    notebook_path=workspace_target,
+                    base_parameters=notebook_params,
+                ),
+                existing_cluster_id=cluster_id,
+            )
+
+        submit_kwargs: dict[str, Any] = {
+            "run_name": f"lhp-validate-tier2-{int(time.time())}",
+            "tasks": [task],
+        }
+        if environments is not None:
+            submit_kwargs["environments"] = environments
+        run = client.jobs.submit(**submit_kwargs)
         run_id = getattr(run, "run_id", None)
         if run_id is None and hasattr(run, "response"):
             run_id = getattr(run.response, "run_id", None)
