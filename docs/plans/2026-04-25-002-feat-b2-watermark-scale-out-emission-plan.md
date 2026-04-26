@@ -16,6 +16,40 @@ Flowgroups without `execution_mode: for_each` keep the existing per-action stati
 
 ---
 
+## Direct-JDBC Spike Findings (2026-04-25)
+
+**Verdict**: B/B2 is the stronger direction for mass scale-out, but not the current static `jdbc_watermark_v2` implementation as-is.
+
+### Key Results
+
+- Static direct JDBC 68-table run passed first-run scale: 71/71 tasks successful, 49.58 min.
+- Static direct JDBC second run **failed correctness**: duplicated max-watermark boundary rows because the deployed/current path uses `>=` watermark semantics.
+- B-style direct JDBC `for_each` full run passed: run `729333305858621`, 68 tables, 759,240 source rows = 759,240 target rows, 0 validation failures, 45.31 min.
+- B-style direct JDBC no-change second run passed: run `1060162614663980`, latest 68 watermark rows all had `row_count=0`, target total stayed 759,240, 0 validation failures.
+- Old scale schemas `devtest_edp_bronze.jdbc_spike`, `devtest_edp_bronze.jdbc_spike_b`, and `devtest_edp_orchestration.jdbc_spike` were dropped successfully.
+
+### Caveat — UC Table Quota
+
+UC table quota blocked the B run variant that tried to create 68 registered target tables plus a scratch watermark table (estimated count: 539/500). The spike validated B with direct JDBC + `for_each` + strict watermarking using Delta path outputs and the existing `metadata.orchestration.watermarks` table under unique `source_system_id = b_jdbc_path_aw_20260425_174027`. That proves the orchestration/JDBC/watermark behavior, but the production B2 design needs an explicit UC table strategy.
+
+### Audit Resources
+
+- Job: `862576116537604`
+- Workspace root: `/Workspace/Users/verbena1@gmail.com/.bundle/scooty_puff_junior/dev/files/b_jdbc_path_reval_20260425_174027`
+- Target root: `/Volumes/main/_landing/landing/b_jdbc_path_reval_20260425_174027`
+- Watermark rows: `metadata.orchestration.watermarks` where `source_system_id = 'b_jdbc_path_aw_20260425_174027'`
+
+### Required B2 Design Constraints
+
+These four constraints are design **requirements** derived from spike evidence. Each subsequent section of this plan that touches the relevant concern carries a `(see §Direct-JDBC Spike Findings, Constraint N)` reference.
+
+1. **Strict `>` predicates** — NOT `>=`. The deployed `jdbc_watermark_v2` `>=` operator duplicates max-watermark boundary rows on every re-run. B2 must default to `>` (or require the operator to set it explicitly) and must not allow `>=` as an implicit default.
+2. **Retry-safe / idempotent writes** — every worker write path must be safe to re-execute on DAB retry without duplicating data or corrupting watermark state.
+3. **Explicit `for_each` concurrency controls** — concurrency must be declared and bounded in generated YAML; unbounded parallelism caused resource contention at scale.
+4. **UC table strategy** — do NOT assume one-UC-table-per-extract; quota is tight (hit 539/500 in spike). Default to Delta path outputs OR shared registered tables. B2 codegen must not emit CREATE TABLE per-action.
+
+---
+
 ## Problem Frame
 
 Today LHP emits N static tasks per `jdbc_watermark_v2` flowgroup — one per action — into a single workflow YAML per pipeline. At fleet scale (50+ tables per flowgroup; 300+ across pipelines), this floods the DAB UI with one task per table and prevents per-iteration retry budget. Spike B (prototype) proved a `for_each` topology works at N=61, but raw Spike B swallowed exceptions, used `saveAsTable` as the idempotency primitive, and disconnected from the production L2 §5.3 contract.
@@ -24,7 +58,7 @@ B2 is the hardened variant. Same `for_each` topology, but:
 
 1. Built on `lhp_watermark` substrate (production contract; not Spike B's standalone state).
 2. Worker raises after `mark_failed` (matches `jdbc_watermark_job.py.j2:255-262` verbatim).
-3. Idempotency = ADR-003 run-scoped landing (`<landing_root>/_lhp_runs/<run_id>/`), not `saveAsTable`.
+3. Idempotency = ADR-003 run-scoped landing (`<landing_root>/_lhp_runs/<run_id>/`), not `saveAsTable`. (see §Direct-JDBC Spike Findings, Constraint 2)
 4. Validate gate joins manifest LEFT JOIN watermarks on `worker_run_id` (deterministic) — race-free under concurrent batches of the same flowgroup.
 
 Five binding requirements (R1–R5) define the contract. Each maps to an implementation unit. (see origin: `docs/planning/b2-watermark-scale-out-design.md`)
@@ -40,11 +74,15 @@ Five binding requirements (R1–R5) define the contract. Each maps to an impleme
 - R4. Worker's except block calls `mark_failed(type(e).__name__, str(e)[:4096])` then re-raises — exactly matching `jdbc_watermark_job.py.j2:255-262` today. `for_each_task.task.max_retries: 1` codegen default; operator override path documented.
 - R5. `validate.py.j2` runs the manifest LEFT JOIN watermarks-on-`worker_run_id` query for the current `batch_id`; computes `final_status = coalesce(worker_status, manifest_status)`; passes when `completed_n == expected AND failed_n == 0 AND unfinished_n == 0`. Empty-batch is a no-op pass. Optional per-table parity check (`JDBC-rows-read == landed-parquet-rows`) gated by config flag.
 - R6. `LHP-CFG-019` (separator collision), `LHP-CFG-026` (composite uniqueness), `LHP-CFG-028` (300-cap + empty-batch + concurrency bounds + same-pipeline-same-mode + shared `source_system_id`/`landing_path`/`wm_catalog`/`wm_schema`) — all flowgroup-level checks fire only when `execution_mode: for_each` is set; live in `ConfigValidator.validate_flowgroup` via `_validate_for_each_invariants` helper.
-- R7. `FlowGroup.workflow` model accepts `execution_mode: "for_each"` and `concurrency: int` keys (concurrency bounds `1 ≤ concurrency ≤ 100`, default `min(action_count, 10)`). Free-form dict accepts these without strict Pydantic schema change today; optional typed wrapper for safety.
+- R7. `FlowGroup.workflow` model accepts `execution_mode: "for_each"` and `concurrency: int` keys (concurrency bounds `1 ≤ concurrency ≤ 100`, default `min(action_count, 10)`). Free-form dict accepts these without strict Pydantic schema change today; optional typed wrapper for safety. (see §Direct-JDBC Spike Findings, Constraint 3)
 - R8. `_generate_workflow_resources` in `orchestrator.py` enforces same-pipeline same-execution_mode at codegen time; mixed-mode flowgroups in one pipeline raise `LHPConfigError`.
 - R9. `b2_manifests` table is created via auto-DDL inside `prepare_manifest.py.j2` notebook on first run (matches `_ensure_table_exists` pattern; avoids "works in dev, missing in prod").
 - R10. Manifest 30-day DELETE retention ships with the initial deploy as a sibling task in the workflow (or sidecar notebook); not deferred to follow-up.
 - R11. Operator runbook documents `for_each` adoption: `execution_mode` opt-in, `concurrency` tuning, error-code reference, `b2_manifests` retention cadence, `OPTIMIZE`/`VACUUM` policy on registry.
+- R12. **B2 workers MUST use strict `>` watermark predicates, not `>=`.** Per Direct-JDBC Spike Findings Constraint 1, the static `jdbc_watermark_v2` path with `watermark_operator=">="` duplicated max-watermark boundary rows on second run. B2 inherits this defect by default — generator default lives at `src/lhp/generators/load/jdbc_watermark_job.py:243`. Two enforcement paths (either-or, U5 picks):
+  - **(a) Codegen default change**: U5 changes the generator default to `">"` for `execution_mode: for_each`, leaving the legacy static path unchanged for back-compat.
+  - **(b) Validator enforcement**: U2 emits a new fatal `LHP-CFG-029` when a flowgroup has `execution_mode: for_each` AND `watermark_operator != ">"`, forcing operator-explicit choice.
+  R12 is hard — B2 cannot ship without either (a) or (b). Test scenario: rendered B2 notebook contains `WHERE <wm_col> > <hwm>` (not `>=`); second-run smoke shows zero duplicate rows. (see §Direct-JDBC Spike Findings, Constraint 1)
 
 ---
 
@@ -53,6 +91,7 @@ Five binding requirements (R1–R5) define the contract. Each maps to an impleme
 - **HIPAA hashing implementation.** Hook insertion point is documented in `jdbc_watermark_job.py.j2` template comment between JDBC read and landing write; no template code change ships in this milestone. The no-op default and column-masking implementation are deferred to a separate HIPAA milestone.
 - **Bronze parity gate.** Downstream DLT pipeline owns parity vs landed parquet; B2 only validates `JDBC-rows-read == landed-parquet-rows` (optional, config-flagged).
 - **B2 generalization to non-JDBC load types.** Start with `jdbc_watermark_v2`; generalize to `kafka`, `cloudfiles`, `delta` after JDBC production proof.
+- **UC table strategy for target data.** B2 workers write to Delta path outputs (ADR-003) — not one-UC-registered-table-per-extract. UC quota at devtest is tight (spike hit 539/500); per-extract CREATE TABLE is out of scope and must not be introduced. (see §Direct-JDBC Spike Findings, Constraint 4)
 - **Big-bang fleet migration.** Per-flowgroup adoption (`lhp seed-load-group` from Tier 2 plan) is the rollout path; B2 ships only the codegen, not the fleet flip.
 - **Manifest table retention v2.** 30-day DELETE ships in U9; richer retention (batch-count-based, audit-window-aware) is deferred until operational data exists.
 - **Append-only manifest path.** Known issue from origin doc: if write-hotspot mitigations on `b2_manifests` UPDATE prove insufficient, design migrates to append-only event-log + `ROW_NUMBER()` in validate. Out of scope for this plan; flag in Risks.
@@ -96,7 +135,7 @@ Five binding requirements (R1–R5) define the contract. Each maps to an impleme
 - **ADR-002 §"Concrete deployment shape" lines 80–106** — `databricks bundle deploy` syncs entire repo (`src/lhp_watermark/` and `generated/${bundle.target}/`) under `${workspace.file_path}/`. B2 notebook templates deploy via the same path; rendered at `lhp generate` into `generated/<env>/<pipeline>_extract/`; DAB `notebook_path` references `${workspace.file_path}/...`.
 - **`_lhp_watermark_bootstrap_syspath()`** (commit `a1c12852`) — prepends bundle files root to `sys.path` so `lhp_watermark` resolves at notebook execution. **`prepare_manifest.py.j2` and `validate.py.j2` MUST replicate this bootstrap** or imports will fail at runtime.
 - **Spike B's three concrete gotchas** (`docs/ideas/spike-a1-vs-b-comparison.md`):
-  1. `saveAsTable` idempotency fails on retry → B2 uses ADR-003 run-scoped landing instead.
+  1. `saveAsTable` idempotency fails on retry → B2 uses ADR-003 run-scoped landing instead. (see §Direct-JDBC Spike Findings, Constraint 2)
   2. prepare_manifest 403s for 73 sequential HWM lookups → Tier 2 makes batched `GROUP BY` per registry feasible.
   3. `abandoned` row provenance → B2's retry-aware validate (R5) handles without root-cause.
 - **`derive_run_id` empirical verification** — per origin doc, `runtime.py:97` returns `job-{jobRunId}-task-{taskRunId}-attempt-{N}`. Confirmed empirically; B2 R1a + R3 + R4 all depend on this format being stable.
@@ -119,12 +158,15 @@ Five binding requirements (R1–R5) define the contract. Each maps to an impleme
 - **Manifest carries iteration keys only; HWM read live by worker.** Earlier Spike B draft snapshotted HWM in manifest; that contradicted R3 (production contract). Live read matches `WatermarkManager.get_latest_watermark` semantics already in template.
 - **Validate joins manifest → watermarks on `worker_run_id` (deterministic), not time-window.** Closes race concern between concurrent batches of the same flowgroup. Each batch isolated by `batch_id`; per-iteration `worker_run_id` is the join key.
 - **Worker reuses `jdbc_watermark_job.py.j2` body verbatim.** Single conditional header block above line 67; L2 §5.3 body (`:255-262` raise-on-failure) unchanged. One diff point for review; legacy static-emission path falls through unchanged.
+
+> **CONTRADICTS SPIKE CONSTRAINT 1 — REQUIRES UPDATE:** The existing `jdbc_watermark_job.py.j2` template defaults `watermark_operator` to `">="` (confirmed at `src/lhp/generators/load/jdbc_watermark_job.py:243`). The spike proved `>=` duplicates boundary rows on re-run. B2 must change the default operator to `">"` — or enforce that B2 workers explicitly set `">"` — before the template is reused for `for_each` workers. The current plan does not address this; it needs an explicit U5 requirement or a new sub-task.
 - **`b2_manifests` table created via auto-DDL inside `prepare_manifest.py.j2`.** Matches `_ensure_table_exists` pattern. Alternative (Tier 2 migration creates the table) couples B2 to Tier 2 deploy timing; rejected.
 - **Same-pipeline same-execution_mode required at codegen.** `_generate_workflow_resources` merges all jdbc_watermark_v2 actions across flowgroups by pipeline today (orchestrator.py:1853). B2 enforces that all flowgroups in one pipeline share the same `execution_mode` value. Operator splits across pipelines if mixed needed. (Resolved Q during planning.)
 - **Flowgroup-level invariant checks live in `ConfigValidator.validate_flowgroup`, not `LoadActionValidator`.** Mirrors `_validate_readmode_compatibility` shape at validator.py:179. Origin doc said "in `LoadActionValidator`" — that's wrong by current architecture.
 - **Error code numbering: LHP-CFG-019, LHP-CFG-026, LHP-CFG-028.** LHP-CFG-020/021/022/023/024/025/027 already taken (`docs/errors_reference.rst`). Sequential CFG matches `LHP-CFG-018` (LandingPathOverlapsError) precedent for generator-time cross-action invariants. (Resolved Q during planning.)
 - **Manifest UPDATE optimistic-concurrency check is in-scope, not deferred.** Worker UPDATE `WHERE worker_run_id IS NULL OR worker_run_id = :previous_worker_run_id` (origin Known Issues). Cheapest mitigation; lands with the worker UPDATE itself.
-- **`for_each_task.task.max_retries: 1` codegen default.** Operator override path: declare `workflow.max_retries: int` on flowgroup YAML; codegen threads to `for_each_task.task.max_retries`.
+- **`for_each_task.task.max_retries: 1` codegen default.** Operator override path: declare `workflow.max_retries: int` on flowgroup YAML; codegen threads to `for_each_task.task.max_retries`. (see §Direct-JDBC Spike Findings, Constraint 2)
+- **`for_each_task` concurrency bounded by codegen default `min(action_count, 10)`.** Operator sets `workflow.concurrency`; codegen emits into YAML; R7 enforces `1 ≤ concurrency ≤ 100`. (see §Direct-JDBC Spike Findings, Constraint 3)
 - **Manifest 30-day DELETE retention ships with initial deploy.** Not deferred. Sibling task in the workflow OR sidecar notebook scheduled separately. Decide during impl.
 - **Empty-batch is no-op pass for validate**, but codegen rejects via LHP-CFG-028. A flowgroup expanding to zero actions is almost certainly authoring error, not intent.
 - **No new public exports in `lhp_watermark.__init__.py`.** B2 consumes 10 existing names verbatim.
@@ -492,9 +534,9 @@ If the UPDATE matches zero rows under DAB-retry-timeout race, worker reads back 
 
 - [ ] U5. **Conditional `taskValues` header in `jdbc_watermark_job.py.j2` + manifest UPDATE**
 
-**Goal:** Per-iteration worker generated from `jdbc_watermark_job.py.j2` unpacks `taskValues` in conditional header (B2 path) or falls through to existing static literals (legacy path). Worker writes its `worker_run_id` to `b2_manifests` between `derive_run_id` and `insert_new` via optimistic-concurrency UPDATE.
+**Goal:** Per-iteration worker generated from `jdbc_watermark_job.py.j2` unpacks `taskValues` in conditional header (B2 path) or falls through to existing static literals (legacy path). Worker writes its `worker_run_id` to `b2_manifests` between `derive_run_id` and `insert_new` via optimistic-concurrency UPDATE. **U5 also enforces R12 — strict `>` watermark predicate semantics for B2 workers.** Pick path (a) [codegen default change] or (b) [U2 validator gate] from R12; goal completion gates on rendered B2 notebook emitting `WHERE <wm_col> > <hwm>` (NOT `>=`).
 
-**Requirements:** R3, R4
+**Requirements:** R3, R4, R12
 
 **Dependencies:** U4 (manifest table exists); Tier 2 plan U2 (worker calls `get_latest_watermark(load_group=...)`).
 
@@ -842,7 +884,7 @@ Test expectation: none — pure documentation, no behavior change.
 - **State lifecycle risks:** Manifest UPDATE write hotspot at concurrency=10 × N=300 (origin Known Issues). Mitigation: optimistic-concurrency check + `_merge_with_retry`. Long-term fallback: append-only event-log if hotspot proves insufficient (deferred to v2).
 - **API surface parity:** `lhp_watermark.__init__.py` exports unchanged — B2 reuses 10 existing names. New error codes in `LHP-CFG-` namespace, no new categories. `FlowGroup` model gains documented support for two new optional `workflow` keys (no Pydantic schema break).
 - **Integration coverage:** U10 covers happy path + every error code + per-env substitution + parity flag. U12 covers e2e DAB execution including induced failure + concurrent batches + DAB retry.
-- **Unchanged invariants:** ADR-002 namespace (`lhp_watermark` reused verbatim, no new exports). ADR-003 landing shape (`<landing_root>/_lhp_runs/<run_id>/`). ADR-004 registry placement (watermarks + b2_manifests at `metadata.<env>_orchestration`). L2 §5.3 control flow (`insert_new` outside try; `mark_failed`-then-raise inside; `mark_complete` after). Terminal-state guard. SQL safety via `SQLInputValidator` pre-composition. UTC session on every DML. `action_registry.py` unchanged.
+- **Unchanged invariants:** ADR-002 namespace (`lhp_watermark` reused verbatim, no new exports). ADR-003 landing shape (`<landing_root>/_lhp_runs/<run_id>/`) — Delta path outputs, not one-UC-table-per-extract (see §Direct-JDBC Spike Findings, Constraint 4). ADR-004 registry placement (watermarks + b2_manifests at `metadata.<env>_orchestration`). L2 §5.3 control flow (`insert_new` outside try; `mark_failed`-then-raise inside; `mark_complete` after). Terminal-state guard. SQL safety via `SQLInputValidator` pre-composition. UTC session on every DML. `action_registry.py` unchanged.
 
 ---
 
@@ -855,6 +897,7 @@ Test expectation: none — pure documentation, no behavior change.
 | Mixed-mode flowgroups in one pipeline produce surprising error | Low | Low | U2 catches at validator (friendly error); U7 catches at orchestrator (safety net). Documented in runbook. |
 | `for_each_task.inputs` syntax change in DAB | Low | High | DAB API is GA; syntax is documented and stable. If breaking change ships, all LHP B2 deploys break — file as upstream dependency. |
 | `derive_run_id` format changes | Low | High | Origin doc explicitly verifies empirically against `runtime.py:97`. Pin verification in U12 against current commit. |
+| **`>=` watermark predicate default leaks into B2 path → duplicate boundary rows on re-run** (R12 regression) | Med | High | Direct-JDBC spike (2026-04-25) proved this happens with the static path under load. Generator default at `src/lhp/generators/load/jdbc_watermark_job.py:243` is `">="`. U5 enforces R12 via either (a) codegen default change for `for_each` mode or (b) U2 validator (`LHP-CFG-029`). U12 e2e smoke MUST include a second-run-zero-duplicates assertion. Without R12, B2 ships the duplication defect at scale. |
 | `_lhp_watermark_bootstrap_syspath()` not replicated correctly in new task notebooks → import errors at runtime | Med | High | U4 + U6 + U10 explicitly include the bootstrap helper as cell 1 of every new notebook. ADR-002 Phase 4 evidence shows the pattern works. |
 | HIPAA hook code accidentally ships in B2 milestone | Low | Med | U5 explicitly documents the comment marker only; no executable HIPAA code. Code review enforces. |
 | `pyproject.toml` package-data missing new template subdir | Low | High | Either keep new templates flat under `lhp.templates.bundle/` (no change needed) or add subdir + `pyproject.toml` entry in U4. |

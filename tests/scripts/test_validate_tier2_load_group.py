@@ -67,6 +67,48 @@ def test_helpers_exposed() -> None:
         assert hasattr(mod, name), f"helper {name} missing from notebook"
 
 
+def test_v_check_functions_exposed() -> None:
+    """V1-V5 check functions are module-level so the final-cell loop can
+    register them. Importable under bare-import (functions reference
+    module-level globals like ``spark`` / ``wm`` only when called inside
+    the Databricks runtime path).
+    """
+    mod = _load_notebook()
+    for name in (
+        "_v1_isolation_smoke",
+        "_v2_cross_source_regression",
+        "_v3_legacy_fallback",
+        "_v4_legacy_seed_then_incremental",
+        "_v5_cold_start_no_legacy",
+    ):
+        assert hasattr(mod, name), f"V-check {name} missing from notebook"
+        assert callable(getattr(mod, name)), f"V-check {name} not callable"
+
+
+def test_v5_registered_in_final_cell_invariants_loop() -> None:
+    """The final cell registers each V-check by id in the invariants loop.
+    V5 must appear so its result lands in the exit JSON (used by the
+    operator's PASS/FAIL gate per plan v5 §Phase 5.6).
+
+    Source-text check (the loop body is gated on ``_running_in_databricks``
+    and cannot be executed under bare-import).
+    """
+    src = _SCRIPT_PATH.read_text(encoding="utf-8")
+    assert '("V5", _v5_cold_start_no_legacy)' in src, (
+        "V5 entry missing from final-cell invariants loop"
+    )
+
+
+def test_v5_header_documents_pinned_contract() -> None:
+    """Notebook header docstring must mention V5 + the pinned cold-start
+    contract (load_group=None / "" / default-arg → None when no legacy/
+    NULL row exists). Catches accidental V5 removal from the spec.
+    """
+    src = _SCRIPT_PATH.read_text(encoding="utf-8")
+    assert "V5 — Cold-start when no legacy row exists" in src
+    assert "Tier-1 cross-source isolation" in src
+
+
 # ---------- _build_probe_row -------------------------------------------------
 
 

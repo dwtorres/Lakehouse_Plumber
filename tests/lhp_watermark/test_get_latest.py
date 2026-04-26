@@ -210,6 +210,63 @@ def test_load_group_clause_collapses_to_is_null_when_caller_passes_none() -> Non
     )
 
 
+def test_load_group_clause_empty_string_reduces_to_eq_empty() -> None:
+    """V5 / H24 contract pin: ``load_group=""`` is a valid string per
+    ``SQLInputValidator.string`` (no length-zero rejection, no control
+    chars) and so flows through ``_render_load_group_literal`` as the SQL
+    literal ``''``.
+
+    The composed clause becomes:
+
+        AND ( load_group = '' OR ('' IS NULL AND load_group IS NULL) )
+
+    Three-valued logic: ``'' IS NULL`` is FALSE (empty string is NOT NULL
+    in SQL), so the right arm is dead. The clause reduces to:
+
+        AND load_group = ''
+
+    Different SQL path from ``load_group=None`` (which reduces to
+    ``IS NULL``), but for a probe shape with rows under non-empty
+    ``load_group`` values only (lg_a, lg_b), both produce empty result.
+    V5 in the validation notebook depends on this contract.
+    """
+    spark = _RecordingSpark(rows=[])
+    wm = _make_wm(spark)
+    wm.get_latest_watermark(**_kwargs(load_group=""))
+    sql = spark.statements[-1]
+    pattern = re.compile(
+        r"AND\s*\(\s*load_group\s*=\s*''\s+OR\s+"
+        r"\(\s*''\s+IS\s+NULL\s+AND\s+load_group\s+IS\s+NULL\s*\)\s*\)",
+        re.IGNORECASE,
+    )
+    assert pattern.search(sql), (
+        f"load_group='' must emit both arms with empty-string substitutions; SQL: {sql}"
+    )
+
+
+def test_load_group_default_arg_emits_same_sql_as_explicit_none() -> None:
+    """V5 / H24 contract pin: the default value for the ``load_group`` kwarg
+    is ``None`` (per ``WatermarkManager.get_latest_watermark`` signature),
+    so omitting it must produce identical SQL to passing ``load_group=None``
+    explicitly. V5 exercises both call shapes; this test guarantees they are
+    indistinguishable at the SQL composer.
+    """
+    spark1 = _RecordingSpark(rows=[])
+    wm1 = _make_wm(spark1)
+    wm1.get_latest_watermark(**_kwargs())  # default arg
+    sql_default = spark1.statements[-1]
+
+    spark2 = _RecordingSpark(rows=[])
+    wm2 = _make_wm(spark2)
+    wm2.get_latest_watermark(**_kwargs(load_group=None))  # explicit None
+    sql_explicit_none = spark2.statements[-1]
+
+    assert sql_default == sql_explicit_none, (
+        "default-arg call shape must emit identical SQL to explicit "
+        f"load_group=None.\ndefault: {sql_default}\nexplicit: {sql_explicit_none}"
+    )
+
+
 def test_get_latest_returns_only_matching_load_group_row() -> None:
     """Probe set spans ``('pipe_a::fg_a', 'pipe_b::fg_b', 'legacy', NULL)``;
     a B2 caller filtered to ``pipe_a::fg_a`` sees only that row.

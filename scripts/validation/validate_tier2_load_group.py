@@ -2,7 +2,8 @@
 # Tier 2 ``load_group`` Databricks validation — runs on a Databricks cluster
 # against a deep-clone of ``metadata.<env>_orchestration.watermarks``.
 #
-# Invariants exercised (V1–V4 from docs/planning/tier-2-hwm-load-group-fix.md):
+# Invariants exercised (V1–V5 from docs/planning/tier-2-hwm-load-group-fix.md
+# + plan v5 §Phase 5 V1-V5 table):
 #   V1 — Isolation smoke. Two probe rows with same ``(source_system_id, schema,
 #        table)`` but different ``load_group`` values do NOT leak: a
 #        ``WatermarkManager.get_latest_watermark(..., load_group='lg_a')`` call
@@ -20,6 +21,12 @@
 #        HWM equals the seeded ``watermark_value``, (b) the worker's
 #        ``extraction_type`` would be ``'incremental'`` (not ``'full'``), and
 #        (c) the JDBC WHERE clause includes the seeded HWM literal.
+#   V5 — Cold-start when no legacy row exists. Probe rows under ``lg_a`` +
+#        ``lg_b`` only — no ``'legacy'`` row, no NULL row. Caller invokes
+#        ``get_latest_watermark(load_group=None)`` (also ``load_group=""`` and
+#        the default-arg call shape per H24). All three must return ``None``.
+#        Pinned contract: silent latest-across-all-load_groups would break
+#        Tier-1 cross-source isolation guarantee (regression-catch only).
 #
 # Invocation:
 #
@@ -761,6 +768,133 @@ def _v4_legacy_seed_then_incremental() -> Dict[str, Any]:
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## Cell 5b — V5 cold-start fallback (no legacy row)
+# MAGIC
+# MAGIC Probe rows under ``lg_a`` + ``lg_b`` only for one
+# MAGIC ``(source_system_id, schema, table)`` triple. **No** ``'legacy'`` row,
+# MAGIC **no** NULL-load_group row. Caller invokes
+# MAGIC ``get_latest_watermark(load_group=None)``. All three call shapes
+# MAGIC (``load_group=None``, ``load_group=""``, default arg) must return
+# MAGIC ``None``.
+# MAGIC
+# MAGIC ### Pinned contract (three-valued logic reduction)
+# MAGIC
+# MAGIC From ``src/lhp_watermark/watermark_manager.py::_compose_load_group_clause``
+# MAGIC (lines ~95-113), when ``load_group is None``:
+# MAGIC
+# MAGIC ```
+# MAGIC AND ( load_group = NULL OR (NULL IS NULL AND load_group IS NULL) )
+# MAGIC ⇒ AND ( NULL OR load_group IS NULL )           # NULL = NULL is NULL, not true
+# MAGIC ⇒ AND load_group IS NULL
+# MAGIC ```
+# MAGIC
+# MAGIC Probe rows have ``load_group='lg_a'`` and ``'lg_b'`` — neither matches
+# MAGIC ``IS NULL`` — empty result returned. Same observable for ``load_group=""``
+# MAGIC (reduces to ``AND load_group = ''`` — empty string ≠ ``'lg_a'``,``'lg_b'``).
+# MAGIC Default-arg call shape uses the kwarg default ``None`` per the
+# MAGIC ``get_latest_watermark`` signature.
+# MAGIC
+# MAGIC **Why V5 matters**: a regression where the three-way filter degrades to
+# MAGIC silent latest-across-all-load_groups would leak ``lg_a``/``lg_b`` rows to
+# MAGIC legacy callers, breaking Tier-1 cross-source isolation guarantee. V5 is
+# MAGIC the catch-net for that class of regression.
+
+# COMMAND ----------
+
+
+def _v5_cold_start_no_legacy() -> Dict[str, Any]:
+    """V5 — cold-start fallback when no legacy row exists.
+
+    Probe with rows under ``lg_a`` + ``lg_b`` only. Three call shapes (H24):
+      - ``get_latest_watermark(..., load_group=None)`` — explicit None
+      - ``get_latest_watermark(..., load_group="")`` — empty string
+      - ``get_latest_watermark(...)`` — default arg
+
+    All three must return ``None``. ``None`` and ``""`` reduce to different
+    SQL (``IS NULL`` vs ``= ''``) but yield the same observable for this
+    probe shape (no row matches either predicate). Default-arg shape uses
+    the kwarg default ``None`` per the ``get_latest_watermark`` signature.
+    """
+    tracked: List[str] = []
+    rid_a = _fresh_run_id()
+    rid_b = _fresh_run_id()
+    tracked.extend([rid_a, rid_b])
+    try:
+        # Probe set: lg_a + lg_b only. No 'legacy' row, no NULL row, no other
+        # rows for this (src, schema, table) under any load_group.
+        row_a = _build_probe_row(
+            run_id=rid_a,
+            source_system_id=source_system_id,
+            schema_name=schema_name_w,
+            table_name=table_name_w,
+            watermark_column_name="modified_date",
+            watermark_value="2099-07-01T00:00:00.000000+00:00",
+            watermark_time="2099-07-01T00:00:00+00:00",
+            load_group="lg_a",
+        )
+        row_b = _build_probe_row(
+            run_id=rid_b,
+            source_system_id=source_system_id,
+            schema_name=schema_name_w,
+            table_name=table_name_w,
+            watermark_column_name="modified_date",
+            watermark_value="2099-08-01T00:00:00.000000+00:00",
+            watermark_time="2099-08-01T00:00:00+00:00",
+            load_group="lg_b",
+        )
+
+        spark.sql(build_probe_insert_sql(probe_table_fq, row_a))
+        spark.sql(build_probe_insert_sql(probe_table_fq, row_b))
+
+        # Call shape 1: explicit load_group=None
+        got_none = wm.get_latest_watermark(
+            source_system_id=source_system_id,
+            schema_name=schema_name_w,
+            table_name=table_name_w,
+            load_group=None,
+        )
+
+        # Call shape 2: explicit load_group=""
+        got_empty = wm.get_latest_watermark(
+            source_system_id=source_system_id,
+            schema_name=schema_name_w,
+            table_name=table_name_w,
+            load_group="",
+        )
+
+        # Call shape 3: default-arg (omit load_group kwarg entirely)
+        got_default = wm.get_latest_watermark(
+            source_system_id=source_system_id,
+            schema_name=schema_name_w,
+            table_name=table_name_w,
+        )
+
+        none_ok = got_none is None
+        empty_ok = got_empty is None
+        default_ok = got_default is None
+
+        return {
+            "tracked_run_ids": tracked,
+            "load_group_none_result": got_none,
+            "load_group_empty_string_result": got_empty,
+            "default_arg_result": got_default,
+            "a_load_group_none_returns_none": bool(none_ok),
+            "b_load_group_empty_returns_none": bool(empty_ok),
+            "c_default_arg_returns_none": bool(default_ok),
+            "ok": bool(none_ok and empty_ok and default_ok),
+        }
+    finally:
+        cleanup_sql = build_cleanup_sql(probe_table_fq, tracked)
+        if cleanup_sql:
+            try:
+                spark.sql(cleanup_sql)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## Cell 6 — Cleanup tracked probe rows + report
 # MAGIC
 # MAGIC Each V-cell's ``finally`` already deletes its own tracked ``run_id``s.
@@ -796,7 +930,7 @@ def _timed(fn: Callable[[], Dict[str, Any]]) -> Dict[str, Any]:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Final cell — Run all V1–V4 + emit JSON exit value
+# MAGIC ## Final cell — Run all V1–V5 + emit JSON exit value
 
 # COMMAND ----------
 
@@ -819,6 +953,7 @@ if _running_in_databricks():
         ("V2", _v2_cross_source_regression),
         ("V3", _v3_legacy_fallback),
         ("V4", _v4_legacy_seed_then_incremental),
+        ("V5", _v5_cold_start_no_legacy),
     ]:
         results["invariants"][invariant_id] = _timed(fn)
 

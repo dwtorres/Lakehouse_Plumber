@@ -100,4 +100,14 @@ Example_Projects/performance_testing/resources
 Example_Projects/performance_testing/
 
 Example_Projects/performance_testing/monitoring/
+
+# edp_lhp_starter — bundle deploy artifacts (vendored package, generated
+# pipeline yml, local state). Source-of-truth lives in src/lhp_watermark/
+# + pipelines/*.yaml; deploy regenerates these.
+Example_Projects/edp_lhp_starter/.lhp_state.json
+Example_Projects/edp_lhp_starter/generated/
+Example_Projects/edp_lhp_starter/lhp_watermark/
+Example_Projects/edp_lhp_starter/resources/lhp/edp_*.pipeline.yml
+Example_Projects/edp_lhp_starter/resources/lhp/edp_*_workflow.yml
+
 .claude/
