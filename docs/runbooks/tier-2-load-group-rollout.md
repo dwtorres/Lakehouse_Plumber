@@ -414,11 +414,11 @@ LIMIT 1;
 
 For each env, append a row to your runbook log:
 
-| Env | Step 1 verified | Step 3 backfilled | Step 3a OPTIMIZED | V1-V4 PASS | Date | Run ids |
-|---|---|---|---|---|---|---|
-| dev | yes | yes | yes | yes | YYYY-MM-DD | … |
-| qa  | … | … | … | … | … | … |
-| prod | … | … | … | … | … | … |
+| Env | Step 1 verified | Step 3 backfilled | Step 3a OPTIMIZED | V1-V4 PASS | Date | Run ids | Notes |
+|---|---|---|---|---|---|---|---|
+| devtest | yes | yes (no-op; empty registry) | yes (no-op; numFiles 0→0) | deferred | 2026-04-25 | preflight stmt 01f1410e-a704; init via `lhp init-registry`; backfill+optimize via `lhp tier2-rollout`. Principal: `verbena1@gmail.com`. Warehouse: `9f30611e0b932a47`. | Empty registry (numFiles=0, sizeInBytes=0). M14 idempotency confirmed (re-run init issued zero ALTERs). V1-V5 (Phase 5) deferred — no interactive cluster + lhp_watermark wheel in workspace. Phase 6 dry-run validated for `customer_bronze` (zero-row preview = correct cold-start). Bug fixed mid-flight: SDK 0.105 needs enum `ExecuteStatementRequestOnWaitTimeout.CONTINUE` not string. |
+| qa  | … | … | … | … | … | … | … |
+| prod | … | … | … | … | … | … | … |
 
 ---
 
