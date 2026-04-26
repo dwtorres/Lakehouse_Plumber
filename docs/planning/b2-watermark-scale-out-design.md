@@ -1,6 +1,8 @@
 # Spike B2 — Watermark Scale-Out Design
 
-**Status:** Design baseline (not yet implemented)
+**Status:** Scheduled-then-shipped — design approved 2026-04-25, implementation
+units U1-U11 committed on branch `feat/b2-watermark-scale-out`. Operator
+adoption runbook: [`docs/runbooks/b2-for-each-rollout.md`](../runbooks/b2-for-each-rollout.md).
 **Prerequisite:** Tier 2 HWM load_group fix (see [tier-2-hwm-load-group-fix.md](tier-2-hwm-load-group-fix.md))
 **Approved:** 2026-04-25
 **Source plan:** `~/.claude/plans/cozy-scribbling-spring.md` (Revision 4)

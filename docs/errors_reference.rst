@@ -551,6 +551,213 @@ deterministic.
 4. *Mixed mode:* Move non-``for_each`` flowgroups to a separate pipeline, or convert
    all flowgroups in the pipeline to ``for_each``.
 
+.. rubric:: YAML examples — action count (facet 1)
+
+.. code-block:: yaml
+   :caption: Before (triggers LHP-CFG-033 — 301 actions after template expansion)
+
+   pipeline: crm_bronze
+   flowgroup: product_ingestion
+   workflow:
+     execution_mode: for_each
+   template_parameters:
+     tables: [t001, t002, ... t301]   # 301 entries — exceeds 300-action limit
+
+.. code-block:: yaml
+   :caption: After (fixed — split into two flowgroups)
+
+   # flowgroup A: first 150 tables
+   pipeline: crm_bronze
+   flowgroup: product_ingestion_a
+   workflow:
+     execution_mode: for_each
+   template_parameters:
+     tables: [t001, ... t150]
+
+   # flowgroup B: remaining 151 tables
+   pipeline: crm_bronze
+   flowgroup: product_ingestion_b
+   workflow:
+     execution_mode: for_each
+   template_parameters:
+     tables: [t151, ... t301]
+
+.. rubric:: YAML examples — shared-key disagreement (facet 2)
+
+.. code-block:: yaml
+   :caption: Before (triggers LHP-CFG-033 — two source systems in one flowgroup)
+
+   pipeline: crm_bronze
+   flowgroup: mixed_sources
+   workflow:
+     execution_mode: for_each
+   actions:
+     - name: load_crm_orders
+       type: load
+       source_system_id: crm_prod
+       wm_catalog: metadata
+       wm_schema: devtest_orchestration
+     - name: load_erp_orders
+       type: load
+       source_system_id: erp_prod    # different source_system_id — violates shared-key rule
+       wm_catalog: metadata
+       wm_schema: devtest_orchestration
+
+.. code-block:: yaml
+   :caption: After (fixed — one flowgroup per source system)
+
+   # crm flowgroup
+   pipeline: crm_bronze
+   flowgroup: crm_orders
+   workflow:
+     execution_mode: for_each
+   actions:
+     - name: load_crm_orders
+       type: load
+       source_system_id: crm_prod
+       wm_catalog: metadata
+       wm_schema: devtest_orchestration
+
+   # erp flowgroup
+   pipeline: crm_bronze
+   flowgroup: erp_orders
+   workflow:
+     execution_mode: for_each
+   actions:
+     - name: load_erp_orders
+       type: load
+       source_system_id: erp_prod
+       wm_catalog: metadata
+       wm_schema: devtest_orchestration
+
+.. rubric:: YAML examples — concurrency out of bounds (facet 3)
+
+.. code-block:: yaml
+   :caption: Before (triggers LHP-CFG-033 — concurrency 200 exceeds maximum 100)
+
+   pipeline: crm_bronze
+   flowgroup: product_ingestion
+   workflow:
+     execution_mode: for_each
+     concurrency: 200
+
+.. code-block:: yaml
+   :caption: After (fixed)
+
+   pipeline: crm_bronze
+   flowgroup: product_ingestion
+   workflow:
+     execution_mode: for_each
+     concurrency: 10   # or omit entirely for default min(action_count, 10)
+
+.. rubric:: YAML examples — mixed execution_mode in one pipeline (facet 4)
+
+.. code-block:: yaml
+   :caption: Before (triggers LHP-CFG-033 — legacy flowgroup alongside for_each in same pipeline)
+
+   # file: pipelines/crm_bronze/product_ingestion.yaml
+   pipeline: crm_bronze
+   flowgroup: product_ingestion
+   workflow:
+     execution_mode: for_each
+
+   # file: pipelines/crm_bronze/reference_data.yaml
+   pipeline: crm_bronze        # same pipeline name
+   flowgroup: reference_data   # no execution_mode — legacy emission
+   actions:
+     - name: load_ref
+       type: load
+
+.. code-block:: yaml
+   :caption: After (fixed — move legacy flowgroup to a separate pipeline)
+
+   # file: pipelines/crm_bronze/product_ingestion.yaml
+   pipeline: crm_bronze
+   flowgroup: product_ingestion
+   workflow:
+     execution_mode: for_each
+
+   # file: pipelines/crm_bronze_legacy/reference_data.yaml
+   pipeline: crm_bronze_legacy   # different pipeline name — no mixed-mode
+   flowgroup: reference_data
+   actions:
+     - name: load_ref
+       type: load
+
+LHP-CFG-034: Mixed ``execution_mode`` Flowgroups in Same Pipeline (Orchestrator)
+----------------------------------------------------------------------------------
+
+**When it occurs:** A pipeline contains a mix of flowgroups, some with
+``workflow.execution_mode: for_each`` and some without (legacy per-action static
+emission). The orchestrator merge guard catches this at codegen time as the
+safety-net layer behind LHP-CFG-033 facet 4.
+
+**Why it is an error:** B2 codegen merges all ``jdbc_watermark_v2`` actions across
+flowgroups in a pipeline into one synthetic flowgroup and emits a single
+``prepare_manifest → for_each_ingest → validate`` DAB workflow. Mixed
+``execution_mode`` values cannot share a single workflow YAML — the manifest and
+fan-out logic are incompatible with the legacy per-action emission topology.
+
+**Common causes:**
+
+- A new ``for_each`` flowgroup was added to an existing pipeline that already
+  has one or more non-``for_each`` flowgroups.
+- Template expansion produced a ``for_each`` flowgroup and a non-``for_each``
+  flowgroup in the same pipeline scope.
+- LHP-CFG-033 facet 4 was somehow bypassed at validation time and the
+  orchestrator encountered the mixed state during codegen.
+
+**Resolution:**
+
+1. Move the ``for_each`` flowgroup(s) into a separate pipeline name (rename the
+   ``pipeline:`` field), or
+2. Remove ``workflow.execution_mode: for_each`` from the new flowgroup to keep
+   the legacy per-action static emission for the entire pipeline.
+
+.. code-block:: yaml
+   :caption: Before (triggers LHP-CFG-034 — mixed mode reaches orchestrator)
+
+   # product_ingestion.yaml
+   pipeline: crm_bronze
+   flowgroup: product_ingestion
+   workflow:
+     execution_mode: for_each
+
+   # reference_data.yaml
+   pipeline: crm_bronze        # same pipeline — mixed mode not caught earlier
+   flowgroup: reference_data
+   actions:
+     - name: load_ref
+       type: load
+
+.. code-block:: yaml
+   :caption: After (fixed — separate pipelines)
+
+   # product_ingestion.yaml
+   pipeline: crm_bronze
+   flowgroup: product_ingestion
+   workflow:
+     execution_mode: for_each
+
+   # reference_data.yaml
+   pipeline: crm_bronze_legacy   # separate pipeline; no mixed-mode
+   flowgroup: reference_data
+   actions:
+     - name: load_ref
+       type: load
+
+.. note::
+
+   LHP-CFG-033 (facet 4) is the primary validator-time guard for this condition.
+   LHP-CFG-034 is a defence-in-depth backstop at orchestrator codegen time.
+   If you see LHP-CFG-034 without a preceding LHP-CFG-033 in the same run,
+   file an issue — the validator guard may have a gap.
+
+.. seealso::
+
+   :ref:`LHP-CFG-033 <LHP-CFG-033: for_each Post-Expansion Structural Violation>`
+   for the validator-time check covering the same mixed-mode condition.
+
 LHP-CFG-020: Bundle Resource Error
 -----------------------------------
 
