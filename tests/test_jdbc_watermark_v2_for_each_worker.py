@@ -1281,3 +1281,167 @@ def test_u1_integration_attempt0_fails_attempt1_also_fails() -> None:
         "Attempt-1 fail-mirror must emit UPDATE setting execution_status='failed' "
         "when the JDBC read fails inside the try block"
     )
+
+
+# ---------------------------------------------------------------------------
+# Tests: explicit DuplicateRunError handling (issue #18 / U1)
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_run_id_for_each_render_contains_handler() -> None:
+    """B2 render contains a try / except DuplicateRunError around insert_new
+    that re-raises and includes the LHP-WM-001 breadcrumb."""
+    rendered = _render(execution_mode="for_each", watermark_operator=">")
+    assert "except DuplicateRunError:" in rendered, (
+        "B2 render must contain the dedicated except DuplicateRunError handler"
+    )
+    assert "duplicate_run_id_abort" in rendered, (
+        "Handler must emit a duplicate_run_id_abort phase log breadcrumb"
+    )
+    assert 'error_code="LHP-WM-001"' in rendered, (
+        "Handler must record error_code='LHP-WM-001' in the structured log"
+    )
+    assert "DuplicateRunError" in rendered.split("from lhp_watermark import")[1].split(")")[0], (
+        "DuplicateRunError must be imported from lhp_watermark"
+    )
+
+
+def test_duplicate_run_id_legacy_render_contains_handler_without_batch_id() -> None:
+    """Legacy render contains the handler too. batch_id is a B2-only iteration
+    key so the legacy log call must NOT reference it."""
+    rendered = _render(execution_mode=None, watermark_operator=">=")
+    assert "except DuplicateRunError:" in rendered, (
+        "Legacy render must also contain the except DuplicateRunError handler"
+    )
+    assert "duplicate_run_id_abort" in rendered
+
+    # Locate the handler block and confirm batch_id is not referenced inside it.
+    lines = rendered.splitlines()
+    in_handler = False
+    handler_lines: List[str] = []
+    indent: Optional[int] = None
+    for line in lines:
+        stripped = line.lstrip()
+        if not in_handler:
+            if stripped.startswith("except DuplicateRunError:"):
+                in_handler = True
+                indent = len(line) - len(stripped)
+            continue
+        if line.strip() == "":
+            handler_lines.append(line)
+            continue
+        line_indent = len(line) - len(line.lstrip())
+        if line_indent <= (indent or 0) and line.strip():
+            break
+        handler_lines.append(line)
+    handler_src = "\n".join(handler_lines)
+    assert "batch_id" not in handler_src, (
+        f"Legacy DuplicateRunError handler must not reference batch_id; got:\n{handler_src}"
+    )
+
+
+def test_duplicate_run_id_handler_does_not_call_mark_failed() -> None:
+    """FR-L-05 contract: the new handler must NOT call wm.mark_failed.
+    No row was created by insert_new, so mark_failed would itself raise
+    TerminalStateGuardError and obscure the original DuplicateRunError."""
+    rendered = _render(execution_mode="for_each", watermark_operator=">")
+    handler_body = _extract_duplicate_run_id_handler_body(rendered)
+    # Strip comment-only lines before substring check — the handler comment
+    # block intentionally references "mark_failed" to document the contract.
+    code_lines = [
+        ln for ln in handler_body
+        if ln.strip() and not ln.lstrip().startswith("#")
+    ]
+    code_src = "\n".join(code_lines)
+    assert "mark_failed" not in code_src, (
+        "DuplicateRunError handler must not call wm.mark_failed (FR-L-05); "
+        f"found in non-comment lines:\n{code_src}"
+    )
+    # Bare raise must terminate the handler.
+    raise_lines = [ln for ln in handler_body if ln.strip() == "raise"]
+    assert raise_lines, "DuplicateRunError handler must end with bare `raise`"
+
+
+def _extract_duplicate_run_id_handler_body(rendered: str) -> List[str]:
+    """Return the body lines of the ``except DuplicateRunError:`` block."""
+    lines = rendered.splitlines()
+    in_handler = False
+    indent: Optional[int] = None
+    handler_body: List[str] = []
+    for line in lines:
+        stripped = line.lstrip()
+        if not in_handler:
+            if stripped.startswith("except DuplicateRunError:"):
+                in_handler = True
+                indent = len(line) - len(stripped)
+            continue
+        if line.strip() == "":
+            handler_body.append(line)
+            continue
+        line_indent = len(line) - len(line.lstrip())
+        if line_indent <= (indent or 0) and line.strip():
+            break
+        handler_body.append(line)
+    return handler_body
+
+
+def test_duplicate_run_id_runtime_propagates_no_fail_mirror() -> None:
+    """Runtime: when wm.insert_new raises DuplicateRunError, the worker
+    re-raises it without calling wm.mark_failed and without issuing a
+    manifest UPDATE setting execution_status='failed'."""
+    from lhp_watermark import DuplicateRunError
+
+    rendered = _render(execution_mode="for_each", watermark_operator=">")
+    run_id = "job-1-task-2-attempt-0"
+    spark = _make_claim_succeeds_spark(run_id)
+    iteration = _default_b2_iteration()
+    dbutils = _FakeDbutils(run_id=run_id, iteration=iteration)
+
+    wm = _build_wm_mock()
+    wm.insert_new.side_effect = DuplicateRunError(run_id=run_id)
+
+    with pytest.raises(DuplicateRunError):
+        _run_rendered(rendered, spark, dbutils, wm=wm)
+
+    # wm.mark_failed must NOT have been invoked — the new handler skips it.
+    assert wm.mark_failed.call_count == 0, (
+        "DuplicateRunError handler must not call wm.mark_failed; "
+        f"got call_count={wm.mark_failed.call_count}"
+    )
+    # No manifest UPDATE *setting* execution_status='failed' must have been
+    # issued. Match SET specifically so the claim UPDATE's WHERE-clause
+    # mention of `... OR execution_status = 'failed'` does not false-trigger.
+    failed_set_updates = [
+        s for s in spark.statements
+        if "UPDATE" in s.upper() and "SET execution_status = 'failed'" in s
+    ]
+    assert not failed_set_updates, (
+        "DuplicateRunError must not trigger the Anomaly B fail-mirror UPDATE; "
+        f"got: {failed_set_updates}"
+    )
+
+
+def test_non_duplicate_insert_new_failure_falls_through_unchanged() -> None:
+    """Edge case: insert_new raising a non-DuplicateRunError exception must
+    propagate without being caught by the new handler. The exception
+    bypasses the JDBC-read try block entirely (insert_new is outside it)."""
+    rendered = _render(execution_mode="for_each", watermark_operator=">")
+    run_id = "job-1-task-2-attempt-0"
+    spark = _make_claim_succeeds_spark(run_id)
+    iteration = _default_b2_iteration()
+    dbutils = _FakeDbutils(run_id=run_id, iteration=iteration)
+
+    wm = _build_wm_mock()
+    wm.insert_new.side_effect = ValueError("simulated non-duplicate failure")
+
+    with pytest.raises(ValueError, match="simulated non-duplicate failure"):
+        _run_rendered(rendered, spark, dbutils, wm=wm)
+
+    # Neither mark_failed nor a fail-mirror SET-UPDATE should have been issued
+    # for this exception class — insert_new is outside the JDBC-read try.
+    assert wm.mark_failed.call_count == 0
+    failed_set_updates = [
+        s for s in spark.statements
+        if "UPDATE" in s.upper() and "SET execution_status = 'failed'" in s
+    ]
+    assert not failed_set_updates

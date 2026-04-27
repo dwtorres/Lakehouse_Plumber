@@ -562,3 +562,59 @@ def test_error_code_renamed_val_050() -> None:
         "LHP-VAL-04A must not appear in rendered validate notebook; "
         "rename to LHP-VAL-050 was not applied"
     )
+
+
+# ---------- test: issue #18 R4 silent-divergence guard -----------------------
+
+
+def test_final_status_uses_case_form_in_count_query() -> None:
+    """Issue #18 R4: count query final_status must use CASE form requiring
+    manifest-side 'completed' AND (worker NULL or 'completed') for the
+    'completed' bucket. The plain coalesce(worker_status, manifest_status)
+    form would silently false-pass when watermarks retains a stale
+    'completed' row for a run_id whose manifest is still 'running'."""
+    rendered = _render()
+    assert "CASE" in rendered, (
+        "Issue #18 R4: validate count query must use a CASE expression for "
+        "final_status; plain coalesce was the silent-divergence regression"
+    )
+    assert "WHEN m.manifest_status = 'completed'" in rendered, (
+        "CASE must guard the 'completed' bucket on manifest_status"
+    )
+    assert (
+        "AND (w.worker_status IS NULL OR w.worker_status = 'completed')" in rendered
+    ), (
+        "CASE 'completed' bucket must require worker_status to be NULL or "
+        "'completed' — anything else means a stale watermarks row"
+    )
+    assert "END AS final_status" in rendered
+
+
+def test_final_status_case_form_used_in_both_call_sites() -> None:
+    """Issue #18 R4: both the count query and the failure-enumeration query
+    must use the same CASE form. A divergence would cause the failure
+    enumeration to disagree with the aggregate counts."""
+    rendered = _render()
+    case_count = rendered.count("END AS final_status")
+    assert case_count == 2, (
+        f"Expected exactly 2 final_status CASE projections (count + "
+        f"failure-enumeration); got {case_count}"
+    )
+
+
+def test_final_status_no_bare_coalesce_projection() -> None:
+    """The pre-fix bare coalesce projection must not survive at module level.
+
+    The CASE form keeps a coalesce in its ELSE branch as a fallback for
+    worker-side intermediate statuses (running, landed_not_committed,
+    abandoned), but the pre-fix bare projection
+    `coalesce(w.worker_status, m.manifest_status) AS final_status` is the
+    silent-divergence regression and must not appear as the projection."""
+    rendered = _render()
+    assert (
+        "coalesce(w.worker_status, m.manifest_status) AS final_status"
+        not in rendered
+    ), (
+        "Issue #18 R4: bare coalesce projection of final_status must not "
+        "appear; the CASE form supersedes it"
+    )
