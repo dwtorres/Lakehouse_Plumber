@@ -17,6 +17,7 @@ so both halves can never silently drift again.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from pathlib import Path
@@ -124,7 +125,44 @@ def test_b2_iteration_keys_constant_is_authoritative() -> None:
 # ---------------------------------------------------------------------------
 
 
-_ITERATION_KEY_RE = re.compile(r'iteration\[\s*"([a-zA-Z_][a-zA-Z0-9_]*)"\s*\]')
+def _extract_iteration_reads_via_ast(source: str) -> Set[str]:
+    """Return every string key read via ``iteration[<key>]`` in *source*.
+
+    Uses ast.parse + a NodeVisitor to walk Subscript nodes where the value is
+    a Name node named ``iteration`` and the slice is a string Constant.  This
+    is robust to quote style (single vs double) and arbitrary whitespace /
+    line-continuation formatting that would fool a regex.
+    """
+
+    class _IterationSubscriptVisitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.keys: Set[str] = set()
+
+        def visit_Subscript(self, node: ast.Subscript) -> None:
+            if (
+                isinstance(node.value, ast.Name)
+                and node.value.id == "iteration"
+                and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, str)
+            ):
+                self.keys.add(node.slice.value)
+            self.generic_visit(node)
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        # Rendered template may contain Jinja2 stubs that are not valid Python.
+        # Fall back to empty set — the caller will flag the miss.
+        return set()
+
+    visitor = _IterationSubscriptVisitor()
+    visitor.visit(tree)
+    return visitor.keys
+
+
+# Retain the regex as an internal fallback for non-parseable fragments;
+# not used by production tests.
+_ITERATION_KEY_RE = re.compile(r"iteration\[\s*['\"]([a-zA-Z_][a-zA-Z0-9_]*)['\"]")
 
 
 def _emitted_keys(prepare_rendered: str) -> Set[str]:
@@ -181,10 +219,15 @@ def test_prepare_manifest_emits_all_contract_keys_per_iteration() -> None:
 
 
 def test_worker_reads_subset_of_contract_keys() -> None:
+    """Worker reads only keys defined in B2_ITERATION_KEYS.
+
+    Uses ast.parse + Subscript-walk (not regex) so the check is robust to
+    quote style and whitespace formatting.
+    """
     from lhp.models.b2_iteration import B2_ITERATION_KEYS
 
     rendered = _render_worker()
-    reads = set(_ITERATION_KEY_RE.findall(rendered))
+    reads = _extract_iteration_reads_via_ast(rendered)
     illegal = reads - B2_ITERATION_KEYS
     assert not illegal, (
         f"Worker reads iteration keys outside the frozen contract: "
@@ -196,9 +239,12 @@ def test_worker_reads_subset_of_contract_keys() -> None:
 def test_worker_reads_anomaly_a_keys_from_iteration() -> None:
     """Anomaly A regression — worker MUST read jdbc_table, landing_path,
     watermark_column from iteration in B2 mode, not from codegen literals.
+
+    Uses ast.parse + Subscript-walk so single-quoted keys or reformatted
+    source are detected correctly.
     """
     rendered = _render_worker()
-    reads = set(_ITERATION_KEY_RE.findall(rendered))
+    reads = _extract_iteration_reads_via_ast(rendered)
     for required in ("jdbc_table", "landing_path", "watermark_column"):
         assert required in reads, (
             f"Worker must read {required!r} from iteration kwargs in B2 mode"

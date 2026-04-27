@@ -12,7 +12,7 @@ import re
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, NoReturn, Optional, Union
 
 from pyspark.sql import SparkSession
 
@@ -199,49 +199,44 @@ class WatermarkManager:
         self._ensure_utc_session()
         start_time = time.time()
 
-        namespace = f"{self.catalog}.{self.schema}"
-        tables = self.spark.sql(f"SHOW TABLES IN {namespace}").collect()
+        # CREATE TABLE IF NOT EXISTS is idempotent — no SHOW TABLES round-trip
+        # required. On worker restarts (~300 concurrent) this eliminates the
+        # redundant catalogue probe and the race window where two workers could
+        # both observe absence and race on CREATE.
+        ddl = f"""
+            CREATE TABLE IF NOT EXISTS {self.table_name} (
+                run_id STRING NOT NULL,
+                watermark_time TIMESTAMP NOT NULL,
+                source_system_id STRING NOT NULL,
+                schema_name STRING NOT NULL,
+                table_name STRING NOT NULL,
+                watermark_column_name STRING,
+                watermark_value STRING,
+                previous_watermark_value STRING,
+                row_count BIGINT,
+                extraction_type STRING NOT NULL,
+                bronze_stage_complete BOOLEAN NOT NULL,
+                silver_stage_complete BOOLEAN NOT NULL,
+                status STRING NOT NULL,
+                error_class STRING,
+                error_message STRING,
+                created_at TIMESTAMP NOT NULL,
+                completed_at TIMESTAMP,
+                load_group STRING,
+                CONSTRAINT pk_watermarks PRIMARY KEY (run_id)
+            )
+            USING DELTA
+            CLUSTER BY (source_system_id, load_group, schema_name, table_name)
+            TBLPROPERTIES (
+                'delta.enableChangeDataFeed' = 'true',
+                'delta.autoOptimize.optimizeWrite' = 'true',
+                'delta.autoOptimize.autoCompact' = 'true'
+            )
+        """
+        self.spark.sql(ddl)
 
-        table_exists = any(row["tableName"] == "watermarks" for row in tables)
-
-        if not table_exists:
-            logger.info("Creating watermarks table: %s", self.table_name)
-
-            ddl = f"""
-                CREATE TABLE IF NOT EXISTS {self.table_name} (
-                    run_id STRING NOT NULL,
-                    watermark_time TIMESTAMP NOT NULL,
-                    source_system_id STRING NOT NULL,
-                    schema_name STRING NOT NULL,
-                    table_name STRING NOT NULL,
-                    watermark_column_name STRING,
-                    watermark_value STRING,
-                    previous_watermark_value STRING,
-                    row_count BIGINT,
-                    extraction_type STRING NOT NULL,
-                    bronze_stage_complete BOOLEAN NOT NULL,
-                    silver_stage_complete BOOLEAN NOT NULL,
-                    status STRING NOT NULL,
-                    error_class STRING,
-                    error_message STRING,
-                    created_at TIMESTAMP NOT NULL,
-                    completed_at TIMESTAMP,
-                    load_group STRING,
-                    CONSTRAINT pk_watermarks PRIMARY KEY (run_id)
-                )
-                USING DELTA
-                CLUSTER BY (source_system_id, load_group, schema_name, table_name)
-                TBLPROPERTIES (
-                    'delta.enableChangeDataFeed' = 'true',
-                    'delta.autoOptimize.optimizeWrite' = 'true',
-                    'delta.autoOptimize.autoCompact' = 'true'
-                )
-            """
-            self.spark.sql(ddl)
-
-            duration_ms = (time.time() - start_time) * 1000
-            logger.info("Watermarks table created successfully (%.1f ms)", duration_ms)
-            return
+        duration_ms = (time.time() - start_time) * 1000
+        logger.info("Watermarks table existence ensured (%.1f ms)", duration_ms)
 
         # Pre-existing table path: conditional ALTERs gated on probes.
         if not self._has_load_group_column():
@@ -633,7 +628,7 @@ class WatermarkManager:
         detection live in ``lhp_watermark._merge_helpers``.
         """
 
-        def _on_exhausted(last_exc: Optional[BaseException]) -> None:
+        def _on_exhausted(last_exc: Optional[BaseException]) -> NoReturn:
             raise WatermarkConcurrencyError(
                 run_id=run_id, attempts=_INSERT_NEW_RETRY_BUDGET
             ) from last_exc
@@ -1001,7 +996,7 @@ class WatermarkManager:
         """
         self._ensure_utc_session()
         start_time = time.time()
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        current_time = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         timeout_hours = int(stale_timeout_hours)
 
         count_sql = f"""
@@ -1051,24 +1046,26 @@ class WatermarkManager:
         conditions: list = []
 
         if source_system_id is not None:
-            self._validate_identifier(source_system_id, "source_system_id")
-            conditions.append(f"source_system_id = '{source_system_id}'")
+            SQLInputValidator.identifier(source_system_id)
+            conditions.append(
+                f"source_system_id = {sql_literal(source_system_id)}"
+            )
         if schema_name is not None:
-            self._validate_identifier(schema_name, "schema_name")
-            conditions.append(f"schema_name = '{schema_name}'")
+            SQLInputValidator.identifier(schema_name)
+            conditions.append(f"schema_name = {sql_literal(schema_name)}")
         if table_name is not None:
-            self._validate_identifier(table_name, "table_name")
-            conditions.append(f"table_name = '{table_name}'")
+            SQLInputValidator.identifier(table_name)
+            conditions.append(f"table_name = {sql_literal(table_name)}")
 
         if start_date is not None:
             self._validate_date(start_date, "start_date")
-            conditions.append(f"created_at >= '{start_date}'")
+            conditions.append(f"created_at >= {sql_literal(start_date)}")
         elif end_date is None:
             conditions.append("created_at >= current_date() - INTERVAL 7 DAYS")
 
         if end_date is not None:
             self._validate_date(end_date, "end_date")
-            conditions.append(f"created_at <= '{end_date}'")
+            conditions.append(f"created_at <= {sql_literal(end_date)}")
 
         return conditions
 
@@ -1173,8 +1170,9 @@ class WatermarkManager:
         Returns:
             Spark DataFrame of stale runs.
         """
+        self._ensure_utc_session()
         start_time = time.time()
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        current_time = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         timeout_hours = int(stale_timeout_hours)
 
         sql = f"""
@@ -1204,8 +1202,8 @@ class WatermarkManager:
 
         where_clause = ""
         if source_system_id is not None:
-            self._validate_identifier(source_system_id, "source_system_id")
-            where_clause = f"WHERE source_system_id = '{source_system_id}'"
+            SQLInputValidator.identifier(source_system_id)
+            where_clause = f"WHERE source_system_id = {sql_literal(source_system_id)}"
 
         sql = f"""
             SELECT source_system_id, schema_name, table_name,

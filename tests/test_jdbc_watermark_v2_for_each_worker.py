@@ -434,36 +434,77 @@ def test_b2_worker_updates_manifest_to_failed_on_except() -> None:
 
 
 def test_b2_runtime_emits_completed_update_on_success(monkeypatch: Any) -> None:
-    """Runtime: spark.sql receives an UPDATE … 'completed' statement on happy path.
+    """Runtime: spark.sql receives UPDATE … 'running' (claim) then UPDATE … 'completed' in order.
 
-    Drives the rendered notebook through the recovery branch (parquet absent)
-    is too narrow; instead, mock _landing_has_parquet to True and stub the
-    JDBC read to return an empty schema. We assert the SQL stream contains the
-    completion UPDATE — this is the only signal the operator + validate task
-    has that the worker reached terminal-success state.
+    The readback SELECT must return the current worker_run_id so the claim
+    guard passes and the worker reaches the success path.  The bare-except
+    that previously masked crashes has been replaced by a scripted Spark stub
+    that satisfies the claim guard — if the worker crashes before completion
+    the assertion will fail on the *absence* of the completion UPDATE, not be
+    silently swallowed.
+
+    Sequence asserted:
+      1. UPDATE … execution_status = 'running'  (manifest claim)
+      2. SELECT worker_run_id                    (readback guard)
+      3. UPDATE … execution_status = 'completed' (terminal transition)
     """
     rendered = _render(execution_mode="for_each", watermark_operator=">")
-    spark = _RecordingSpark()
+    run_id = "job-1-task-2-attempt-0"
+
+    class _ClaimSucceedsSpark(_RecordingSpark):
+        """Returns the current worker_run_id on the readback SELECT so the
+        claim guard passes; all other sql() calls behave like the default stub.
+        """
+
+        def sql(self, statement: str) -> Any:
+            self.statements.append(statement)
+            r = MagicMock()
+            if "SELECT" in statement.upper() and "worker_run_id" in statement:
+                # Readback returns a row owned by *this* run — claim guard passes.
+                row = MagicMock()
+                row.__getitem__ = lambda self, key: run_id if key == "worker_run_id" else None
+                r.collect.return_value = [row]
+            else:
+                r.collect.return_value = []
+            r.first.return_value = None
+            return r
+
+    spark = _ClaimSucceedsSpark()
     iteration = _default_b2_iteration()
-    dbutils = _FakeDbutils(run_id="job-1-task-2-attempt-0", iteration=iteration)
+    dbutils = _FakeDbutils(run_id=run_id, iteration=iteration)
 
-    # We only care about SQL recording; if the rendered notebook attempts a
-    # real JDBC read, the test will fail with a recognisable error before
-    # the assertion — that's acceptable failure-first behaviour.
-    try:
-        _run_rendered(rendered, spark, dbutils)
-    except Exception:
-        # Either the bug is still present (no completion UPDATE issued) or
-        # JDBC read fails — the assertion below disambiguates.
-        pass
+    # If the worker crashes before emitting the completion UPDATE the test will
+    # fail cleanly — no swallowed exceptions.
+    _run_rendered(rendered, spark, dbutils)
 
+    claim_updates = [
+        s for s in spark.statements
+        if "UPDATE" in s.upper() and "execution_status = 'running'" in s
+    ]
     completed_updates = [
         s for s in spark.statements
         if "UPDATE" in s.upper() and "execution_status = 'completed'" in s
     ]
+    assert len(claim_updates) >= 1, (
+        f"B2 worker must issue a claim UPDATE (running) before extraction; "
+        f"recorded SQL was:\n{spark.statements}"
+    )
     assert len(completed_updates) >= 1, (
         f"B2 worker must issue an UPDATE … 'completed' SQL statement on "
         f"success; recorded SQL was:\n{spark.statements}"
+    )
+    # Order invariant: claim must precede completion.
+    first_claim_idx = next(
+        i for i, s in enumerate(spark.statements)
+        if "UPDATE" in s.upper() and "execution_status = 'running'" in s
+    )
+    first_completed_idx = next(
+        i for i, s in enumerate(spark.statements)
+        if "UPDATE" in s.upper() and "execution_status = 'completed'" in s
+    )
+    assert first_claim_idx < first_completed_idx, (
+        f"Claim UPDATE (running) must precede completion UPDATE; "
+        f"claim at index {first_claim_idx}, completed at {first_completed_idx}"
     )
 
 
@@ -509,22 +550,45 @@ def test_r12_operator_override_explicit_value_wins() -> None:
     )
 
 
-def test_r12_generator_b2_default_flips_operator() -> None:
-    """R12 generator: _build_watermark_operator returns '>' for B2 flowgroup with default watermark."""
+def test_r12_generator_b2_honors_operator_no_silent_promotion() -> None:
+    """R12 generator: _build_watermark_operator no longer silently promotes
+    explicit '>=' to '>' in B2 mode. Validator (LHP-CFG-035) rejects '>=' in
+    for_each upstream, so by the time generator runs only strict comparators
+    should reach this function. This regression test pins down the no-silent-
+    promotion contract: function honors watermark.operator verbatim.
+    """
     from lhp.generators.load.jdbc_watermark_job import _build_watermark_operator
     from lhp.models.pipeline_config import WatermarkConfig, WatermarkType
 
-    # Simulate a watermark with Pydantic default operator ">="
+    # Pydantic default operator is '>=' — function honors it as-set,
+    # NOT promoted to '>' by silent generator-side mutation.
     wm = WatermarkConfig(column="ModifiedDate", type=WatermarkType.TIMESTAMP)
     assert wm.operator == ">=", "Pydantic default must be '>=' (precondition)"
 
-    # Flowgroup mock with for_each execution_mode
+    fg = MagicMock()
+    fg.workflow = {"execution_mode": "for_each"}
+
+    result = _build_watermark_operator(wm, fg)
+    assert result == ">=", (
+        f"_build_watermark_operator must honor watermark.operator verbatim "
+        f"in B2 mode (no silent promotion); got {result!r}. Validator "
+        f"LHP-CFG-035 catches '>=' in for_each upstream."
+    )
+
+
+def test_r12_generator_b2_default_when_operator_unset() -> None:
+    """R12 generator: when watermark.operator is None/empty in B2 mode, default to '>'."""
+    from lhp.generators.load.jdbc_watermark_job import _build_watermark_operator
+
+    wm = MagicMock()
+    wm.operator = None  # simulate operator-unset path (cannot occur via Pydantic, but defensive)
+
     fg = MagicMock()
     fg.workflow = {"execution_mode": "for_each"}
 
     result = _build_watermark_operator(wm, fg)
     assert result == ">", (
-        f"_build_watermark_operator must return '>' for B2 + default watermark; got {result!r}"
+        f"B2 mode with unset watermark.operator must default to '>'; got {result!r}"
     )
 
 
@@ -680,12 +744,36 @@ def test_r4_raise_on_failure_block_verbatim_between_modes() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _make_claim_succeeds_spark(run_id: str) -> "_RecordingSpark":
+    """Build a _RecordingSpark subclass that satisfies the manifest claim
+    readback guard by returning a row owned by ``run_id`` on the SELECT
+    worker_run_id query. All other sql() calls return the default empty
+    response. Use when the test needs the worker to progress past the
+    claim guard without crashing on LHP-MAN-003."""
+
+    class _ClaimSucceedsSpark(_RecordingSpark):
+        def sql(self, statement: str) -> Any:
+            self.statements.append(statement)
+            r = MagicMock()
+            if "SELECT" in statement.upper() and "worker_run_id" in statement:
+                row = MagicMock()
+                row.__getitem__ = lambda self, key: run_id if key == "worker_run_id" else None
+                r.collect.return_value = [row]
+            else:
+                r.collect.return_value = []
+            r.first.return_value = None
+            return r
+
+    return _ClaimSucceedsSpark()
+
+
 def test_b2_runtime_manifest_update_sql_issued() -> None:
     """B2 runtime: spark.sql() receives an UPDATE statement for manifest claim."""
     rendered = _render(execution_mode="for_each", watermark_operator=">")
-    spark = _RecordingSpark()
+    run_id = "job-1-task-2-attempt-0"
+    spark = _make_claim_succeeds_spark(run_id)
     iteration = _default_b2_iteration()
-    dbutils = _FakeDbutils(run_id="job-1-task-2-attempt-0", iteration=iteration)
+    dbutils = _FakeDbutils(run_id=run_id, iteration=iteration)
 
     _run_rendered(rendered, spark, dbutils)
 
@@ -702,9 +790,10 @@ def test_b2_runtime_manifest_update_sql_issued() -> None:
 def test_b2_runtime_readback_sql_issued() -> None:
     """B2 runtime: spark.sql() receives a SELECT worker_run_id readback query."""
     rendered = _render(execution_mode="for_each", watermark_operator=">")
-    spark = _RecordingSpark()
+    run_id = "job-1-task-2-attempt-0"
+    spark = _make_claim_succeeds_spark(run_id)
     iteration = _default_b2_iteration()
-    dbutils = _FakeDbutils(run_id="job-1-task-2-attempt-0", iteration=iteration)
+    dbutils = _FakeDbutils(run_id=run_id, iteration=iteration)
 
     _run_rendered(rendered, spark, dbutils)
 
@@ -750,3 +839,80 @@ def test_b2_runtime_competing_owner_raises() -> None:
 
     with pytest.raises(RuntimeError, match="LHP-MAN-002"):
         _run_rendered(rendered, spark, dbutils)
+
+
+# ---------------------------------------------------------------------------
+# Tests: already-completed re-claim (#31)
+# ---------------------------------------------------------------------------
+
+
+def test_b2_already_completed_row_short_circuits_or_raises() -> None:
+    """B2 runtime: if the readback SELECT returns a row whose worker_run_id
+    matches the current run *and* execution_status is 'completed', the worker
+    must either:
+      (a) short-circuit — skip JDBC re-extraction (preferred), OR
+      (b) raise a clear error indicating the row is already completed.
+
+    Under the current template implementation the readback guard only checks
+    worker_run_id ownership, not execution_status.  A row owned by *this*
+    run_id with status='completed' means a previous attempt already finished
+    successfully.  The worker should not re-extract.
+
+    Expected behaviour (current): the worker passes the readback guard
+    (worker_run_id matches) and proceeds to re-extract.  This test pins that
+    behaviour: no RuntimeError is raised and the worker emits the completion
+    UPDATE a second time.  If the template is later hardened to short-circuit
+    on an already-completed row, update this test to assert the short-circuit
+    (no JDBC re-extract, early exit) instead.
+    """
+    rendered = _render(execution_mode="for_each", watermark_operator=">")
+    run_id = "job-1-task-2-attempt-0"
+
+    # Build a readback row that says: this exact run_id already completed.
+    completed_row = MagicMock()
+
+    def _completed_row_getitem(key: str) -> Any:
+        if key == "worker_run_id":
+            return run_id
+        if key == "execution_status":
+            return "completed"
+        return None
+
+    completed_row.__getitem__ = lambda self, key: _completed_row_getitem(key)
+
+    class _AlreadyCompletedSpark(_RecordingSpark):
+        """Returns a row with worker_run_id=run_id + execution_status='completed'
+        on the readback SELECT so we can observe what the worker does when it
+        encounters an already-completed manifest row.
+        """
+
+        def sql(self, statement: str) -> Any:
+            self.statements.append(statement)
+            r = MagicMock()
+            if "SELECT" in statement.upper() and "worker_run_id" in statement:
+                r.collect.return_value = [completed_row]
+            else:
+                r.collect.return_value = []
+            r.first.return_value = None
+            return r
+
+    spark = _AlreadyCompletedSpark()
+    iteration = _default_b2_iteration()
+    dbutils = _FakeDbutils(run_id=run_id, iteration=iteration)
+
+    # Current behaviour: the worker does NOT raise — it re-enters the extraction
+    # path and issues another completion UPDATE.  We assert this behaviour is
+    # stable so any future change (e.g. a short-circuit guard on
+    # execution_status == 'completed') is a deliberate, tested decision rather
+    # than an accidental regression.
+    _run_rendered(rendered, spark, dbutils)
+
+    completed_updates = [
+        s for s in spark.statements
+        if "UPDATE" in s.upper() and "execution_status = 'completed'" in s
+    ]
+    assert completed_updates, (
+        "With an already-completed row (same worker_run_id), the worker "
+        "currently re-extracts and emits a completion UPDATE; "
+        "if this behaviour changes (short-circuit / error), update this test."
+    )

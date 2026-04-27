@@ -59,7 +59,11 @@ class WorkflowResourceGenerator(BaseActionGenerator):
         Returns:
             Rendered YAML string with B2 three-task topology.
         """
-        assert isinstance(flowgroup.workflow, dict)
+        if not isinstance(flowgroup.workflow, dict):
+            raise TypeError(
+                f"Expected flowgroup.workflow to be dict, got"
+                f" {type(flowgroup.workflow).__name__}"
+            )
         pipeline_name = flowgroup.pipeline
         flowgroup_name = flowgroup.flowgroup
 
@@ -109,7 +113,7 @@ class WorkflowResourceGenerator(BaseActionGenerator):
             isinstance(flowgroup.workflow, dict)
             and flowgroup.workflow.get("extraction_mode") == "serial"
         )
-        previous_task_name = None
+        previous_task_name: Optional[str] = None
         for action in flowgroup.actions:
             if not isinstance(action.source, dict):
                 continue

@@ -108,6 +108,8 @@ from typing import Any, Dict, List, Optional
 if lhp_workspace_path and lhp_workspace_path not in sys.path:
     sys.path.insert(0, lhp_workspace_path)
 
+from lhp_watermark.sql_safety import sql_literal  # noqa: E402
+
 spark.conf.set("spark.sql.session.timeZone", "UTC")
 
 # Databricks REST client — uses the cluster's token transparently via the
@@ -228,7 +230,7 @@ def _cleanup() -> None:
     try:
         spark.sql(
             f"DELETE FROM {wm_catalog}.{wm_schema}.b2_manifests"
-            f" WHERE load_group = '{load_group}'"
+            f" WHERE load_group = {sql_literal(load_group)}"
         )
     except Exception:  # noqa: BLE001
         pass

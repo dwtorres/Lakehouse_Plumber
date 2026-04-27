@@ -458,6 +458,170 @@ create the table.
 
    ADR-003 §Q5 for the full analysis of the ``UC LOCATION_OVERLAP`` failure mode.
 
+LHP-CFG-020: Bundle Resource Error
+-----------------------------------
+
+**When it occurs:** An error occurred while generating or syncing Databricks Asset Bundle
+resource files during ``lhp generate``.
+
+**Common causes:**
+
+- Invalid YAML in existing bundle resource files under ``resources/lhp/``
+- File permission issues preventing writes to the resources directory
+- Corrupted resource files from a previous interrupted generation
+
+**Resolution:**
+
+1. Run ``lhp validate --env <env>`` to check your configuration
+2. Check that files under ``resources/lhp/`` are valid YAML
+3. If files are corrupted, delete them and re-run ``lhp generate --env <env> --force``
+
+.. seealso::
+
+   :doc:`databricks_bundles` for bundle setup and configuration.
+
+LHP-CFG-021: Bundle YAML Processing Error
+------------------------------------------
+
+**When it occurs:** A bundle-related YAML file (such as ``databricks.yml`` or a resource
+file) could not be processed.
+
+**Common causes:**
+
+- Invalid YAML syntax in ``databricks.yml``
+- Malformed resource YAML files under ``resources/lhp/``
+- Encoding issues (file is not UTF-8)
+
+**Resolution:**
+
+1. Validate ``databricks.yml`` with a YAML linter
+2. Check for syntax errors at the line number shown in the error details
+3. Ensure all YAML files use UTF-8 encoding
+
+LHP-CFG-022: Missing databricks.yml
+------------------------------------
+
+**When it occurs:** Bundle operations require a ``databricks.yml`` file, but it was
+not found in the project root.
+
+**Common causes:**
+
+- Running bundle commands in a project that was not initialized with bundle support
+- Running commands from the wrong directory
+
+.. code-block:: bash
+   :caption: Resolution options
+
+   # Option 1: Initialize a new project with bundle support
+   lhp init my_project
+
+   # Option 2: Skip bundle operations
+   lhp generate --env dev --no-bundle
+
+LHP-CFG-023: Missing Databricks Bundle Targets
+-----------------------------------------------
+
+**When it occurs:** Substitution files exist for environments (e.g., ``substitutions/dev.yaml``)
+but the corresponding targets are not defined in ``databricks.yml``.
+
+**Common causes:**
+
+- Adding a new substitution file without updating ``databricks.yml``
+- Renaming a target in ``databricks.yml`` without updating the substitution file name
+
+.. code-block:: yaml
+   :caption: Before (triggers LHP-CFG-023) — substitutions/staging.yaml exists but...
+
+   # databricks.yml
+   targets:
+     dev:
+       default: true
+     prod:
+       mode: production
+     # Missing: staging target!
+
+.. code-block:: yaml
+   :caption: After (fixed)
+
+   # databricks.yml
+   targets:
+     dev:
+       default: true
+     staging:                    # Added to match substitutions/staging.yaml
+       mode: development
+     prod:
+       mode: production
+
+.. seealso::
+
+   :doc:`databricks_bundles` for target configuration details.
+
+LHP-CFG-024: Bundle Template Error
+-----------------------------------
+
+**When it occurs:** An error occurred while fetching or processing bundle templates
+during project initialization.
+
+**Common causes:**
+
+- Network connectivity issues when downloading templates
+- Invalid template URL or path
+- Template file is corrupted or in unexpected format
+
+**Resolution:**
+
+1. Check your internet connection if using remote templates
+2. Verify the template path or URL is correct
+3. Try running the command again
+
+LHP-CFG-025: Bundle Configuration Error
+----------------------------------------
+
+**When it occurs:** The ``databricks.yml`` file or bundle configuration has structural
+problems that prevent LHP from processing it.
+
+**Common causes:**
+
+- Missing required fields in ``databricks.yml``
+- Invalid YAML structure in the bundle configuration
+- Incompatible bundle configuration format
+
+**Resolution:**
+
+1. Review your ``databricks.yml`` against the Databricks Asset Bundles documentation
+2. Run ``lhp validate`` for detailed diagnostics
+3. Compare with a working project's ``databricks.yml``
+
+LHP-CFG-027: Template Not Found
+--------------------------------
+
+**When it occurs:** The flowgroup references a template name that does not exist
+in the ``templates/`` directory.
+
+**Common causes:**
+
+- Typo in the template name
+- The template file is missing from the ``templates/`` directory
+- Using a template name without the correct file extension
+
+.. code-block:: yaml
+   :caption: Before (triggers LHP-CFG-027)
+
+   pipeline: my_pipeline
+   flowgroup: bronze_load
+   template: stanard_cloudfiles_load    # Typo!
+
+.. code-block:: yaml
+   :caption: After (fixed)
+
+   pipeline: my_pipeline
+   flowgroup: bronze_load
+   template: standard_cloudfiles_load   # Correct spelling
+
+.. tip::
+
+   Run ``lhp list_templates`` to see all available template names.
+
 LHP-CFG-031: Separator Collision in for_each Pipeline or Flowgroup Name
 ------------------------------------------------------------------------
 
@@ -757,170 +921,6 @@ fan-out logic are incompatible with the legacy per-action emission topology.
 
    :ref:`LHP-CFG-033 <LHP-CFG-033: for_each Post-Expansion Structural Violation>`
    for the validator-time check covering the same mixed-mode condition.
-
-LHP-CFG-020: Bundle Resource Error
------------------------------------
-
-**When it occurs:** An error occurred while generating or syncing Databricks Asset Bundle
-resource files during ``lhp generate``.
-
-**Common causes:**
-
-- Invalid YAML in existing bundle resource files under ``resources/lhp/``
-- File permission issues preventing writes to the resources directory
-- Corrupted resource files from a previous interrupted generation
-
-**Resolution:**
-
-1. Run ``lhp validate --env <env>`` to check your configuration
-2. Check that files under ``resources/lhp/`` are valid YAML
-3. If files are corrupted, delete them and re-run ``lhp generate --env <env> --force``
-
-.. seealso::
-
-   :doc:`databricks_bundles` for bundle setup and configuration.
-
-LHP-CFG-021: Bundle YAML Processing Error
-------------------------------------------
-
-**When it occurs:** A bundle-related YAML file (such as ``databricks.yml`` or a resource
-file) could not be processed.
-
-**Common causes:**
-
-- Invalid YAML syntax in ``databricks.yml``
-- Malformed resource YAML files under ``resources/lhp/``
-- Encoding issues (file is not UTF-8)
-
-**Resolution:**
-
-1. Validate ``databricks.yml`` with a YAML linter
-2. Check for syntax errors at the line number shown in the error details
-3. Ensure all YAML files use UTF-8 encoding
-
-LHP-CFG-022: Missing databricks.yml
-------------------------------------
-
-**When it occurs:** Bundle operations require a ``databricks.yml`` file, but it was
-not found in the project root.
-
-**Common causes:**
-
-- Running bundle commands in a project that was not initialized with bundle support
-- Running commands from the wrong directory
-
-.. code-block:: bash
-   :caption: Resolution options
-
-   # Option 1: Initialize a new project with bundle support
-   lhp init my_project
-
-   # Option 2: Skip bundle operations
-   lhp generate --env dev --no-bundle
-
-LHP-CFG-023: Missing Databricks Bundle Targets
------------------------------------------------
-
-**When it occurs:** Substitution files exist for environments (e.g., ``substitutions/dev.yaml``)
-but the corresponding targets are not defined in ``databricks.yml``.
-
-**Common causes:**
-
-- Adding a new substitution file without updating ``databricks.yml``
-- Renaming a target in ``databricks.yml`` without updating the substitution file name
-
-.. code-block:: yaml
-   :caption: Before (triggers LHP-CFG-023) — substitutions/staging.yaml exists but...
-
-   # databricks.yml
-   targets:
-     dev:
-       default: true
-     prod:
-       mode: production
-     # Missing: staging target!
-
-.. code-block:: yaml
-   :caption: After (fixed)
-
-   # databricks.yml
-   targets:
-     dev:
-       default: true
-     staging:                    # Added to match substitutions/staging.yaml
-       mode: development
-     prod:
-       mode: production
-
-.. seealso::
-
-   :doc:`databricks_bundles` for target configuration details.
-
-LHP-CFG-024: Bundle Template Error
------------------------------------
-
-**When it occurs:** An error occurred while fetching or processing bundle templates
-during project initialization.
-
-**Common causes:**
-
-- Network connectivity issues when downloading templates
-- Invalid template URL or path
-- Template file is corrupted or in unexpected format
-
-**Resolution:**
-
-1. Check your internet connection if using remote templates
-2. Verify the template path or URL is correct
-3. Try running the command again
-
-LHP-CFG-025: Bundle Configuration Error
-----------------------------------------
-
-**When it occurs:** The ``databricks.yml`` file or bundle configuration has structural
-problems that prevent LHP from processing it.
-
-**Common causes:**
-
-- Missing required fields in ``databricks.yml``
-- Invalid YAML structure in the bundle configuration
-- Incompatible bundle configuration format
-
-**Resolution:**
-
-1. Review your ``databricks.yml`` against the Databricks Asset Bundles documentation
-2. Run ``lhp validate`` for detailed diagnostics
-3. Compare with a working project's ``databricks.yml``
-
-LHP-CFG-027: Template Not Found
---------------------------------
-
-**When it occurs:** The flowgroup references a template name that does not exist
-in the ``templates/`` directory.
-
-**Common causes:**
-
-- Typo in the template name
-- The template file is missing from the ``templates/`` directory
-- Using a template name without the correct file extension
-
-.. code-block:: yaml
-   :caption: Before (triggers LHP-CFG-027)
-
-   pipeline: my_pipeline
-   flowgroup: bronze_load
-   template: stanard_cloudfiles_load    # Typo!
-
-.. code-block:: yaml
-   :caption: After (fixed)
-
-   pipeline: my_pipeline
-   flowgroup: bronze_load
-   template: standard_cloudfiles_load   # Correct spelling
-
-.. tip::
-
-   Run ``lhp list_templates`` to see all available template names.
 
 Validation Errors (LHP-VAL)
 ============================

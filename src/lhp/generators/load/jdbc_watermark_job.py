@@ -22,12 +22,12 @@ B2 for_each mode (R3, R5):
 import logging
 import re
 from pathlib import PurePosixPath
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import black
 
 from ...core.base_generator import BaseActionGenerator
-from ...models.config import Action, ActionType
+from ...models.config import Action, ActionType, FlowGroup, WatermarkConfig
 from ...utils.error_formatter import ErrorCategory, LHPConfigError
 
 logger = logging.getLogger(__name__)
@@ -122,7 +122,7 @@ def _has_schema_location(source_config: Dict[str, Any]) -> bool:
 
 
 def _check_landing_schema_overlap(
-    action: Action, flowgroup: object
+    action: Action, flowgroup: FlowGroup
 ) -> None:
     """Raise LHPConfigError when landing_path shares catalog+schema with bronze write target.
 
@@ -195,26 +195,43 @@ def _check_landing_schema_overlap(
         )
 
 
-def _build_watermark_operator(watermark: Any, flowgroup: Any) -> str:
-    """Return watermark comparison operator honouring R12 B2 strict-'>' default.
+def _resolve_source_system_id(
+    watermark: Optional[WatermarkConfig], source_config: Dict[str, Any]
+) -> str:
+    """Derive source_system_id from watermark config or JDBC URL host.
+
+    Falls back to "unknown" when neither is available.
+    """
+    source_system_id = (
+        getattr(watermark, "source_system_id", None) if watermark else None
+    )
+    if not source_system_id:
+        url = source_config.get("url", "")
+        host_match = re.search(r"//([^:/]+)", url)
+        source_system_id = host_match.group(1) if host_match else "unknown"
+    return source_system_id
+
+
+def _build_watermark_operator(
+    watermark: WatermarkConfig | None, flowgroup: FlowGroup | None
+) -> str:
+    """Return the watermark comparison operator.
 
     Rules (in priority order):
-      1. Explicit override: watermark.operator != ">=" → use it verbatim.
-      2. B2 for_each mode + no explicit override: return ">".
-      3. Legacy static-emission or no watermark: return ">=".
+      1. Explicit operator set on watermark: use it verbatim.
+      2. B2 for_each mode with no explicit operator: default to ">".
+      3. Legacy static-emission or no watermark: default to ">=".
 
-    The Pydantic default for WatermarkConfig.operator is ">="; we treat "=="
-    as "not overridden" because the field accepts only ">=" or ">".  An
-    operator explicitly set to ">=" in YAML is indistinguishable at this layer
-    — in B2 mode it still gets promoted to ">", which is the safe direction.
+    Operator validation (e.g. rejecting ">=" in for_each mode) is the
+    validator's responsibility. This function emits whatever the user set
+    without silent promotion.
     """
     _b2_for_each = bool(
         flowgroup
         and flowgroup.workflow
         and flowgroup.workflow.get("execution_mode") == "for_each"
     )
-    if watermark and watermark.operator and watermark.operator != ">=":
-        # Explicit non-default override wins in all modes.
+    if watermark and watermark.operator:
         return watermark.operator
     return ">" if _b2_for_each else ">="
 
@@ -243,14 +260,7 @@ class JDBCWatermarkJobGenerator(BaseActionGenerator):
         _check_landing_schema_overlap(action, flowgroup)
 
         # Derive context values
-        source_system_id = (
-            getattr(watermark, "source_system_id", None) if watermark else None
-        )
-        if not source_system_id:
-            # Derive from JDBC URL host
-            url = source_config.get("url", "")
-            host_match = re.search(r"//([^:/]+)", url)
-            source_system_id = host_match.group(1) if host_match else "unknown"
+        source_system_id = _resolve_source_system_id(watermark, source_config)
 
         wm_catalog = (
             getattr(watermark, "catalog", None) if watermark else None
@@ -414,7 +424,7 @@ class JDBCWatermarkJobGenerator(BaseActionGenerator):
 
     def _emit_b2_aux_files(
         self,
-        flowgroup: Any,
+        flowgroup: FlowGroup,
         wm_catalog: str,
         wm_schema: str,
         context: Dict[str, Any],
@@ -452,19 +462,8 @@ class JDBCWatermarkJobGenerator(BaseActionGenerator):
                 if src.get("type") != "jdbc_watermark_v2":
                     continue
 
-                # Derive source_system_id using same logic as generate().
                 action_wm = getattr(fg_action, "watermark", None)
-                action_source_system_id = (
-                    getattr(action_wm, "source_system_id", None)
-                    if action_wm
-                    else None
-                )
-                if not action_source_system_id:
-                    url = src.get("url", "")
-                    host_match = re.search(r"//([^:/]+)", url)
-                    action_source_system_id = (
-                        host_match.group(1) if host_match else "unknown"
-                    )
+                action_source_system_id = _resolve_source_system_id(action_wm, src)
 
                 # Anomaly A regression net (devtest 2026-04-26) — every
                 # per-action source/destination value MUST flow through the

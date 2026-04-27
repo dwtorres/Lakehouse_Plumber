@@ -8,6 +8,7 @@
 
 - 2026-04-17T23:25Z [USER] `jdbc_watermark_v2` is the active production path; legacy `jdbc_watermark` should be removed.
 - 2026-04-17T23:25Z [TOOL] `gsd headless` cannot run in this repo until project state exists; bootstrap is being created manually in `.planning/`.
+- 2026-04-26T18:56Z [USER] B2 for_each should preserve scale-out visibility without passing verbose per-action payloads through taskValues; use manifest-backed lookup so multiple for_each groups can cover action counts in the 1000s.
 
 ## [PROGRESS]
 
@@ -31,6 +32,7 @@
 - 2026-04-25T23:19Z [TOOL] B-style direct-JDBC `for_each` validation with strict `>` semantics completed 68 tables successfully: full run 45.31 min, 759,240 source/target rows, zero validation failures.
 - 2026-04-25T23:19Z [TOOL] B-style direct-JDBC second no-change run completed successfully: 68 latest watermark rows all had `row_count=0`, target total remained 759,240, and validation reported zero failures.
 - 2026-04-25T23:19Z [TOOL] UC table quota blocked a B run that attempted 68 registered target tables plus a scratch watermark table (`estimated count: 539/500` after cleanup); path-based Delta outputs avoided UC table creation and kept the orchestration/JDBC test moving.
+- 2026-04-26T18:56Z [TOOL] Databricks docs support the manifest-backed direction: Jobs support up to 1000 tasks, taskValues are limited to 48 KB per represented value, and large For each arrays should pass lookup keys into stored JSON/table data instead of embedding full records.
 
 ## [OUTCOMES]
 

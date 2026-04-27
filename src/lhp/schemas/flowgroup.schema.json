@@ -54,7 +54,22 @@
                 },
                 "operational_metadata": {
                     "$ref": "#/definitions/OperationalMetadata"
+                },
+                "workflow": {
+                    "$ref": "#/definitions/Workflow"
                 }
+            }
+        },
+        "Workflow": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Optional workflow block controlling DAB orchestration. Accepted on SingleFlowGroup or as a per-flowgroup override inside MultiFlowGroupArray.flowgroups items.",
+            "properties": {
+                "execution_mode": {"type": "string", "enum": ["for_each"]},
+                "concurrency": {"type": "integer", "minimum": 1, "maximum": 100},
+                "max_retries": {"type": "integer", "minimum": 0, "maximum": 3},
+                "parity_check": {"type": "boolean"},
+                "extraction_mode": {"type": "string"}
             }
         },
         "MultiFlowGroupArray": {
@@ -121,6 +136,9 @@
                             },
                             "operational_metadata": {
                                 "$ref": "#/definitions/OperationalMetadata"
+                            },
+                            "workflow": {
+                                "$ref": "#/definitions/Workflow"
                             }
                         }
                     }

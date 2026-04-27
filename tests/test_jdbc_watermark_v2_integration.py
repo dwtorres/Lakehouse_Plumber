@@ -867,6 +867,82 @@ class TestJDBCWatermarkV2ForEachIntegration:
         )
 
     # ------------------------------------------------------------------
+    # Scenario 6b: LHP-CFG-034 codegen-time backstop (bypasses validator)
+    # ------------------------------------------------------------------
+
+    def test_cfg_034_mixed_mode_codegen_backstop(self, tmp_path):
+        """generate_pipeline_by_field on a mixed-mode pipeline raises LHP-CFG-034.
+
+        The validator (validate_pipeline_by_field) catches mixed-mode pipelines
+        as LHP-CFG-033.  The orchestrator's _generate_workflow_resources method
+        contains a second, independent guard (code_number='034') that fires when
+        generation is called directly — e.g. via lhp generate without a prior
+        validate, or when validator routing is bypassed in tests.
+
+        This test calls generate_pipeline_by_field (NOT validate) on a pipeline
+        that has both a for_each flowgroup and a legacy (no execution_mode)
+        flowgroup so that the validator path is never consulted.  The expected
+        result is LHPConfigError with 'LHP-CFG-034' in the message.
+        """
+        project = tmp_path / "backstop_proj"
+        project.mkdir()
+        (project / "lhp.yaml").write_text("name: backstop\nversion: '1.0'\n")
+        for d in ("presets", "templates", "substitutions", "generated"):
+            (project / d).mkdir()
+        (project / "substitutions" / "dev.yaml").write_text(
+            "dev:\n  catalog: bronze_catalog\n  schema: bronze\n"
+        )
+        pipeline_dir = project / "pipelines" / "crm_bronze"
+        pipeline_dir.mkdir(parents=True)
+
+        # for_each flowgroup
+        for_each_yaml = _make_b2_flowgroup_yaml(
+            pipeline="crm_bronze",
+            flowgroup="product_ingestion",
+            actions_yaml=(
+                _b2_action_yaml("load_a", "table_a")
+                + _b2_write_action_yaml("write_a", "v_load_a")
+            ),
+        )
+        # Legacy (no execution_mode) flowgroup in the same pipeline.
+        # Uses a raw YAML string so _make_b2_flowgroup_yaml's workflow block
+        # is absent — this is the key condition that triggers the mixed-mode guard.
+        legacy_yaml = (
+            "pipeline: crm_bronze\n"
+            "flowgroup: order_ingestion\n"
+            "actions:\n"
+            + _b2_action_yaml(
+                "load_order",
+                "orders",
+                source_system_id="pg_crm",
+                landing_path="/Volumes/cat/land/root",
+            )
+            + "  - name: write_order\n"
+            "    type: write\n"
+            "    source: v_load_order\n"
+            "    write_target:\n"
+            "      type: streaming_table\n"
+            "      catalog: bronze_catalog\n"
+            "      schema: bronze\n"
+            "      table: orders\n"
+        )
+        (pipeline_dir / "product_ingestion.yaml").write_text(for_each_yaml)
+        (pipeline_dir / "order_ingestion.yaml").write_text(legacy_yaml)
+
+        # Call generate directly — do NOT call validate first so the CFG-034
+        # codegen backstop (not CFG-033 validator) is the one that fires.
+        orchestrator = ActionOrchestrator(project)
+        with pytest.raises(LHPConfigError) as exc_info:
+            orchestrator.generate_pipeline_by_field(
+                pipeline_field="crm_bronze",
+                env="dev",
+                output_dir=project / "generated",
+            )
+        assert "LHP-CFG-034" in str(exc_info.value), (
+            f"Expected LHP-CFG-034 from codegen backstop; got: {exc_info.value}"
+        )
+
+    # ------------------------------------------------------------------
     # Scenario 7: 300 cap inclusive — no error, manifest has 300 entries
     # ------------------------------------------------------------------
 
@@ -978,8 +1054,13 @@ class TestJDBCWatermarkV2ForEachIntegration:
     # Scenario 10: Parity flag — validate.py contains parity SQL block
     # ------------------------------------------------------------------
 
-    def test_parity_flag_enables_parity_sql_block(self, tmp_path):
-        """workflow.parity_check: true → validate.py contains parity_mismatches SQL block."""
+    def test_parity_flag_raises_not_implemented(self, tmp_path):
+        """workflow.parity_check: true → validate.py raises NotImplementedError
+        (LHP-VAL-049). Parity check stub was disabled per review finding #16
+        because the original implementation compared row_count to itself and
+        always passed silently, giving operators false confidence. Until the
+        landed-parquet row-count source ships, parity_check: true must fail
+        loudly at runtime so it cannot be enabled accidentally."""
         parity_yaml = (
             "pipeline: crm_bronze\n"
             "flowgroup: product_ingestion\n"
@@ -994,9 +1075,9 @@ class TestJDBCWatermarkV2ForEachIntegration:
         project = _build_b2_project(tmp_path, parity_yaml)
         _, output_dir = self._generate(project)
         val = (output_dir / "crm_bronze_extract" / "__lhp_validate_product_ingestion.py").read_text()
-        assert "parity_mismatches" in val, (
-            "Expected parity SQL block in validate.py when parity_check: true; "
-            "did not find 'parity_mismatches'"
+        assert "NotImplementedError" in val and "LHP-VAL-049" in val, (
+            "Expected NotImplementedError + LHP-VAL-049 raise in validate.py "
+            "when parity_check: true; did not find both"
         )
 
     # ------------------------------------------------------------------

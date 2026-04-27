@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
-from ..models.config import Action, ActionType, BATCH_ONLY_SOURCE_TYPES, FlowGroup, LoadSourceType, WriteTargetType
+from ..models.config import Action, ActionType, BATCH_ONLY_SOURCE_TYPES, FlowGroup, LoadSourceType, ProjectConfig, WriteTargetType
 from ..utils.error_formatter import ErrorCategory, LHPConfigError, LHPError
 from .action_registry import ActionRegistry
 from .config_field_validator import ConfigFieldValidator
@@ -31,7 +32,11 @@ if TYPE_CHECKING:
 class ConfigValidator:
     """Validate LakehousePlumber configurations."""
 
-    def __init__(self, project_root=None, project_config=None):
+    def __init__(
+        self,
+        project_root: Optional[Path] = None,
+        project_config: Optional[ProjectConfig] = None,
+    ) -> None:
         self.logger = logging.getLogger(__name__)
         self.project_root = project_root
         self.project_config = project_config
@@ -118,10 +123,7 @@ class ConfigValidator:
         self._validate_readmode_compatibility(flowgroup.actions)
 
         # for_each execution-mode invariants (single-flowgroup scope)
-        try:
-            self._validate_for_each_invariants(flowgroup)
-        except LHPError:
-            raise
+        self._validate_for_each_invariants(flowgroup)
 
         # Validate template usage
         if flowgroup.use_template and not flowgroup.template_parameters:
@@ -182,7 +184,7 @@ class ConfigValidator:
 
         return errors
 
-    def _validate_readmode_compatibility(self, actions: list) -> None:
+    def _validate_readmode_compatibility(self, actions: List[Action]) -> None:
         """Warn when a streaming_table write reads from a batch-only JDBC source."""
         # Build set of view names produced by batch-only load actions
         batch_only_views: set = set()
@@ -423,6 +425,53 @@ class ConfigValidator:
                     ],
                 )
 
+        # LHP-CFG-035: strict comparison required for for_each watermark actions.
+        # Re-run boundary rows occur when operator is non-strict (>= or <=).
+        # WatermarkConfig.operator only permits ">=" or ">" (field_validator
+        # rejects "<" and "<="), so in practice only ">=" needs to be caught.
+        #
+        # Pydantic cannot distinguish an explicit "operator: >=" from the model
+        # default of ">=" — both look identical after construction.  We therefore
+        # reject ANY ">=" (or "<=", defensively) on a for_each action rather than
+        # allow the silent-promote behaviour that causes duplicate rows on re-run.
+        # The false-positive rate is low: users who truly want ">=" must switch to
+        # non-for_each execution mode or explicitly set "operator: >".
+        for action in actions:
+            if not isinstance(action.source, dict):
+                continue
+            if action.source.get("type") != "jdbc_watermark_v2":
+                continue
+            if action.watermark is None:
+                continue
+            op = action.watermark.operator
+            if op in (">=", "<="):
+                raise LHPConfigError(
+                    category=ErrorCategory.CONFIG,
+                    code_number="035",
+                    title="Strict comparison required for execution_mode: for_each",
+                    details=(
+                        f"Action '{action.name}' uses watermark.operator '{op}', "
+                        "which is a non-strict comparison. Non-strict operators "
+                        "include the current high-water-mark boundary row on every "
+                        "re-run, causing duplicate rows in for_each batches. "
+                        "Use '>' (ascending) or '<' (descending) instead."
+                    ),
+                    context={
+                        "pipeline": flowgroup.pipeline,
+                        "flowgroup": flowgroup.flowgroup,
+                        "action": action.name,
+                        "operator": op,
+                        "execution_mode": "for_each",
+                    },
+                    suggestions=[
+                        "Set watermark.operator to '>' for ascending watermarks "
+                        "(the common case for timestamp/numeric columns).",
+                        "Set watermark.operator to '<' for descending watermarks.",
+                        "Strict comparison prevents max-watermark boundary row "
+                        "duplication on re-run.",
+                    ],
+                )
+
         # Shared-keys check: only jdbc_watermark_v2 actions carry these fields
         wm_actions = [
             a for a in actions
@@ -432,7 +481,7 @@ class ConfigValidator:
             self._validate_for_each_shared_wm_keys(flowgroup, wm_actions)
 
     def _validate_for_each_shared_wm_keys(
-        self, flowgroup: FlowGroup, wm_actions: list
+        self, flowgroup: FlowGroup, wm_actions: List[Action]
     ) -> None:
         """Raise LHP-CFG-033 when jdbc_watermark_v2 actions disagree on shared keys.
 
@@ -461,6 +510,8 @@ class ConfigValidator:
                 return getattr(wm_type, "value", wm_type)
             if key == "watermark_operator":
                 return getattr(action.watermark, "operator", None)
+            if key == "watermark_column":
+                return getattr(action.watermark, "column", None)
             return None
 
         def _landing_root(action: Action) -> Optional[str]:
@@ -472,10 +523,13 @@ class ConfigValidator:
                 return "/" + "/".join(parts[:3])
             return path or None
 
-        # ``watermark_type`` and ``watermark_operator`` join the homogeneity
-        # check (devtest 2026-04-26 Anomaly A safety net): the worker template
-        # branches statically on both — heterogeneous values across actions
-        # would silently apply action[0]'s rendered branch to every iteration.
+        # ``watermark_type``, ``watermark_operator``, and ``watermark_column``
+        # join the homogeneity check (devtest 2026-04-26 Anomaly A safety net):
+        # the worker template branches statically on all three — heterogeneous
+        # values across actions would silently apply action[0]'s rendered branch
+        # to every iteration.  ``watermark_column`` heterogeneity is also
+        # forbidden because the manifest stores a single wm_column per batch;
+        # divergent columns would produce incorrect high-water-mark bookkeeping.
         checks: List[Tuple[str, Any]] = [
             ("source_system_id", [_wm_value(a, "source_system_id") for a in wm_actions]),
             ("landing_path root", [_landing_root(a) for a in wm_actions]),
@@ -483,6 +537,7 @@ class ConfigValidator:
             ("wm_schema", [_wm_value(a, "wm_schema") for a in wm_actions]),
             ("watermark_type", [_wm_value(a, "watermark_type") for a in wm_actions]),
             ("watermark_operator", [_wm_value(a, "watermark_operator") for a in wm_actions]),
+            ("watermark_column", [_wm_value(a, "watermark_column") for a in wm_actions]),
         ]
 
         for key_name, values in checks:

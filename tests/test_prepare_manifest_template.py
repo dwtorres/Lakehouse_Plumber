@@ -13,7 +13,7 @@ Scenarios:
   - Bootstrap helper present: rendered source contains _lhp_watermark_bootstrap_syspath
   - LHP-MAN-001 error code present in template source
   - R10 retention cell present: rendered source contains DELETE FROM + INTERVAL 30 DAYS
-  - R10 retention order: DELETE appears after MERGE in recorded SQL statements
+  - R10 retention order: DELETE appears BEFORE MERGE in recorded SQL statements (fix #5)
   - R10 retention deleted count logged: stdout reports correct deleted row count
 """
 
@@ -273,13 +273,16 @@ def test_happy_path_ddl_merge_taskvalue() -> None:
         f"Expected 3 VALUES tuples in MERGE source; found {len(values_rows)}:\n{merge_sql}"
     )
 
-    # taskValue: set() called once with key="iterations"
+    # taskValues: two set() calls — "iterations" (primary) + "batch_id" (sibling, fix #19)
     tv_calls = dbutils.jobs.taskValues.calls
-    assert len(tv_calls) == 1, f"Expected 1 taskValues.set() call; got {len(tv_calls)}"
+    assert len(tv_calls) == 2, f"Expected 2 taskValues.set() calls; got {len(tv_calls)}"
     key, payload = tv_calls[0]
-    assert key == "iterations", f"taskValue key must be exactly 'iterations'; got {key!r}"
+    assert key == "iterations", f"First taskValue key must be 'iterations'; got {key!r}"
+    batch_id_key, batch_id_val = tv_calls[1]
+    assert batch_id_key == "batch_id", f"Second taskValue key must be 'batch_id'; got {batch_id_key!r}"
+    assert isinstance(batch_id_val, str) and batch_id_val, "batch_id taskValue must be a non-empty string"
 
-    # payload is valid JSON array of 3 entries each with exactly 7 keys
+    # payload is valid JSON array of 3 entries each with exactly 10 keys
     iterations = json.loads(payload)
     assert isinstance(iterations, list), "taskValue payload must be a JSON array"
     assert len(iterations) == 3, f"Expected 3 iteration entries; got {len(iterations)}"
@@ -342,7 +345,7 @@ def test_idempotency_rerun_issues_ddl_and_merge_twice() -> None:
     merge_stmts = [s for s in spark.statements if re.search(r"\bMERGE\b", s, re.IGNORECASE)]
     assert len(merge_stmts) == 1, "Second run must still issue exactly one MERGE"
 
-    assert len(dbutils.jobs.taskValues.calls) == 1, "Second run must emit taskValue"
+    assert len(dbutils.jobs.taskValues.calls) == 2, "Second run must emit iterations + batch_id taskValues"
 
 
 # ---------- test: DAB retry produces fresh batch_id --------------------------
@@ -421,7 +424,8 @@ def test_payload_size_logging_and_ceiling_headroom() -> None:
 
     _run_rendered(rendered, spark, dbutils)
 
-    assert len(dbutils.jobs.taskValues.calls) == 1, "Expected taskValues.set() to be called"
+    assert len(dbutils.jobs.taskValues.calls) == 2, "Expected 2 taskValues.set() calls (iterations + batch_id)"
+    assert dbutils.jobs.taskValues.calls[0][0] == "iterations", "First taskValue key must be 'iterations'"
     payload_str = dbutils.jobs.taskValues.calls[0][1]
     payload_bytes = len(payload_str.encode("utf-8"))
     ceiling = 48 * 1024
@@ -437,14 +441,20 @@ def test_payload_size_logging_and_ceiling_headroom() -> None:
     spark_300 = _RecordingSpark()
     dbutils_300 = _FakeDbutils(run_id="job-99-task-1-attempt-0")
     _run_rendered(rendered_300, spark_300, dbutils_300)  # must not raise
-    assert len(dbutils_300.jobs.taskValues.calls) == 1, "300-entry render must emit taskValue"
+    assert len(dbutils_300.jobs.taskValues.calls) == 2, "300-entry render must emit iterations + batch_id taskValues"
 
 
 # ---------- test: taskValue key naming ---------------------------------------
 
 
 def test_taskvalue_key_is_exactly_iterations() -> None:
-    """taskValues.set() called exactly once with key='iterations' (R2 explicit naming)."""
+    """taskValues.set() called with key='iterations' as first call (R2 explicit naming).
+
+    Fix #19: a second call with key='batch_id' is emitted immediately after so
+    the validate task can read the batch_id without a manifest table lookup.
+    This test verifies: (a) 'iterations' is the first and primary key, and
+    (b) 'batch_id' is the second sibling key.
+    """
     rendered = _render(_three_action_fixture())
     spark = _RecordingSpark()
     dbutils = _FakeDbutils(run_id="job-1-task-2-attempt-3")
@@ -452,10 +462,16 @@ def test_taskvalue_key_is_exactly_iterations() -> None:
     _run_rendered(rendered, spark, dbutils)
 
     calls = dbutils.jobs.taskValues.calls
-    assert len(calls) == 1, f"Expected exactly 1 taskValues.set() call; got {len(calls)}"
+    assert len(calls) == 2, (
+        f"Expected exactly 2 taskValues.set() calls (iterations + batch_id); got {len(calls)}"
+    )
     key, _ = calls[0]
     assert key == "iterations", (
-        f"taskValue key must be exactly 'iterations' (R2 explicit naming); got {key!r}"
+        f"First taskValue key must be exactly 'iterations' (R2 explicit naming); got {key!r}"
+    )
+    sibling_key, _ = calls[1]
+    assert sibling_key == "batch_id", (
+        f"Second taskValue key must be 'batch_id' (fix #19); got {sibling_key!r}"
     )
 
 
@@ -469,6 +485,26 @@ def test_lhp_man_001_error_code_in_template_source() -> None:
     assert "LHP-MAN-001" in source, (
         "prepare_manifest.py.j2 must contain LHP-MAN-001 error code "
         "(placeholder for ManifestConcurrencyError class, see U4-followup)"
+    )
+
+
+# ---------- test: TBLPROPERTIES row tracking (fix #4) ------------------------
+
+
+def test_ddl_tblproperties_row_tracking_enabled() -> None:
+    """b2_manifests DDL must include delta.enableRowTracking = 'true' (fix #4).
+
+    Row tracking is required for CDC correctness on the manifest table;
+    this test is a regression guard so the property is never silently dropped.
+    """
+    rendered = _render(_three_action_fixture())
+    assert "delta.enableRowTracking" in rendered, (
+        "Rendered notebook missing 'delta.enableRowTracking' in b2_manifests TBLPROPERTIES; "
+        "fix #4 requires this property for CDC correctness"
+    )
+    # Verify the value is 'true' (not 'false' or absent).
+    assert re.search(r"delta\.enableRowTracking['\s]*=\s*['\"]true['\"]", rendered), (
+        "delta.enableRowTracking must be set to 'true' in b2_manifests TBLPROPERTIES"
     )
 
 
@@ -496,11 +532,12 @@ def test_retention_cell_present_in_rendered_source() -> None:
 # ---------- test: R10 retention order (after MERGE) --------------------------
 
 
-def test_retention_runs_after_merge_in_sql_order() -> None:
-    """DELETE statement must appear after MERGE in the recorded SQL statement order (R10).
+def test_retention_runs_before_merge_in_sql_order() -> None:
+    """DELETE statement must appear BEFORE MERGE in the recorded SQL statement order (R10, fix #5).
 
-    The retention cell is appended after the MERGE+taskValue cells per U9 spec;
-    this test locks in that ordering so a future template reorder is caught.
+    Fix #5 moved retention DELETE before the MERGE so stale rows are pruned
+    before new rows are written. Order is: CREATE TABLE → DELETE → MERGE.
+    This test locks in that ordering so a future template reorder is caught.
     """
     rendered = _render(_three_action_fixture())
     spark = _RecordingSpark()
@@ -524,11 +561,12 @@ def test_retention_runs_after_merge_in_sql_order() -> None:
         f"No DELETE statement found in recorded SQL; statements: {spark.statements}"
     )
 
-    last_merge_idx = max(merge_indices)
+    first_merge_idx = min(merge_indices)
     first_delete_idx = min(delete_indices)
-    assert first_delete_idx > last_merge_idx, (
-        f"DELETE (index {first_delete_idx}) must appear after MERGE (index {last_merge_idx}) "
-        f"in recorded SQL order; full statement list:\n"
+    assert first_delete_idx < first_merge_idx, (
+        f"DELETE (index {first_delete_idx}) must appear BEFORE MERGE (index {first_merge_idx}) "
+        f"in recorded SQL order (fix #5 — retention prunes stale rows before writing new ones); "
+        f"full statement list:\n"
         + "\n---\n".join(spark.statements)
     )
 
@@ -541,10 +579,10 @@ def test_retention_deleted_count_logged() -> None:
     rendered = _render(_three_action_fixture())
     dbutils = _FakeDbutils(run_id="job-7-task-3-attempt-0")
 
-    # Script: DDL call → noop, MERGE call → noop, DELETE call → 2 affected rows.
-    # The template issues: (1) CREATE TABLE, (2) MERGE (via execute_with_concurrent_commit_retry),
-    # (3) DELETE for retention. Script entries are consumed in order.
-    spark = _RecordingSpark(script=["noop", "noop", 2])
+    # Script: DDL call → noop, DELETE call → 2 affected rows, MERGE call → noop.
+    # Fix #5 moved retention BEFORE the MERGE; execution order is now:
+    # (1) CREATE TABLE, (2) DELETE for retention, (3) MERGE via execute_with_concurrent_commit_retry.
+    spark = _RecordingSpark(script=["noop", 2, "noop"])
 
     captured = io.StringIO()
     with patch("builtins.print", side_effect=lambda *a, **kw: captured.write(" ".join(str(x) for x in a) + "\n")):

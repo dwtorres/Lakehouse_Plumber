@@ -118,9 +118,43 @@ def _statements_starting_with(spark: _ScriptedByPrefixSpark, prefix: str) -> Lis
 
 
 def test_new_table_create_ddl_includes_load_group_column_and_target_clustering() -> None:
+    """Brand-new table: CREATE TABLE IF NOT EXISTS includes load_group +
+    target clustering. After review fix #18 _ensure_table_exists no longer
+    early-returns on the create path — it runs DESCRIBE TABLE / DESCRIBE
+    DETAIL unconditionally and reconciles. In production the freshly-created
+    table satisfies both probes (CREATE shape matches target shape) so no
+    ALTER fires. The test scripts the DESCRIBE responses to match.
+    """
+    target_columns = [
+        "run_id",
+        "watermark_time",
+        "source_system_id",
+        "schema_name",
+        "table_name",
+        "watermark_column_name",
+        "watermark_value",
+        "previous_watermark_value",
+        "row_count",
+        "extraction_type",
+        "bronze_stage_complete",
+        "silver_stage_complete",
+        "status",
+        "error_class",
+        "error_message",
+        "created_at",
+        "completed_at",
+        "load_group",
+    ]
+    target_clustering = (
+        "source_system_id",
+        "load_group",
+        "schema_name",
+        "table_name",
+    )
     spark = _ScriptedByPrefixSpark()
     spark.register("SHOW TABLES", _show_tables_handler(table_present=False))
-    # No DESCRIBE handlers needed: CREATE path returns before probes fire.
+    spark.register("DESCRIBE TABLE", _describe_table_handler(columns=target_columns))
+    spark.register("DESCRIBE DETAIL", _describe_detail_handler(clustering=target_clustering))
 
     _build_manager(spark)
 
@@ -141,10 +175,10 @@ def test_new_table_create_ddl_includes_load_group_column_and_target_clustering()
         re.IGNORECASE,
     ), f"CREATE missing target CLUSTER BY; SQL: {ddl}"
 
-    # No ALTER SQL on the create path.
+    # Post-CREATE reconciliation must no-op when probes confirm target shape.
     assert not _statements_starting_with(
         spark, "ALTER TABLE"
-    ), "CREATE path must not emit ALTER"
+    ), "CREATE path must not emit ALTER when DESCRIBE confirms target shape"
 
 
 # ---------- 2. pre-existing table missing load_group column ----------------

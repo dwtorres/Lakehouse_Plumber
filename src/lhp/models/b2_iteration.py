@@ -28,12 +28,10 @@ test time.
 
 from __future__ import annotations
 
-from typing import FrozenSet
-
 # Order is preserved here purely for human readability; the constant is a
 # frozenset because membership and set-arithmetic are the only operations
 # that matter for the contract check.
-B2_ITERATION_KEYS: FrozenSet[str] = frozenset(
+B2_ITERATION_KEYS: frozenset[str] = frozenset(
     {
         # batch-scoped (constant across all iterations of one batch)
         "batch_id",

@@ -38,16 +38,23 @@ def _wm_action(
     landing_path: str = "/Volumes/cat/land/tbl",
     wm_catalog: str = "metadata",
     wm_schema: str = "orchestration",
+    wm_column: str = "updated_at",
+    operator: str = ">",
 ) -> Action:
-    """Return a jdbc_watermark_v2 action with fully-specified shared keys."""
+    """Return a jdbc_watermark_v2 action with fully-specified shared keys.
+
+    Defaults to operator='>' (strict) so CFG-035 does not fire before
+    shared-keys tests can exercise CFG-033.
+    """
     return Action(
         name=name,
         type=ActionType.LOAD,
         target=f"v_{name}",
         landing_path=landing_path,
         watermark=WatermarkConfig(
-            column="updated_at",
+            column=wm_column,
             type=WatermarkType.TIMESTAMP,
+            operator=operator,
             source_system_id=source_system_id,
             catalog=wm_catalog,
             schema=wm_schema,
@@ -399,18 +406,43 @@ class TestSharedKeys:
         Anomaly A safety net: operator is rendered into the worker once at
         codegen time. Heterogeneous operators across actions would silently
         apply the first action's operator to every iteration.
+
+        LHP-CFG-035 fires first in _validate_for_each_invariants when any
+        action has operator '>=', so this test calls the shared-keys method
+        directly to isolate the CFG-033 heterogeneity path.
         """
         validator = ConfigValidator()
-        a1 = _wm_action(name="load_1")
-        a2 = _wm_action(name="load_2")
-        a1.watermark.operator = ">"
+        a1 = _wm_action(name="load_1", operator=">")
+        a2 = _wm_action(name="load_2", operator=">")
+        # Bypass Pydantic field_validator to force '>=' on a2 without triggering
+        # the model-construction error — direct attribute assignment skips
+        # field_validator re-execution on already-constructed instances.
         a2.watermark.operator = ">="
+        fg = _fg_for_each(actions=[a1, a2])
+        with pytest.raises(LHPConfigError) as exc_info:
+            validator._validate_for_each_shared_wm_keys(fg, [a1, a2])
+        err = exc_info.value
+        assert err.code == "LHP-CFG-033"
+        assert "watermark_operator" in err.context.get("key", "")
+
+    def test_error_disagreeing_watermark_column(self):
+        """Different watermark.column across actions in for_each → LHP-CFG-033.
+
+        Added in wave-1 review fix #27: the manifest stores a single wm_column
+        per batch, so divergent columns across actions produce incorrect
+        high-water-mark bookkeeping.
+
+        AE: LHP-CFG-033 shared keys error path (watermark_column).
+        """
+        validator = ConfigValidator()
+        a1 = _wm_action(name="load_1", wm_column="updated_at")
+        a2 = _wm_action(name="load_2", wm_column="created_at")
         fg = _fg_for_each(actions=[a1, a2])
         with pytest.raises(LHPConfigError) as exc_info:
             validator._validate_for_each_invariants(fg)
         err = exc_info.value
         assert err.code == "LHP-CFG-033"
-        assert "watermark_operator" in err.context.get("key", "")
+        assert "watermark_column" in err.context.get("key", "")
 
 
 # ---------------------------------------------------------------------------

@@ -47,6 +47,15 @@ from .state_manager import StateManager
 from .template_engine import TemplateEngine
 from .validator import ConfigValidator
 
+# Auxiliary file name prefixes emitted by extract notebooks (worker, B2
+# prepare_manifest, B2 validate) that must live in the sibling _extract/ dir
+# to stay outside the DLT pipeline glob scope.
+_EXTRACT_AUX_PREFIXES = (
+    "__lhp_extract_",
+    "__lhp_prepare_manifest_",
+    "__lhp_validate_",
+)
+
 
 @dataclass
 class GenerationAnalysis:
@@ -1046,11 +1055,6 @@ class ActionOrchestrator:
                         # Extraction notebooks (worker, B2 prepare_manifest, B2
                         # validate) go to sibling _extract/ dir (outside pipeline
                         # glob scope) to prevent DLT loading them.
-                        _EXTRACT_AUX_PREFIXES = (
-                            "__lhp_extract_",
-                            "__lhp_prepare_manifest_",
-                            "__lhp_validate_",
-                        )
                         has_extract_aux = any(
                             k.startswith(_EXTRACT_AUX_PREFIXES) and k.endswith(".py")
                             for k in flowgroup_for_aux._auxiliary_files
@@ -1153,11 +1157,6 @@ class ActionOrchestrator:
                         # validate) go to sibling _extract/ dir (outside pipeline
                         # glob scope) to prevent DLT loading them.
                         if processed_flowgroup._auxiliary_files:
-                            _EXTRACT_AUX_PREFIXES = (
-                                "__lhp_extract_",
-                                "__lhp_prepare_manifest_",
-                                "__lhp_validate_",
-                            )
                             has_extract_aux = any(
                                 k.startswith(_EXTRACT_AUX_PREFIXES) and k.endswith(".py")
                                 for k in processed_flowgroup._auxiliary_files
