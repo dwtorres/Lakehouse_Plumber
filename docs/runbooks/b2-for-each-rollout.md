@@ -271,10 +271,48 @@ running off-peak. They do not block extraction jobs.
 | LHP-MAN-003 | Manifest row missing for action after claim UPDATE | Re-run full workflow from beginning; check that `prepare_manifest` succeeded. See [errors_reference.rst](../errors_reference.rst#lhp-man-003-manifest-row-missing-for-action) |
 | LHP-MAN-004 | Completion mirror MERGE retry exhausted; manifest row stuck in `running` | Reduce `concurrency`; manually correct manifest row if watermark shows completed. See [errors_reference.rst](../errors_reference.rst#lhp-man-004-completion-mirror-merge-retry-budget-exhausted) |
 | LHP-MAN-005 | Projected or actual `iterations` taskValue payload exceeds DAB 48 KB ceiling | Reduce action count or shorten field identifiers. At runtime: DELETE orphaned manifest rows and redeploy. See [errors_reference.rst](../errors_reference.rst#lhp-man-005-manifest-taskvalue-payload-exceeds-dab-48-kb-ceiling) |
+| LHP-WM-001 | `DuplicateRunError` raised by `wm.insert_new` — `run_id` already present in watermarks. Often a `__lhp_run_id_override` collision or a redeploy that resets DAB task counters. | Search worker task log for `duplicate_run_id_abort`. Clear the override widget or redeploy to refresh task identifiers. The manifest row stays in `running` and `validate` surfaces it as `final_status='running'` — manually reset via the LHP-MAN-002 procedure after fixing run_id provenance. See [errors_reference.rst](../errors_reference.rst#lhp-wm-001-duplicate-run-id-duplicaterunerror) |
 
 ---
 
-## Common DAB UI patterns for `for_each_task`
+### Anomaly B addendum (issue #18 — explicit DuplicateRunError handling)
+
+The Anomaly B failure-mirror was added in PR #13 / PR #24 to make
+`b2_manifests` an authoritative state log instead of a join-only surface
+coalesced against watermarks. Issue #18 (PR for fix follows) tightened
+the worker error-path in two places:
+
+1. **Worker**: `wm.insert_new` is now wrapped in a dedicated
+   `try / except DuplicateRunError` block in
+   `src/lhp/templates/load/jdbc_watermark_job.py.j2`. The handler logs a
+   structured `_log_phase("duplicate_run_id_abort", error_code="LHP-WM-001",
+   batch_id=...)` breadcrumb and re-raises the original exception. It does
+   **not** call `wm.mark_failed` (no row was created to transition) and does
+   **not** mirror the manifest to `'failed'` (the issue is run-id
+   provenance, not extraction failure). The manifest row stays in its
+   claim-time `'running'` state.
+
+2. **Validate**: `validate.py.j2`'s `final_status` projection switched from
+   `coalesce(worker_status, manifest_status)` to a CASE that requires
+   manifest-side `'completed'` AND (worker-side either `'completed'` or
+   NULL) before treating an action as completed. A stale watermarks row
+   matched on `worker_run_id` can no longer mask a fresh manifest
+   `'running'` state — that produced a silent false pass under the
+   pre-issue-#18 form.
+
+**Operator runbook for `final_status='running'` after a `DuplicateRunError`:**
+
+1. In the Databricks Jobs UI, locate the failed `for_each_ingest` iteration.
+   The worker task log contains the `duplicate_run_id_abort` breadcrumb
+   with `run_id`, `batch_id`, and `action_name`.
+2. Investigate the run-id provenance:
+   - Was `__lhp_run_id_override` set on the workflow or a parent context?
+     Clear it.
+   - Was the bundle redeployed in a way that reset DAB task counters? A
+     fresh deploy with new task identifiers resolves the collision.
+3. Reset the manifest row using the LHP-MAN-002 procedure (manual
+   `UPDATE ... SET execution_status = 'failed'` then re-run the failed
+   iteration from the Jobs UI).
 
 - The iteration list for `for_each_ingest` is shown in the Databricks Jobs UI
   under the task. Click any iteration to drill into its logs and Spark metrics.
