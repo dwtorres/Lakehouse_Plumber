@@ -415,6 +415,11 @@ def test_payload_size_logging_and_ceiling_headroom() -> None:
     the taskValue ceiling — that drift is captured by the second assertion
     below and should be re-tightened in a follow-up if operators report
     payload-size failures at the 100-300 range.
+
+    Updated in U3 (LHP-MAN-005): the size log now fires BEFORE the guard (was
+    after taskValues.set(), making it invisible when set() threw).  The 300-entry
+    sub-case is updated to assert the runtime LHP-MAN-005 raise path instead of
+    asserting success.
     """
     # 100 entries: ~42 KB with realistic short strings — under the 48 KB ceiling.
     actions = _n_action_fixture(100)
@@ -422,7 +427,9 @@ def test_payload_size_logging_and_ceiling_headroom() -> None:
     spark = _RecordingSpark()
     dbutils = _FakeDbutils(run_id="job-99-task-1-attempt-0")
 
-    _run_rendered(rendered, spark, dbutils)
+    captured = io.StringIO()
+    with patch("builtins.print", side_effect=lambda *a, **kw: captured.write(" ".join(str(x) for x in a) + "\n")):
+        _run_rendered(rendered, spark, dbutils)
 
     assert len(dbutils.jobs.taskValues.calls) == 2, "Expected 2 taskValues.set() calls (iterations + batch_id)"
     assert dbutils.jobs.taskValues.calls[0][0] == "iterations", "First taskValue key must be 'iterations'"
@@ -434,14 +441,35 @@ def test_payload_size_logging_and_ceiling_headroom() -> None:
         f"reduce fixture or shorten action/table name lengths"
     )
 
-    # Also confirm the template renders for 300 actions (the U2 hard cap boundary)
-    # without internal errors — the operator sees the payload size warning in stdout.
+    # U3: size log must appear in output even on the passing path.
+    output = captured.getvalue()
+    assert "taskvalue payload bytes:" in output.lower(), (
+        f"Size log 'taskvalue payload bytes:' must appear in stdout even when payload fits; "
+        f"got:\n{output!r}"
+    )
+
+    # 300-entry sub-case: U3 runtime guard raises RuntimeError(LHP-MAN-005) before
+    # taskValues.set("iterations", ...) is called.  Replace the old "must not raise"
+    # assertion with the new "must raise LHP-MAN-005" assertion.
     actions_300 = _n_action_fixture(300)
     rendered_300 = _render(actions_300)
     spark_300 = _RecordingSpark()
     dbutils_300 = _FakeDbutils(run_id="job-99-task-1-attempt-0")
-    _run_rendered(rendered_300, spark_300, dbutils_300)  # must not raise
-    assert len(dbutils_300.jobs.taskValues.calls) == 2, "300-entry render must emit iterations + batch_id taskValues"
+    with pytest.raises(RuntimeError) as exc_info_300:
+        _run_rendered(rendered_300, spark_300, dbutils_300)
+    err_msg = str(exc_info_300.value)
+    assert "LHP-MAN-005:" in err_msg, (
+        f"300-entry render must raise RuntimeError with 'LHP-MAN-005:' prefix; got: {err_msg!r}"
+    )
+    assert "bytes" in err_msg.lower(), (
+        f"LHP-MAN-005 RuntimeError must include byte count; got: {err_msg!r}"
+    )
+    # taskValues.set("iterations", ...) must NOT have been called
+    iterations_calls = [c for c in dbutils_300.jobs.taskValues.calls if c[0] == "iterations"]
+    assert iterations_calls == [], (
+        f"taskValues.set('iterations', ...) must NOT be called when payload exceeds ceiling; "
+        f"got calls: {dbutils_300.jobs.taskValues.calls}"
+    )
 
 
 # ---------- test: taskValue key naming ---------------------------------------
@@ -591,4 +619,103 @@ def test_retention_deleted_count_logged() -> None:
     output = captured.getvalue()
     assert "manifest_retention: deleted 2 rows" in output, (
         f"Expected 'manifest_retention: deleted 2 rows' in stdout; got:\n{output!r}"
+    )
+
+
+# ---------- test: LHP-MAN-005 runtime hard guard (U3) -------------------------
+
+
+def test_runtime_guard_raises_lhp_man_005_on_large_payload() -> None:
+    """300-entry render: runtime guard raises RuntimeError(LHP-MAN-005:) before taskValues.set.
+
+    U3 R4 defense-in-depth: even if codegen-time guard is bypassed (e.g. by rendering
+    the template directly), the notebook itself hard-fails before calling
+    dbutils.jobs.taskValues.set(key='iterations', ...) when the serialized payload
+    exceeds the DAB 48 KB ceiling.
+
+    Also asserts:
+    - RuntimeError message contains 'LHP-MAN-005:' prefix and byte count.
+    - taskValues.set for key='iterations' is NOT called.
+    - The manifest MERGE ran (rows exist in the manifest table for this batch_id) —
+      operator-visible orphan-row state; downstream worker tasks will fail at
+      LHP-VAL-048 (batch_id taskValue absent).
+    - Size log line ('manifest entries: ..., taskvalue payload bytes: ...') appears
+      in stdout BEFORE the guard raises, so the operator always sees the size.
+    """
+    actions = _n_action_fixture(300)
+    rendered = _render(actions)
+    spark = _RecordingSpark()
+    dbutils = _FakeDbutils(run_id="job-99-task-1-attempt-0")
+
+    captured = io.StringIO()
+    with patch("builtins.print", side_effect=lambda *a, **kw: captured.write(" ".join(str(x) for x in a) + "\n")):
+        with pytest.raises(RuntimeError) as exc_info:
+            _run_rendered(rendered, spark, dbutils)
+
+    err_msg = str(exc_info.value)
+
+    # 1. Error prefix and byte count
+    assert "LHP-MAN-005:" in err_msg, (
+        f"RuntimeError must start with 'LHP-MAN-005:'; got: {err_msg!r}"
+    )
+    assert "bytes" in err_msg.lower(), (
+        f"LHP-MAN-005 message must include byte count; got: {err_msg!r}"
+    )
+
+    # 2. taskValues.set("iterations", ...) must NOT have been called
+    iterations_calls = [c for c in dbutils.jobs.taskValues.calls if c[0] == "iterations"]
+    assert iterations_calls == [], (
+        f"taskValues.set('iterations', ...) must NOT be called when payload exceeds ceiling; "
+        f"calls recorded: {dbutils.jobs.taskValues.calls}"
+    )
+
+    # 3. MERGE ran: at least one SQL statement contains MERGE (rows committed to manifest)
+    merge_statements = [s for s in spark.statements if "MERGE" in s.upper()]
+    assert merge_statements, (
+        f"Runtime guard fires AFTER MERGE; expected at least one MERGE in recorded SQL. "
+        f"Statements: {spark.statements}"
+    )
+
+    # 4. Size log line appears before guard raises (it's in captured output)
+    output = captured.getvalue()
+    assert "taskvalue payload bytes:" in output.lower(), (
+        f"Size log must appear in stdout before the guard raises (operator visibility); "
+        f"got:\n{output!r}"
+    )
+
+
+def test_runtime_guard_size_log_appears_before_guard() -> None:
+    """Size log fires before LHP-MAN-005 guard — operator sees size on both pass and fail.
+
+    U3 requirement: move the print log from AFTER taskValues.set() (where it was
+    invisible on overflow) to BEFORE the guard. This test asserts:
+    - On the passing path (3 actions): size log appears in stdout.
+    - On the failing path (300 actions): size log appears in stdout even though
+      RuntimeError is raised immediately after.
+
+    The log format is: 'manifest entries: N, taskvalue payload bytes: B'
+    """
+    # Passing path: size log appears in stdout
+    rendered_small = _render(_three_action_fixture())
+    spark_s = _RecordingSpark()
+    dbutils_s = _FakeDbutils(run_id="job-1-task-1-attempt-0")
+    captured_s = io.StringIO()
+    with patch("builtins.print", side_effect=lambda *a, **kw: captured_s.write(" ".join(str(x) for x in a) + "\n")):
+        _run_rendered(rendered_small, spark_s, dbutils_s)
+    output_s = captured_s.getvalue()
+    assert "manifest entries:" in output_s.lower() and "taskvalue payload bytes:" in output_s.lower(), (
+        f"Size log must appear in stdout on passing path; got:\n{output_s!r}"
+    )
+
+    # Failing path: size log appears in stdout even though RuntimeError is raised
+    rendered_large = _render(_n_action_fixture(300))
+    spark_l = _RecordingSpark()
+    dbutils_l = _FakeDbutils(run_id="job-1-task-1-attempt-0")
+    captured_l = io.StringIO()
+    with patch("builtins.print", side_effect=lambda *a, **kw: captured_l.write(" ".join(str(x) for x in a) + "\n")):
+        with pytest.raises(RuntimeError):
+            _run_rendered(rendered_large, spark_l, dbutils_l)
+    output_l = captured_l.getvalue()
+    assert "taskvalue payload bytes:" in output_l.lower(), (
+        f"Size log must appear in stdout even when guard raises; got:\n{output_l!r}"
     )

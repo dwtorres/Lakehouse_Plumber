@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from collections import defaultdict
 from pathlib import Path
@@ -379,6 +380,94 @@ class ConfigValidator:
                     "Ensure template_parameters produces at least one action.",
                 ],
             )
+
+        # LHP-MAN-005: taskValue payload size guard.
+        # Estimate the bytes that prepare_manifest will serialize into
+        # dbutils.jobs.taskValues.set(key="iterations", ...) at runtime.
+        # Build the same 10-key per-action dict that the template renders.
+        # 8 keys come from static action fields; 2 keys use worst-case stubs
+        # because their actual runtime values are unavailable at codegen time:
+        #   batch_id:       64-byte placeholder covers derive_run_id worst-case
+        #   manifest_table: resolved from wm_catalog / wm_schema present on the
+        #                   first jdbc_watermark_v2 action (shared-key invariant
+        #                   guarantees all actions agree on catalog + schema).
+        _BATCH_ID_PLACEHOLDER = "x" * 64
+        _TASKVALUE_CEILING = 48 * 1024  # DAB 48 KB hard limit
+
+        load_group = f"{flowgroup.pipeline}::{flowgroup.flowgroup}"
+        wm_actions_for_payload = [
+            a
+            for a in actions
+            if isinstance(a.source, dict) and a.source.get("type") == "jdbc_watermark_v2"
+        ]
+
+        if wm_actions_for_payload:
+            # Resolve manifest_table from the first wm action (all must agree per CFG-033).
+            first_wm = wm_actions_for_payload[0]
+            wm_catalog = getattr(getattr(first_wm, "watermark", None), "catalog", "") or ""
+            wm_schema = getattr(getattr(first_wm, "watermark", None), "schema", "") or ""
+            manifest_table = f"{wm_catalog}.{wm_schema}.b2_manifests"
+
+            payload_entries = []
+            for a in actions:
+                if not isinstance(a.source, dict):
+                    continue
+                if a.source.get("type") != "jdbc_watermark_v2":
+                    continue
+                action_wm = getattr(a, "watermark", None)
+                source_system_id = (
+                    getattr(action_wm, "source_system_id", None) or ""
+                ) if action_wm else ""
+                if not source_system_id:
+                    import re as _re
+                    url = a.source.get("url", "")
+                    host_match = _re.search(r"//([^:/]+)", url)
+                    source_system_id = host_match.group(1) if host_match else "unknown"
+                payload_entries.append(
+                    {
+                        "source_system_id": source_system_id,
+                        "schema_name": a.source.get("schema_name", ""),
+                        "table_name": a.source.get("table_name", ""),
+                        "action_name": a.name,
+                        "load_group": load_group,
+                        "batch_id": _BATCH_ID_PLACEHOLDER,
+                        "manifest_table": manifest_table,
+                        "jdbc_table": a.source.get("table", ""),
+                        "watermark_column": (
+                            getattr(action_wm, "column", "") if action_wm else ""
+                        ),
+                        "landing_path": a.landing_path or "",
+                    }
+                )
+
+            if payload_entries:
+                # 10% drift cushion: 5% JSON-array overhead + 5% identifier-substitution drift.
+                projected_payload_bytes = len(json.dumps(payload_entries)) * 1.10
+                if projected_payload_bytes > _TASKVALUE_CEILING:
+                    raise LHPError(
+                        category=ErrorCategory.MANIFEST,
+                        code_number="005",
+                        title="for_each flowgroup taskValue payload exceeds DAB 48 KB ceiling",
+                        details=(
+                            f"Projected taskValue payload {projected_payload_bytes:.0f} bytes "
+                            f"exceeds DAB 48 KB ceiling for {len(payload_entries)} actions "
+                            f"in flowgroup '{flowgroup.flowgroup}' of pipeline "
+                            f"'{flowgroup.pipeline}'. Reduce action count or shorten field values."
+                        ),
+                        context={
+                            "pipeline": flowgroup.pipeline,
+                            "flowgroup": flowgroup.flowgroup,
+                            "action_count": len(payload_entries),
+                            "projected_bytes": int(projected_payload_bytes),
+                            "ceiling_bytes": _TASKVALUE_CEILING,
+                        },
+                        suggestions=[
+                            "Trim action count below the projected limit by splitting "
+                            "into multiple for_each flowgroups across separate pipelines.",
+                            "Shorten landing_path / jdbc_table / schema_name identifiers "
+                            "to reduce per-entry payload size.",
+                        ],
+                    )
 
         if action_count > 300:
             raise LHPConfigError(

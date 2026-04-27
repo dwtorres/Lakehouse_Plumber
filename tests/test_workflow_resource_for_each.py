@@ -300,15 +300,23 @@ class TestMixedModeOrchestratorGuard:
         assert "<default>" in str(err)
 
     def test_single_mode_pipeline_does_not_raise(self, tmp_path):
+        """Single-mode pipelines (not mixed) must not raise CFG-034 OR CFG-036.
+
+        Post-U4 (#16): two for_each flowgroups in the SAME pipeline are
+        rejected by LHP-CFG-036. To test the original CFG-034 single-mode
+        invariant (no mixed-mode error), use distinct pipeline names so
+        each pipeline contains exactly one for_each flowgroup — this is
+        the legitimate single-mode-per-pipeline topology.
+        """
         orch = self._build_orchestrator(tmp_path)
 
         fg1 = _for_each_flowgroup(
-            pipeline="for_each_pipeline",
+            pipeline="for_each_pipeline_a",
             flowgroup="fg1",
             concurrency=3,
         )
         fg2 = _for_each_flowgroup(
-            pipeline="for_each_pipeline",
+            pipeline="for_each_pipeline_b",
             flowgroup="fg2",
             concurrency=3,
         )
@@ -317,7 +325,9 @@ class TestMixedModeOrchestratorGuard:
         smart_writer.write_if_changed = MagicMock()
         (orch.project_root / "resources" / "lhp").mkdir(parents=True, exist_ok=True)
 
-        # Should not raise — both flowgroups share for_each mode.
+        # Should not raise — each pipeline has exactly one for_each flowgroup,
+        # all with consistent for_each mode (no CFG-034 mixed-mode trigger; no
+        # CFG-036 multi-for_each-per-pipeline trigger).
         orch._generate_workflow_resources([fg1, fg2], smart_writer)
 
 
@@ -404,3 +414,76 @@ class TestNotebookPaths:
         assert "__lhp_prepare_manifest_orders_fg.py" not in result
         assert "__lhp_validate_orders_fg.py" not in result
         assert "__lhp_extract_orders_fg.py" not in result
+
+
+# ---------------------------------------------------------------------------
+# U3: prepare_manifest task max_retries: 0
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestPrepareManifestMaxRetriesZero:
+    """U3 — prepare_manifest task must declare max_retries: 0.
+
+    LHP-MAN-005 (payload ceiling breach) is deterministic: same payload →
+    same overflow → same failure.  DAB retrying the prepare_manifest task
+    burns retry budget without progress.  max_retries: 0 prevents this.
+
+    The worker (for_each_ingest / ingest_one subtask) and validate tasks
+    keep their existing retry policies — only prepare_manifest is suppressed.
+    """
+
+    def test_prepare_manifest_task_has_max_retries_zero(self):
+        """for_each workflow: prepare_manifest task must declare max_retries: 0.
+
+        AE: U3 LHP-MAN-005 retry suppression — deterministic failures must not
+        consume DAB retry budget.
+        """
+        fg = _for_each_flowgroup(concurrency=5)
+        gen = WorkflowResourceGenerator()
+        result = gen.generate(fg, {})
+        parsed = yaml.safe_load(result)
+        tasks = parsed["resources"]["jobs"]["bronze_pipeline_workflow"]["tasks"]
+        prepare = next(
+            (t for t in tasks if t["task_key"] == "prepare_manifest"), None
+        )
+        assert prepare is not None, "prepare_manifest task not found in rendered YAML"
+        assert prepare.get("max_retries") == 0, (
+            f"prepare_manifest task must declare max_retries: 0 (LHP-MAN-005 is "
+            f"deterministic — retries waste budget); "
+            f"got max_retries={prepare.get('max_retries')!r}"
+        )
+
+    def test_worker_task_retries_not_affected(self):
+        """Worker ingest_one subtask (for_each_task.task) retains its own max_retries.
+
+        Only prepare_manifest is suppressed. The worker's max_retries is independent
+        (controlled by workflow.max_retries in the flowgroup config).
+        """
+        fg = _for_each_flowgroup(concurrency=5, max_retries=2)
+        gen = WorkflowResourceGenerator()
+        result = gen.generate(fg, {})
+        parsed = yaml.safe_load(result)
+        tasks = parsed["resources"]["jobs"]["bronze_pipeline_workflow"]["tasks"]
+        ingest = next(t for t in tasks if t["task_key"] == "for_each_ingest")
+        worker_max_retries = ingest["for_each_task"]["task"]["max_retries"]
+        assert worker_max_retries == 2, (
+            f"Worker ingest_one max_retries must be 2 (from flowgroup config); "
+            f"got {worker_max_retries!r}"
+        )
+
+    def test_validate_task_has_no_max_retries_override(self):
+        """validate task has no max_retries override — inherits DAB default.
+
+        Only prepare_manifest is suppressed to 0. validate task is not changed.
+        """
+        fg = _for_each_flowgroup(concurrency=5)
+        gen = WorkflowResourceGenerator()
+        result = gen.generate(fg, {})
+        parsed = yaml.safe_load(result)
+        tasks = parsed["resources"]["jobs"]["bronze_pipeline_workflow"]["tasks"]
+        validate = next(t for t in tasks if t["task_key"] == "validate")
+        # validate task must NOT have max_retries: 0 set at the top-level task scope
+        assert validate.get("max_retries") is None, (
+            f"validate task must not have max_retries overridden; "
+            f"only prepare_manifest is suppressed. Got: {validate.get('max_retries')!r}"
+        )

@@ -15,7 +15,7 @@ import pytest
 import yaml
 
 from lhp.core.orchestrator import ActionOrchestrator
-from lhp.utils.error_formatter import LHPConfigError
+from lhp.utils.error_formatter import LHPConfigError, LHPError
 
 FLOWGROUP_YAML = """\
 pipeline: crm_bronze
@@ -775,11 +775,21 @@ class TestJDBCWatermarkV2ForEachIntegration:
     # ------------------------------------------------------------------
 
     def test_cfg_033_cap_exceeded_301_actions(self, tmp_path):
-        """flowgroup expanding to 301 actions → raises LHP-CFG-033 with split suggestion."""
+        """flowgroup expanding to 301 actions → raises LHP-MAN-005 (size guard fires first).
+
+        U3 update: with 300 JDBC load actions at realistic field lengths, the projected
+        taskValue payload (~136 KB) far exceeds the DAB 48 KB ceiling.  LHP-MAN-005
+        fires in _validate_for_each_invariants BEFORE the LHP-CFG-033 count cap check,
+        so the operator sees the payload-size error with split-reduction suggestions.
+
+        The previous assertion ('LHP-CFG-033') is replaced with 'LHP-MAN-005'; the
+        split-suggestion assertion is preserved because LHP-MAN-005 also suggests
+        splitting into multiple flowgroups.
+        """
         # The validator counts ALL actions (load + write). Use 300 JDBC loads + 1 write
-        # = 301 total, which exceeds the cap of 300.
+        # = 301 total, which exceeds both the payload ceiling and the count cap of 300.
         # All load actions share source_system_id + landing_path so the shared-keys
-        # check does not fire before the count check.
+        # check does not fire before the size check.
         load_actions = "".join(
             _b2_action_yaml(
                 name=f"load_tbl_{i:03d}",
@@ -792,15 +802,19 @@ class TestJDBCWatermarkV2ForEachIntegration:
         )
         project = _build_b2_project(tmp_path, flowgroup_yaml)
         orchestrator = ActionOrchestrator(project)
-        with pytest.raises(LHPConfigError) as exc_info:
+        with pytest.raises(LHPError) as exc_info:
             orchestrator.generate_pipeline_by_field(
                 pipeline_field="crm_bronze",
                 env="dev",
                 output_dir=project / "generated",
             )
         error_text = str(exc_info.value)
-        assert "LHP-CFG-033" in error_text
-        assert "Split" in error_text, (
+        # U3: LHP-MAN-005 fires before LHP-CFG-033 count cap
+        assert "LHP-MAN-005" in error_text, (
+            f"Expected LHP-MAN-005 (payload size) to fire first for 300 JDBC actions; "
+            f"got: {error_text[:200]}"
+        )
+        assert "Split" in error_text or "split" in error_text.lower(), (
             "Expected split-suggestion in error text; got:\n" + error_text
         )
 
@@ -947,9 +961,20 @@ class TestJDBCWatermarkV2ForEachIntegration:
     # ------------------------------------------------------------------
 
     def test_300_actions_inclusive_no_error(self, tmp_path):
-        """Exactly 300 total actions (299 JDBC loads + 1 write) → no error; prepare_manifest has 299 entries."""
+        """299 JDBC loads + 1 write = 300 total → LHP-MAN-005 raises (payload exceeds 48 KB).
+
+        U3 update: the previous "no error at 300 actions" assertion is replaced with
+        "LHP-MAN-005 fires at codegen time". With the _b2_action_yaml fixture field
+        lengths (table_name=table_NNN, source_system_id=pg_crm, landing_path=
+        /Volumes/cat/land/root), 299 JDBC actions project to ~136 KB — well over the
+        DAB 48 KB taskValue ceiling. The codegen-time guard in _validate_for_each_invariants
+        rejects the flowgroup before bundle generation so the operator fixes it pre-deploy.
+
+        The 300-action count cap (LHP-CFG-033) remains correct; the new LHP-MAN-005
+        payload ceiling fires first for realistic-length fields at this scale.
+        """
         # The validator counts ALL actions (load + write) in the flowgroup.
-        # 299 JDBC loads + 1 write = 300 total = exactly at the cap (inclusive).
+        # 299 JDBC loads + 1 write = 300 total. The payload ceiling fires first.
         load_actions = "".join(
             _b2_action_yaml(
                 name=f"load_tbl_{i:03d}",
@@ -961,16 +986,20 @@ class TestJDBCWatermarkV2ForEachIntegration:
             actions_yaml=load_actions + _b2_write_action_yaml("write_z", "v_load_tbl_000"),
         )
         project = _build_b2_project(tmp_path, flowgroup_yaml)
-        _, output_dir = self._generate(project)
-        pm = output_dir / "crm_bronze_extract" / "__lhp_prepare_manifest_product_ingestion.py"
-        assert pm.exists(), "prepare_manifest aux file not found for 300-action flowgroup"
-        content = pm.read_text()
-        # Each of the 299 JDBC load actions contributes one entry in _manifest_rows
-        # and one in _iterations. The write action is not a JDBC v2 action so it
-        # does not appear in the manifest. Count distinct load_tbl_ tokens.
-        assert content.count("load_tbl_") >= 299, (
-            f"Expected 299 JDBC action entries in prepare_manifest; "
-            f"found {content.count('load_tbl_')} occurrences"
+        orchestrator = ActionOrchestrator(project)
+        with pytest.raises(LHPError) as exc_info:
+            orchestrator.generate_pipeline_by_field(
+                pipeline_field="crm_bronze",
+                env="dev",
+                output_dir=project / "generated",
+            )
+        error_text = str(exc_info.value)
+        assert "LHP-MAN-005" in error_text, (
+            f"Expected LHP-MAN-005 (payload size guard) for 299 JDBC actions "
+            f"with realistic field lengths; got: {error_text[:200]}"
+        )
+        assert "bytes" in error_text.lower(), (
+            f"LHP-MAN-005 must include byte count in error text; got: {error_text[:200]}"
         )
 
     # ------------------------------------------------------------------
