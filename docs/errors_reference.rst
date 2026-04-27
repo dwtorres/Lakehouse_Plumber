@@ -1327,6 +1327,76 @@ At **runtime** (LHP-MAN-005 from ``prepare_manifest`` logs):
    :ref:`LHP-CFG-033 <LHP-CFG-033: for_each Post-Expansion Structural Violation>`
    for the structural action-count cap (300) that is a companion limit.
 
+Watermark Errors (LHP-WM)
+==========================
+
+Watermark errors are raised by the vendored ``lhp_watermark`` package inside
+generated Databricks notebooks. They surface in worker task logs as the
+exception class name (e.g., ``DuplicateRunError``) plus the ``LHP-WM-NNN``
+compact code in the exception ``str()``.
+
+LHP-WM-001: Duplicate run_id (DuplicateRunError)
+-------------------------------------------------
+
+**When it occurs:** A B2 worker iteration calls ``WatermarkManager.insert_new``
+and the underlying MERGE matches an existing target row in the watermarks
+table — the ``run_id`` derived for this iteration already exists.
+
+**Why it is an error:** ``insert_new`` is the row-creation step for a fresh
+extraction attempt. A matching existing row means a prior run already used
+this ``run_id`` (replay, partial commit, or run-id collision via the
+``__lhp_run_id_override`` widget or DAB task counter reset). Continuing would
+either re-process the same source slice or merge into a foreign row's state
+machine. The worker raises ``DuplicateRunError`` and aborts cleanly: it does
+**not** call ``mark_failed`` (no row was created for this attempt to
+transition) and does **not** mirror ``'failed'`` to the manifest (the issue
+is run-id provenance, not extraction failure). The manifest row stays in its
+claim-time ``'running'`` state. The worker also emits a structured
+``_log_phase("duplicate_run_id_abort", error_code="LHP-WM-001", ...)`` event
+in the task log so operators can locate the breadcrumb directly.
+
+**Common causes:**
+
+- Operator supplied an ``__lhp_run_id_override`` widget value that collides
+  with a ``run_id`` already present in the watermarks table.
+- A bundle redeploy or task-counter reset caused ``derive_run_id`` to
+  reproduce a previously-used ``(jobRunId, taskRunId, attempt)`` triple,
+  re-deriving an existing ``run_id``.
+- A partial-commit replay where the prior run successfully wrote the
+  watermarks row but failed before completing — the original ``run_id`` is
+  still present on retry.
+
+**Resolution:**
+
+1. Locate the worker task log entry with ``"duplicate_run_id_abort"`` and
+   note the ``run_id``, ``batch_id``, and ``action_name``.
+2. Query the watermarks table for the existing row:
+
+   .. code-block:: sql
+
+      SELECT run_id, status, watermark_value, source_system_id, schema_name,
+             table_name, created_at, updated_at
+      FROM <wm_catalog>.<wm_schema>.lhp_watermarks
+      WHERE run_id = '<run_id>';
+
+3. If the existing row is from a known-completed prior run, the duplicate
+   indicates a ``run_id`` provenance bug (override widget collision or
+   redeploy reset). Clear the ``__lhp_run_id_override`` widget if set, or
+   redeploy the bundle to force fresh DAB task identifiers.
+4. The ``b2_manifests`` row for the affected action remains in
+   ``execution_status: 'running'``. The ``validate`` task surfaces this as
+   ``final_status = 'running'`` (LHP-VAL-050 fires) and the batch fails
+   loudly. After resolving the run-id provenance, manually reset the
+   manifest row (see LHP-MAN-002 resolution step 2) and re-run the failed
+   iteration.
+
+.. seealso::
+
+   :ref:`LHP-MAN-002 <LHP-MAN-002: Manifest Claim Ownership Conflict>` for
+   the related manifest-row reset procedure.
+   :ref:`LHP-VAL-050 <LHP-VAL-050: B2 Validate Failed>` for the validate-side
+   surfacing of the still-``running`` manifest row produced by this abort.
+
 Validation Errors (LHP-VAL)
 ============================
 

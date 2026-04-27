@@ -112,8 +112,29 @@ def _calls_inside_try(tree: ast.Module, attr: str) -> List[ast.Call]:
 
 
 def _find_try_block(tree: ast.Module) -> Optional[ast.Try]:
+    """Return the JDBC-read Try (the one wrapping ``format("jdbc")``).
+
+    Issue #18 added a second Try at module scope wrapping ``wm.insert_new``
+    that catches ``DuplicateRunError``. The control-flow tests want the
+    JDBC-read Try specifically, identified by its body containing the
+    ``format("jdbc")`` literal.
+    """
     for node in tree.body:
-        if isinstance(node, ast.Try):
+        if not isinstance(node, ast.Try):
+            continue
+        body_src = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
+        if 'format("jdbc")' in body_src or "format('jdbc')" in body_src:
+            return node
+    return None
+
+
+def _find_insert_new_try_block(tree: ast.Module) -> Optional[ast.Try]:
+    """Return the Try wrapping ``wm.insert_new`` (issue #18 explicit handler)."""
+    for node in tree.body:
+        if not isinstance(node, ast.Try):
+            continue
+        body_src = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
+        if "insert_new(" in body_src:
             return node
     return None
 
@@ -247,19 +268,52 @@ class TestUTCSession:
 
 
 class TestControlFlowContract:
-    def test_insert_new_is_outside_try_block(self):
-        """FR-L-05 / L2 §5.3: ``insert_new`` at module level, never inside try."""
+    def test_insert_new_outside_jdbc_read_try_inside_duplicate_run_handler(self):
+        """FR-L-05 + Issue #18: ``insert_new`` is NOT inside the JDBC-read try
+        block, but IS inside a dedicated try whose only handler catches
+        ``DuplicateRunError`` and re-raises after logging.
+
+        The L2 §5.3 contract that ``mark_failed`` is never called on a
+        non-existent row remains held: the new handler does not call
+        ``mark_failed`` and re-raises with bare ``raise``.
+        """
         rendered = _render()
         tree = _parse(rendered)
 
-        module_level_insert_new = _module_level_calls(tree, "insert_new")
-        assert len(module_level_insert_new) == 1, (
-            f"Expected exactly one module-level insert_new call, got "
-            f"{len(module_level_insert_new)}"
+        jdbc_try = _find_try_block(tree)
+        assert jdbc_try is not None, "JDBC-read try block not found"
+        jdbc_body_src = ast.unparse(ast.Module(body=jdbc_try.body, type_ignores=[]))
+        assert "insert_new(" not in jdbc_body_src, (
+            "insert_new must NOT live inside the JDBC-read try block"
         )
 
-        assert _calls_inside_try(tree, "insert_new") == [], (
-            "insert_new must NOT appear inside any try block"
+        insert_try = _find_insert_new_try_block(tree)
+        assert insert_try is not None, (
+            "Issue #18: insert_new must be wrapped in a dedicated try block"
+        )
+        assert insert_try is not jdbc_try, (
+            "insert_new try and JDBC-read try must be distinct"
+        )
+        assert len(insert_try.handlers) == 1, (
+            "Issue #18: insert_new try must have exactly one except clause"
+        )
+        handler = insert_try.handlers[0]
+        assert (
+            isinstance(handler.type, ast.Name)
+            and handler.type.id == "DuplicateRunError"
+        ), (
+            f"Expected `except DuplicateRunError`, got "
+            f"{ast.unparse(handler.type) if handler.type else 'bare except'}"
+        )
+
+        # Handler must NOT call mark_failed, must end with bare `raise`.
+        handler_src = ast.unparse(ast.Module(body=handler.body, type_ignores=[]))
+        assert "mark_failed" not in handler_src, (
+            "DuplicateRunError handler must NOT call mark_failed (FR-L-05)"
+        )
+        last = handler.body[-1]
+        assert isinstance(last, ast.Raise) and last.exc is None, (
+            "DuplicateRunError handler must terminate with bare `raise`"
         )
 
     def test_try_block_exists_and_wraps_extraction(self):
@@ -304,31 +358,38 @@ class TestControlFlowContract:
         assert raises, "except handler must end with `raise`"
 
     def test_mark_complete_is_outside_and_after_try(self):
-        """FR-L-01 / L2 §5.3: mark_complete sits AFTER the try/except, at module level."""
+        """FR-L-01 / L2 §5.3: mark_complete sits AFTER the JDBC-read try/except,
+        at module level. mark_complete must not appear inside any top-level
+        try block."""
         rendered = _render()
         tree = _parse(rendered)
 
-        try_index: Optional[int] = None
+        jdbc_try = _find_try_block(tree)
+        assert jdbc_try is not None, "JDBC-read try block not found"
+        jdbc_try_index: Optional[int] = None
         for i, node in enumerate(tree.body):
-            if isinstance(node, ast.Try):
-                try_index = i
+            if node is jdbc_try:
+                jdbc_try_index = i
                 break
-        assert try_index is not None
+        assert jdbc_try_index is not None
 
-        # mark_complete must not live inside the try body or its handlers.
+        # mark_complete must not live inside ANY top-level try.
         assert _calls_inside_try(tree, "mark_complete") == [], (
-            "mark_complete must NOT be inside the try block"
+            "mark_complete must NOT be inside any top-level try block"
         )
 
-        # Walk module-body nodes AFTER the try and confirm mark_complete appears.
-        after_try = ast.Module(body=tree.body[try_index + 1:], type_ignores=[])
+        # Walk module-body nodes AFTER the JDBC-read try and confirm
+        # mark_complete appears.
+        after_try = ast.Module(
+            body=tree.body[jdbc_try_index + 1:], type_ignores=[]
+        )
         calls = [
             n for n in ast.walk(after_try)
             if isinstance(n, ast.Call)
             and isinstance(n.func, ast.Attribute)
             and n.func.attr == "mark_complete"
         ]
-        assert calls, "mark_complete must appear after the try/except block"
+        assert calls, "mark_complete must appear after the JDBC-read try/except"
 
 
 # ---------------------- SQL-context Jinja hygiene ----------------------
@@ -505,14 +566,26 @@ class TestEmptyBatchSchemaFallback:
         Re-runs the spine assertions from TestControlFlowContract on the
         post-fallback render so a regression in the fallback wiring fails
         loudly here rather than indirectly via integration tests.
+        Issue #18: insert_new now lives inside a dedicated DuplicateRunError
+        try block — assert that block is intact and that insert_new is still
+        outside the JDBC-read try.
         """
         rendered = _render()
         tree = _parse(rendered)
 
-        # insert_new still at module scope, exactly once, never inside try.
-        module_level = _module_level_calls(tree, "insert_new")
-        assert len(module_level) == 1
-        assert _calls_inside_try(tree, "insert_new") == []
+        # insert_new lives inside a DuplicateRunError-only try, not the
+        # JDBC-read try.
+        insert_try = _find_insert_new_try_block(tree)
+        assert insert_try is not None
+        assert len(insert_try.handlers) == 1
+        assert (
+            isinstance(insert_try.handlers[0].type, ast.Name)
+            and insert_try.handlers[0].type.id == "DuplicateRunError"
+        )
+        jdbc_try = _find_try_block(tree)
+        assert jdbc_try is not None
+        jdbc_body_src = ast.unparse(ast.Module(body=jdbc_try.body, type_ignores=[]))
+        assert "insert_new(" not in jdbc_body_src
 
-        # mark_complete still after the try, never inside it.
+        # mark_complete still after the try, never inside any top-level try.
         assert _calls_inside_try(tree, "mark_complete") == []

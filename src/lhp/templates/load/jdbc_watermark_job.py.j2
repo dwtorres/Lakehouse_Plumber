@@ -42,6 +42,7 @@ def _lhp_watermark_bootstrap_syspath() -> None:
 _lhp_watermark_bootstrap_syspath()
 
 from lhp_watermark import (  # noqa: E402  — import follows sys.path bootstrap
+    DuplicateRunError,
     TerminalStateGuardError,
     WatermarkManager,
 )
@@ -222,9 +223,21 @@ def _build_jdbc_query(hwm):
 
 query = _build_jdbc_query(hwm_value)
 
-# FR-L-05 / L2 §5.3: insert_new is OUTSIDE the try block. A DuplicateRunError
-# here means no watermark row was created for this invocation, so mark_failed
-# has nothing to transition and must not be called.
+# FR-L-05 / L2 §5.3: insert_new is OUTSIDE the JDBC-read try block. A
+# DuplicateRunError here means no watermark row was created for this
+# invocation, so mark_failed has nothing to transition and must not be called.
+#
+# Issue #18 (ADV-008): wrap insert_new in a dedicated except DuplicateRunError
+# block. The handler logs a structured breadcrumb (LHP-WM-001) and re-raises
+# the original exception so operators see the duplicate-run-id root cause
+# directly. The handler does NOT call wm.mark_failed (FR-L-05 contract held)
+# and does NOT mirror the manifest to failed (run-id provenance, not
+# extraction failure). The manifest row stays in its claim-time running
+# state; validate.py.j2 R4 tightening surfaces it as a non-completed action
+# so the batch fails loudly. The new block sits BEFORE the JDBC-read try at
+# line 299 so the mark_failed → raise byte-identical-between-modes
+# invariant (R4 / test_r4_raise_on_failure_block_verbatim_between_modes)
+# remains untouched.
 {% if execution_mode == "for_each" %}
 # B2 manifest UPDATE: claim this attempt's worker_run_id (optimistic-concurrency).
 # DAB-retry-timeout race: if UPDATE matches zero, read back current state.
@@ -270,18 +283,33 @@ if readback[0]["worker_run_id"] not in (None, worker_run_id):
     )
 {% endif %}
 extraction_type = "full" if hwm_value is None else "incremental"
-wm.insert_new(
-    run_id=run_id,
-    source_system_id=source_system_id,
-    schema_name=schema_name,
-    table_name=table_name,
-    watermark_column_name=watermark_column,
-    watermark_value=str(hwm_value) if hwm_value is not None else None,
-    row_count=0,
-    extraction_type=extraction_type,
-    previous_watermark_value=str(hwm_value) if hwm_value is not None else None,
-    load_group=load_group,
-)
+try:
+    wm.insert_new(
+        run_id=run_id,
+        source_system_id=source_system_id,
+        schema_name=schema_name,
+        table_name=table_name,
+        watermark_column_name=watermark_column,
+        watermark_value=str(hwm_value) if hwm_value is not None else None,
+        row_count=0,
+        extraction_type=extraction_type,
+        previous_watermark_value=str(hwm_value) if hwm_value is not None else None,
+        load_group=load_group,
+    )
+except DuplicateRunError:
+    # Issue #18: explicit duplicate-run-id breadcrumb. No mark_failed call
+    # (no row exists to transition; would itself raise TerminalStateGuardError).
+    # No manifest fail-mirror (run-id provenance, not extraction failure).
+    # Manifest row stays in claim-time running state; validate R4 tightening
+    # surfaces it as a non-completed action so the batch fails loudly.
+    _log_phase(
+        "duplicate_run_id_abort",
+        error_code="LHP-WM-001",
+        {%- if execution_mode == "for_each" %}
+        batch_id=batch_id,
+        {%- endif %}
+    )
+    raise
 
 extraction_succeeded = False
 row_count = 0
