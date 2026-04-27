@@ -45,6 +45,9 @@ from lhp_watermark import (  # noqa: E402  — import follows sys.path bootstrap
     TerminalStateGuardError,
     WatermarkManager,
 )
+from lhp_watermark._merge_helpers import (  # noqa: E402
+    execute_with_concurrent_commit_retry,
+)
 from lhp_watermark.runtime import derive_run_id  # noqa: E402
 from lhp_watermark.sql_safety import SQLInputValidator, sql_literal  # noqa: E402
 
@@ -235,15 +238,32 @@ WHERE  batch_id    = {sql_literal(batch_id)}
   AND  action_name = {sql_literal(action_name)}
   AND  ( worker_run_id IS NULL OR worker_run_id = {sql_literal(worker_run_id)} )
 """
-update_result = spark.sql(update_sql)
+def _on_claim_exhausted(exc):
+    raise RuntimeError(
+        f"LHP-MAN-001: concurrent-commit retry exhausted claiming manifest row "
+        f"for batch_id={batch_id} action_name={action_name}"
+    ) from exc
+
+
+execute_with_concurrent_commit_retry(
+    spark,
+    update_sql,
+    on_exhausted=_on_claim_exhausted,
+)
 # If zero rows affected, another retry-attempt may already own this row.
-# Read back; if we're not the current owner, abort with a retry-friendly error.
+# Read back; if we are not the current owner, abort with a retry-friendly error.
 readback = spark.sql(
     f"SELECT worker_run_id FROM {manifest_table} "
     f"WHERE batch_id = {sql_literal(batch_id)} "
     f"AND action_name = {sql_literal(action_name)}"
 ).collect()
-if readback and readback[0]["worker_run_id"] not in (None, worker_run_id):
+if not readback:
+    raise RuntimeError(
+        f"LHP-MAN-003: manifest row missing for batch_id={batch_id} "
+        f"action_name={action_name} — prepare_manifest may have been "
+        f"skipped or row was deleted out of band"
+    )
+if readback[0]["worker_run_id"] not in (None, worker_run_id):
     raise RuntimeError(
         f"LHP-MAN-002: manifest row for batch_id={batch_id} action={action_name} "
         f"already claimed by worker_run_id={readback[0]['worker_run_id']}"
@@ -341,9 +361,17 @@ except Exception as e:
     try:
         # SQL is intentionally inlined on one logical line so every rendered
         # line in this except-block stays indented (R4 helper invariant).
-        spark.sql(
+        # Ownership predicate mirrors the claim UPDATE — only the owning run
+        # may transition the row to failed.
+        _fail_mirror_sql = (
             f"UPDATE {manifest_table} SET execution_status = 'failed', updated_at = current_timestamp() "
-            f"WHERE batch_id = {sql_literal(batch_id)} AND action_name = {sql_literal(action_name)}"
+            f"WHERE batch_id = {sql_literal(batch_id)} AND action_name = {sql_literal(action_name)} "
+            f"AND worker_run_id = {sql_literal(worker_run_id)}"
+        )
+        execute_with_concurrent_commit_retry(
+            spark,
+            _fail_mirror_sql,
+            on_exhausted=lambda exc: None,  # best-effort: swallow exhaustion
         )
     except Exception:  # noqa: BLE001 — manifest mirror is best-effort
         pass
@@ -401,10 +429,24 @@ if extraction_succeeded:
 {% if execution_mode == "for_each" %}
         # Anomaly B (devtest 2026-04-26): transition manifest to 'completed'
         # so b2_manifests is a standalone source of truth instead of being
-        # masked by validate.py's coalesce(worker_status, manifest_status).
-        spark.sql(
+        # masked by validate.py coalesce(worker_status, manifest_status).
+        # Ownership predicate mirrors the claim UPDATE — only the owning run
+        # may transition the row to completed.
+        _complete_mirror_sql = (
             f"UPDATE {manifest_table} SET execution_status = 'completed', updated_at = current_timestamp() "
-            f"WHERE batch_id = {sql_literal(batch_id)} AND action_name = {sql_literal(action_name)}"
+            f"WHERE batch_id = {sql_literal(batch_id)} AND action_name = {sql_literal(action_name)} "
+            f"AND worker_run_id = {sql_literal(worker_run_id)}"
+        )
+        def _on_complete_mirror_exhausted(exc):
+            raise RuntimeError(
+                f"LHP-MAN-004: concurrent-commit retry exhausted on completion mirror "
+                f"for batch_id={batch_id} action_name={action_name}"
+            ) from exc
+
+        execute_with_concurrent_commit_retry(
+            spark,
+            _complete_mirror_sql,
+            on_exhausted=_on_complete_mirror_exhausted,
         )
 {% endif %}
     except TerminalStateGuardError:

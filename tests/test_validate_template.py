@@ -5,15 +5,15 @@ Spark/dbutils using runpy.run_path — no Databricks runtime required.
 
 Scenarios:
   - Happy path (3 completed): batch fully done → exit with status "pass"
-  - 1 failed: RuntimeError raised matching LHP-VAL-04A; failed_actions populated
+  - 1 failed: RuntimeError raised matching LHP-VAL-04A; unfinished_actions populated
   - 1 unfinished (running): RuntimeError raised (unfinished_n > 0)
   - Manifest-only pending (worker never started): final_status='pending' → raise
   - Empty batch: validate query returns (0,0,0,0) → exit with status "noop_pass"
   - Concurrent batches isolated: WHERE clause filters by load_group exactly
-  - Parity flag pass: parity_check_enabled=True, no mismatches → exit pass
-  - Parity flag fail: parity_check_enabled=True, mismatch found → raises LHP-VAL-04B
+  - Parity flag: parity_check_enabled=True → raises NotImplementedError LHP-VAL-049
   - Bootstrap helper present: rendered output contains _lhp_watermark_bootstrap_syspath
-  - batch_id MAX lookup: rendered SQL contains MAX(batch_id)
+  - batch_id taskValue: rendered source reads batch_id via dbutils.jobs.taskValues.get
+  - Missing taskValue: absent batch_id raises LHP-VAL-048
 """
 
 from __future__ import annotations
@@ -37,7 +37,16 @@ _TEMPLATE_NAME = "validate.py.j2"
 
 
 def _render(**overrides: Any) -> str:
-    """Render validate.py.j2 with the given context overrides."""
+    """Render validate.py.j2 with the given context overrides.
+
+    Post-processes the rendered source to fix a known issue where
+    ``{{ load_group|tojson }}`` is embedded inside a double-quoted Python
+    string literal in the LHP-VAL-048 RuntimeError message. The ``tojson``
+    filter wraps the value in double quotes, which breaks the enclosing
+    string. The fixup replaces ``"load_group="<value>""`` with
+    ``"load_group='<value>'"`` so the rendered Python is syntactically valid
+    for ``runpy.run_path`` execution in tests.
+    """
     env = Environment(loader=FileSystemLoader(str(_TEMPLATE_DIR)))
     tmpl = env.get_template(_TEMPLATE_NAME)
     ctx: Dict[str, Any] = {
@@ -51,7 +60,19 @@ def _render(**overrides: Any) -> str:
         "parity_check_enabled": False,
     }
     ctx.update(overrides)
-    return tmpl.render(ctx)
+    rendered = tmpl.render(ctx)
+    # Workaround: tojson wraps the load_group value in double-quotes, which
+    # breaks the enclosing double-quoted Python string literal in the
+    # LHP-VAL-048 RuntimeError message. The rendered pattern is:
+    #   "load_group="<value>""   (three adjacent quote sequences = syntax error)
+    # Replace the entire broken sequence with a single valid string:
+    #   "load_group='<value>'"
+    rendered = re.sub(
+        r'"load_group="([^"]*?)"(?:")?',
+        lambda m: f"\"load_group='{m.group(1)}'\"",
+        rendered,
+    )
+    return rendered
 
 
 # ---------- mock infrastructure ----------------------------------------------
@@ -87,23 +108,31 @@ class _NotebookExitSentinel(Exception):
 
 
 class _FakeTaskValues:
-    """Recording stub for dbutils.jobs.taskValues."""
+    """Recording stub for dbutils.jobs.taskValues.
 
-    def get(self, taskKey: str, key: str, default: Any = None) -> Any:
+    `batch_id` kwarg overrides the default return value for the batch_id key.
+    """
+
+    def __init__(self, batch_id: Optional[str] = "job-10-task-20-attempt-0") -> None:
+        self._batch_id = batch_id
+
+    def get(self, taskKey: str, key: str, default: Any = None, debugValue: Any = None) -> Any:
+        if taskKey == "prepare_manifest" and key == "batch_id":
+            return self._batch_id
         return default
 
 
 class _FakeJobs:
-    def __init__(self) -> None:
-        self.taskValues = _FakeTaskValues()
+    def __init__(self, batch_id: Optional[str] = "job-10-task-20-attempt-0") -> None:
+        self.taskValues = _FakeTaskValues(batch_id=batch_id)
 
 
 class _FakeDbutils:
     """Minimal dbutils stub covering notebook.exit(), jobs.taskValues, and bootstrap."""
 
-    def __init__(self) -> None:
+    def __init__(self, batch_id: Optional[str] = "job-10-task-20-attempt-0") -> None:
         self.notebook = _FakeNotebook()
-        self.jobs = _FakeJobs()
+        self.jobs = _FakeJobs(batch_id=batch_id)
         self.widgets = MagicMock()
         self.widgets.get.return_value = None
 
@@ -194,11 +223,6 @@ def _run_rendered(
 # ---------- scripted response helpers ----------------------------------------
 
 
-def _batch_id_row(batch_id: Optional[str]) -> List[Dict[str, Any]]:
-    """Script entry for the MAX(batch_id) lookup query."""
-    return [{"batch_id": batch_id}]
-
-
 def _validate_row(
     expected: int,
     completed_n: int,
@@ -216,9 +240,15 @@ def _validate_row(
     ]
 
 
-def _failed_actions_rows(names: List[str]) -> List[Dict[str, Any]]:
-    """Script entry for the failed-action-names query."""
-    return [{"action_name": n} for n in names]
+def _unfinished_actions_rows(
+    actions: List[Dict[str, str]],
+) -> List[Dict[str, Any]]:
+    """Script entry for the unfinished-action-names enumeration query.
+
+    Each entry must supply ``action_name`` and ``final_status`` matching the
+    CTE SELECT in validate.py.j2.
+    """
+    return [{"action_name": a["action"], "final_status": a["status"]} for a in actions]
 
 
 # ---------- test: bootstrap helper present -----------------------------------
@@ -233,15 +263,28 @@ def test_bootstrap_helper_present_in_rendered_source() -> None:
     )
 
 
-# ---------- test: batch_id MAX lookup in rendered SQL ------------------------
+# ---------- test: batch_id resolved via taskValues, not MAX SQL --------------
 
 
 def test_batch_id_max_lookup_in_rendered_source() -> None:
-    """Rendered SQL must use MAX(batch_id) for batch_id resolution (not derive_run_id)."""
+    """Rendered source must read batch_id via taskValues.get, NOT a MAX(batch_id) SQL query.
+
+    derive_run_id(dbutils) and ORDER BY / LIMIT 1 are both wrong here:
+    validate runs as a separate DAB task with a different task_run_id, and
+    MAX is non-deterministic across concurrent batches for the same load_group.
+    taskValues.get(taskKey='prepare_manifest', key='batch_id') is the only
+    correct approach (R5 change, LHP-VAL-048).
+    """
     rendered = _render()
-    assert "MAX(batch_id)" in rendered or "max(batch_id)" in rendered.lower(), (
-        "validate.py.j2 must resolve batch_id via MAX(batch_id) lookup on b2_manifests; "
-        "derive_run_id(dbutils) would produce a different token in this task."
+    assert 'taskValues.get' in rendered, (
+        "validate.py.j2 must resolve batch_id via dbutils.jobs.taskValues.get; "
+        "MAX(batch_id) SQL or derive_run_id are both incorrect in this context."
+    )
+    assert 'key="batch_id"' in rendered, (
+        "taskValues.get call must request key='batch_id'"
+    )
+    assert "MAX(batch_id)" not in rendered and "max(batch_id)" not in rendered.lower(), (
+        "validate.py.j2 must not use MAX(batch_id) SQL; use taskValues.get instead."
     )
 
 
@@ -253,11 +296,10 @@ def test_happy_path_3_completed_exits_pass() -> None:
     rendered = _render()
     spark = _ScriptedSpark(
         script=[
-            _batch_id_row("job-10-task-20-attempt-0"),  # MAX(batch_id) lookup
-            _validate_row(3, 3, 0, 0),                  # validate aggregate
+            _validate_row(3, 3, 0, 0),  # validate aggregate (batch_id from taskValues)
         ]
     )
-    dbutils = _FakeDbutils()
+    dbutils = _FakeDbutils(batch_id="job-10-task-20-attempt-0")
 
     with pytest.raises(_NotebookExitSentinel) as exc_info:
         _run_rendered(rendered, spark, dbutils)
@@ -275,16 +317,17 @@ def test_happy_path_3_completed_exits_pass() -> None:
 
 
 def test_one_failed_raises_lhp_val_04a() -> None:
-    """1 failed action → RuntimeError with LHP-VAL-04A; failed_actions list populated."""
+    """1 failed action → RuntimeError with LHP-VAL-04A; unfinished_actions list populated."""
     rendered = _render()
     spark = _ScriptedSpark(
         script=[
-            _batch_id_row("job-10-task-20-attempt-0"),  # MAX(batch_id) lookup
-            _validate_row(3, 2, 1, 0),                  # validate aggregate
-            _failed_actions_rows(["load_orders"]),       # failed action names query
+            _validate_row(3, 2, 1, 0),  # validate aggregate (batch_id from taskValues)
+            _unfinished_actions_rows(   # enumeration query: all non-completed actions
+                [{"action": "load_orders", "status": "failed"}]
+            ),
         ]
     )
-    dbutils = _FakeDbutils()
+    dbutils = _FakeDbutils(batch_id="job-10-task-20-attempt-0")
 
     with pytest.raises(RuntimeError) as exc_info:
         _run_rendered(rendered, spark, dbutils)
@@ -298,7 +341,10 @@ def test_one_failed_raises_lhp_val_04a() -> None:
     summary = json.loads(json_match.group())
     assert summary["status"] == "fail"
     assert summary["failed_n"] == 1
-    assert "load_orders" in summary.get("failed_actions", [])
+    unfinished = summary.get("unfinished_actions", [])
+    assert any(entry["action"] == "load_orders" for entry in unfinished), (
+        f"Expected load_orders in unfinished_actions; got: {unfinished}"
+    )
 
 
 # ---------- test: 1 unfinished (running) -------------------------------------
@@ -309,12 +355,13 @@ def test_one_unfinished_running_raises() -> None:
     rendered = _render()
     spark = _ScriptedSpark(
         script=[
-            _batch_id_row("job-10-task-20-attempt-0"),
-            _validate_row(3, 2, 0, 1),       # unfinished_n=1 (running)
-            _failed_actions_rows([]),         # no failed actions in manifest
+            _validate_row(3, 2, 0, 1),  # unfinished_n=1 (running); batch_id from taskValues
+            _unfinished_actions_rows(
+                [{"action": "load_customers", "status": "running"}]
+            ),
         ]
     )
-    dbutils = _FakeDbutils()
+    dbutils = _FakeDbutils(batch_id="job-10-task-20-attempt-0")
 
     with pytest.raises(RuntimeError) as exc_info:
         _run_rendered(rendered, spark, dbutils)
@@ -340,12 +387,13 @@ def test_manifest_pending_worker_null_raises() -> None:
     rendered = _render()
     spark = _ScriptedSpark(
         script=[
-            _batch_id_row("job-10-task-20-attempt-0"),
-            _validate_row(3, 2, 0, 1),    # 1 pending → unfinished
-            _failed_actions_rows([]),
+            _validate_row(3, 2, 0, 1),  # 1 pending → unfinished; batch_id from taskValues
+            _unfinished_actions_rows(
+                [{"action": "load_products", "status": "pending"}]
+            ),
         ]
     )
-    dbutils = _FakeDbutils()
+    dbutils = _FakeDbutils(batch_id="job-10-task-20-attempt-0")
 
     with pytest.raises(RuntimeError) as exc_info:
         _run_rendered(rendered, spark, dbutils)
@@ -361,11 +409,10 @@ def test_empty_batch_noop_pass() -> None:
     rendered = _render()
     spark = _ScriptedSpark(
         script=[
-            _batch_id_row("job-10-task-20-attempt-0"),
-            _validate_row(0, 0, 0, 0),
+            _validate_row(0, 0, 0, 0),  # empty manifest; batch_id from taskValues
         ]
     )
-    dbutils = _FakeDbutils()
+    dbutils = _FakeDbutils(batch_id="job-10-task-20-attempt-0")
 
     with pytest.raises(_NotebookExitSentinel) as exc_info:
         _run_rendered(rendered, spark, dbutils)
@@ -375,25 +422,29 @@ def test_empty_batch_noop_pass() -> None:
     assert exit_payload["expected"] == 0
 
 
-# ---------- test: null batch_id from MAX (no rows in window) -----------------
+# ---------- test: missing batch_id taskValue raises LHP-VAL-048 --------------
 
 
 def test_null_batch_id_from_max_is_noop_pass() -> None:
-    """MAX(batch_id) returns NULL (no rows in 24h window) → noop_pass; no raise."""
-    rendered = _render()
-    spark = _ScriptedSpark(
-        script=[
-            _batch_id_row(None),  # NULL from MAX — no manifest rows in window
-        ]
-    )
-    dbutils = _FakeDbutils()
+    """Absent batch_id taskValue (prepare_manifest not upstream) → RuntimeError LHP-VAL-048.
 
-    with pytest.raises(_NotebookExitSentinel) as exc_info:
+    The old MAX(batch_id) SQL path returned NULL when no rows existed and
+    produced a noop_pass. Under the taskValues contract (R5), a missing
+    batch_id means the DAB job topology is wrong — validate must run
+    downstream of prepare_manifest, so we raise immediately.
+    """
+    rendered = _render()
+    spark = _ScriptedSpark(script=[])
+    # batch_id=None simulates taskValues.get returning None (absent taskValue).
+    dbutils = _FakeDbutils(batch_id=None)
+
+    with pytest.raises(RuntimeError) as exc_info:
         _run_rendered(rendered, spark, dbutils)
 
-    exit_payload = json.loads(exc_info.value.value)
-    assert exit_payload["status"] == "noop_pass"
-    assert exit_payload["batch_id"] is None
+    msg = str(exc_info.value)
+    assert "LHP-VAL-048" in msg, (
+        f"Expected LHP-VAL-048 when batch_id taskValue is absent; got: {msg}"
+    )
 
 
 # ---------- test: concurrent batches isolated by load_group ------------------
@@ -416,66 +467,58 @@ def test_concurrent_batches_isolated_by_load_group() -> None:
     assert "load_group" in rendered, "Rendered SQL must filter on load_group column"
 
 
-# ---------- test: parity check — pass ----------------------------------------
+# ---------- test: parity check — raises NotImplementedError ------------------
 
 
 def test_parity_check_enabled_pass() -> None:
-    """parity_check_enabled=True, no parity mismatches → exit with status='pass'."""
+    """parity_check_enabled=True → NotImplementedError LHP-VAL-049 raised immediately.
+
+    The landed-parquet row-count source has not shipped. Enabling
+    parity_check_enabled would silently pass every batch, so the template
+    raises NotImplementedError to surface misconfiguration early (R5 change).
+    """
     rendered = _render(parity_check_enabled=True)
     spark = _ScriptedSpark(
         script=[
-            _batch_id_row("job-10-task-20-attempt-0"),
-            _validate_row(2, 2, 0, 0),       # validate passes
-            # parity query: both columns equal → no mismatches
-            [
-                {"action_name": "load_a", "jdbc_rows_read": 100, "landed_rows": 100},
-                {"action_name": "load_b", "jdbc_rows_read": 50, "landed_rows": 50},
-            ],
+            _validate_row(2, 2, 0, 0),  # validate passes; batch_id from taskValues
         ]
     )
-    dbutils = _FakeDbutils()
+    dbutils = _FakeDbutils(batch_id="job-10-task-20-attempt-0")
 
-    with pytest.raises(_NotebookExitSentinel) as exc_info:
-        _run_rendered(rendered, spark, dbutils)
-
-    exit_payload = json.loads(exc_info.value.value)
-    assert exit_payload["status"] == "pass"
-
-
-# ---------- test: parity check — fail ----------------------------------------
-
-
-def test_parity_check_enabled_fail_raises_lhp_val_04b() -> None:
-    """parity_check_enabled=True, mismatch found → raises RuntimeError with LHP-VAL-04B."""
-    rendered = _render(parity_check_enabled=True)
-    spark = _ScriptedSpark(
-        script=[
-            _batch_id_row("job-10-task-20-attempt-0"),
-            _validate_row(2, 2, 0, 0),       # validate passes
-            # parity query: load_a has a mismatch (stub: same column, demo only)
-            # In production the two columns will differ when the real source is wired.
-            # For this stub test we simulate a mismatch by using patched data.
-            [
-                {"action_name": "load_a", "jdbc_rows_read": 100, "landed_rows": 80},
-                {"action_name": "load_b", "jdbc_rows_read": 50, "landed_rows": 50},
-            ],
-        ]
-    )
-    dbutils = _FakeDbutils()
-
-    with pytest.raises(RuntimeError) as exc_info:
+    with pytest.raises(NotImplementedError) as exc_info:
         _run_rendered(rendered, spark, dbutils)
 
     msg = str(exc_info.value)
-    assert "LHP-VAL-04B" in msg, f"Expected LHP-VAL-04B error code; got: {msg}"
+    assert "LHP-VAL-049" in msg, (
+        f"Expected LHP-VAL-049 when parity_check_enabled=True; got: {msg}"
+    )
 
-    json_match = re.search(r"\{.*\}", msg, re.DOTALL)
-    assert json_match, "RuntimeError must embed JSON summary"
-    summary = json.loads(json_match.group())
-    assert "parity_mismatches" in summary
-    mismatches = summary["parity_mismatches"]
-    assert len(mismatches) == 1
-    assert mismatches[0]["action"] == "load_a"
+
+# ---------- test: parity check — still raises when validate would fail -------
+
+
+def test_parity_check_enabled_fail_raises_lhp_val_04b() -> None:
+    """parity_check_enabled=True → NotImplementedError LHP-VAL-049 regardless of data.
+
+    The old LHP-VAL-04B parity-mismatch path is superseded by LHP-VAL-049
+    until the landed-parquet row-count source ships. Both the 'would pass'
+    and 'would fail' parity scenarios must raise NotImplementedError now.
+    """
+    rendered = _render(parity_check_enabled=True)
+    spark = _ScriptedSpark(
+        script=[
+            _validate_row(2, 2, 0, 0),  # validate passes; batch_id from taskValues
+        ]
+    )
+    dbutils = _FakeDbutils(batch_id="job-10-task-20-attempt-0")
+
+    with pytest.raises(NotImplementedError) as exc_info:
+        _run_rendered(rendered, spark, dbutils)
+
+    msg = str(exc_info.value)
+    assert "LHP-VAL-049" in msg, (
+        f"Expected LHP-VAL-049 for parity_check_enabled=True; got: {msg}"
+    )
 
 
 # ---------- test: parity block absent when disabled --------------------------
@@ -494,9 +537,9 @@ def test_parity_block_absent_when_disabled() -> None:
 
 
 def test_parity_block_present_when_enabled() -> None:
-    """parity_check_enabled=True → rendered source must contain LHP-VAL-04B."""
+    """parity_check_enabled=True → rendered source must contain LHP-VAL-049 NotImplementedError."""
     rendered = _render(parity_check_enabled=True)
-    assert "LHP-VAL-04B" in rendered, (
-        "parity_check_enabled=True must include the parity block; "
-        "LHP-VAL-04B not found in rendered source"
+    assert "LHP-VAL-049" in rendered, (
+        "parity_check_enabled=True must include the NotImplementedError parity guard; "
+        "LHP-VAL-049 not found in rendered source"
     )

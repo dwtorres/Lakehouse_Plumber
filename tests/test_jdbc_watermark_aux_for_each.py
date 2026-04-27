@@ -334,8 +334,15 @@ def test_multiple_b2_flowgroups_get_separate_aux_files() -> None:
 
 
 @pytest.mark.unit
-def test_parity_flag_true_renders_parity_block() -> None:
-    """parity_check:true → validate.py contains the parity SQL block marker."""
+def test_parity_flag_true_raises_not_implemented() -> None:
+    """parity_check:true → validate.py raises NotImplementedError (LHP-VAL-049).
+
+    The parity_check stub was removed in wave-2 review fix #16 because the
+    original implementation compared w.row_count against itself and always
+    passed silently, giving operators false confidence. Until the landed-parquet
+    row-count source ships, enabling parity_check must surface a hard error
+    rather than a silently-passing stub.
+    """
     fg = _make_b2_flowgroup(
         [_make_load_action("load_orders", landing_path="/Volumes/v/l/o")],
         parity_check=True,
@@ -343,8 +350,14 @@ def test_parity_flag_true_renders_parity_block() -> None:
     _run_generate_all_load_actions(fg)
 
     validate_code = fg._auxiliary_files[f"__lhp_validate_{fg.flowgroup}.py"]
-    assert "parity_mismatches" in validate_code, (
-        "parity_check:true must produce a validate.py containing '_parity_mismatches'"
+    assert "LHP-VAL-049" in validate_code, (
+        "parity_check:true must produce a validate.py containing 'LHP-VAL-049'"
+    )
+    assert "NotImplementedError" in validate_code, (
+        "parity_check:true must produce a validate.py raising NotImplementedError"
+    )
+    assert "parity_mismatches" not in validate_code, (
+        "parity_check:true must NOT produce the old parity_mismatches SQL stub"
     )
 
 

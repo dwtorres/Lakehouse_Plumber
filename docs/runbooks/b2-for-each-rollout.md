@@ -332,6 +332,55 @@ DELETE FROM metadata.devtest_orchestration.b2_manifests
 
 ---
 
+## Internals: iteration contract
+
+Every per-action attribute that the B2 worker reads at iteration time must satisfy
+two requirements simultaneously:
+
+1. It must be a member of `B2_ITERATION_KEYS` — the canonical frozenset defined in
+   `src/lhp/models/b2_iteration.py`.
+2. It must be emitted by `prepare_manifest` into the `b2_manifests` row for that
+   action (via the manifest INSERT template).
+
+If either requirement is not met, the worker will either skip the attribute silently
+or raise a `KeyError` at runtime.
+
+**To extend the contract** (add a new per-action attribute):
+
+1. Add the attribute name to `B2_ITERATION_KEYS` in `src/lhp/models/b2_iteration.py`.
+2. Emit the attribute from the `prepare_manifest` template
+   (`src/lhp/templates/b2/prepare_manifest.py.j2`).
+3. Consume the attribute in the worker template
+   (`src/lhp/templates/b2/worker/jdbc_watermark_job.py.j2`).
+4. Re-run `tests/test_b2_iteration_contract.py` — it asserts that every key in
+   `B2_ITERATION_KEYS` is present in the manifest INSERT and the worker read path.
+
+---
+
+## Operational caveats
+
+**`b2_manifests` TBLPROPERTIES are set once at CREATE TABLE time.** The auto-DDL
+uses `CREATE TABLE IF NOT EXISTS` with the following properties:
+`delta.enableChangeDataFeed`, `delta.autoOptimize.optimizeWrite`,
+`delta.autoOptimize.autoCompact`, and `delta.enableRowTracking`.
+
+Re-running the auto-DDL (e.g., after a `lhp generate` / deploy cycle) does **not**
+update an existing table's properties — `IF NOT EXISTS` skips the CREATE when the
+table already exists.
+
+To change TBLPROPERTIES on an existing table, run an explicit ALTER:
+
+```sql
+ALTER TABLE metadata.<env>_orchestration.b2_manifests
+SET TBLPROPERTIES (
+  'delta.enableChangeDataFeed' = 'true',
+  'delta.autoOptimize.optimizeWrite' = 'true'
+  -- add or modify properties as needed
+);
+```
+
+---
+
 ## Cross-references
 
 | Document | Role |
