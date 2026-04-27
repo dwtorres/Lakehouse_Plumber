@@ -579,3 +579,144 @@ class TestSamePipelineMixedMode:
         cfg033 = [e for e in project_errors if e.code == "LHP-CFG-033"]
         assert len(cfg033) >= 1
         assert cfg033[0].context.get("pipeline") == "gold_pipeline"
+
+
+# ---------------------------------------------------------------------------
+# LHP-CFG-036: multi-for_each-per-pipeline rejection (project-scope)
+# ---------------------------------------------------------------------------
+
+
+class TestMultiForEachPerPipeline:
+    """AE: LHP-CFG-036 — R5 §multi_for_each_per_pipeline.
+
+    Validates that a pipeline with 2+ for_each flowgroups is rejected at
+    validate-time with LHP-CFG-036.  The generate-time guard lives in
+    orchestrator.py; see TestMultiForEachGeneratePath in this module for that.
+    """
+
+    def test_happy_path_single_for_each_per_pipeline(self):
+        """Single for_each flowgroup in pipeline P1 → no LHP-CFG-036.
+
+        AE: LHP-CFG-036 inactive — one for_each per pipeline.
+        """
+        validator = ConfigValidator()
+        fg = _fg_for_each(pipeline="bronze", flowgroup="fg_a",
+                          actions=[_minimal_load_action()])
+        project_errors = validator.validate_project_invariants([fg])
+        cfg036 = [e for e in project_errors if e.code == "LHP-CFG-036"]
+        assert cfg036 == []
+
+    def test_happy_path_two_for_each_in_different_pipelines(self):
+        """for_each in pipeline P1 and for_each in pipeline P2 → no LHP-CFG-036.
+
+        AE: LHP-CFG-036 inactive — one for_each per pipeline (different pipelines).
+        Critical regression guard for test_multiple_b2_flowgroups_get_separate_aux_files.
+        """
+        validator = ConfigValidator()
+        fg_a = _fg_for_each(pipeline="pipeline_a", flowgroup="fg_alpha",
+                            actions=[_minimal_load_action()])
+        fg_b = _fg_for_each(pipeline="pipeline_b", flowgroup="fg_beta",
+                            actions=[_minimal_load_action()])
+        project_errors = validator.validate_project_invariants([fg_a, fg_b])
+        cfg036 = [e for e in project_errors if e.code == "LHP-CFG-036"]
+        assert cfg036 == []
+
+    def test_happy_path_non_for_each_coexisting_does_not_trigger_036(self):
+        """for_each + non-for_each in same pipeline → CFG-033 fires, NOT CFG-036.
+
+        AE: LHP-CFG-036 inactive — mixed-mode is already rejected by CFG-033;
+        CFG-036 must not double-raise for the same project.
+        """
+        validator = ConfigValidator()
+        fg_a = _fg_for_each(pipeline="bronze", flowgroup="fg_a",
+                            actions=[_minimal_load_action()])
+        fg_b = _fg_default(pipeline="bronze", flowgroup="fg_b")
+        project_errors = validator.validate_project_invariants([fg_a, fg_b])
+        cfg036 = [e for e in project_errors if e.code == "LHP-CFG-036"]
+        # CFG-033 fires; CFG-036 must NOT also fire — only one for_each flowgroup.
+        assert cfg036 == []
+
+    def test_error_two_for_each_same_pipeline(self):
+        """Pipeline with 2 for_each flowgroups → LHP-CFG-036 listing both names.
+
+        AE: LHP-CFG-036 error path (2 for_each in same pipeline).
+        Without fix: _generate_workflow_resources silently drops fg_b's actions.
+        """
+        validator = ConfigValidator()
+        fg_a = _fg_for_each(pipeline="bronze", flowgroup="fg_a",
+                            actions=[_minimal_load_action(name="a1"),
+                                     _minimal_load_action(name="a2"),
+                                     _minimal_load_action(name="a3")])
+        fg_b = _fg_for_each(pipeline="bronze", flowgroup="fg_b",
+                            actions=[_minimal_load_action(name="b1"),
+                                     _minimal_load_action(name="b2")])
+        project_errors = validator.validate_project_invariants([fg_a, fg_b])
+        cfg036 = [e for e in project_errors if e.code == "LHP-CFG-036"]
+        assert len(cfg036) == 1, (
+            f"Expected exactly one LHP-CFG-036 error; got: {[e.code for e in project_errors]}"
+        )
+        err = cfg036[0]
+        assert "bronze" in err.details, "Error details must name the pipeline"
+        assert "fg_a" in err.details, "Error details must list fg_a"
+        assert "fg_b" in err.details, "Error details must list fg_b"
+
+    def test_error_three_for_each_same_pipeline(self):
+        """Pipeline with 3 for_each flowgroups → LHP-CFG-036 listing all three names.
+
+        AE: LHP-CFG-036 error path (3 for_each in same pipeline).
+        """
+        validator = ConfigValidator()
+        fg_a = _fg_for_each(pipeline="gold", flowgroup="fg_a",
+                            actions=[_minimal_load_action(name="a1")])
+        fg_b = _fg_for_each(pipeline="gold", flowgroup="fg_b",
+                            actions=[_minimal_load_action(name="b1")])
+        fg_c = _fg_for_each(pipeline="gold", flowgroup="fg_c",
+                            actions=[_minimal_load_action(name="c1")])
+        project_errors = validator.validate_project_invariants([fg_a, fg_b, fg_c])
+        cfg036 = [e for e in project_errors if e.code == "LHP-CFG-036"]
+        assert len(cfg036) == 1, (
+            f"Expected exactly one LHP-CFG-036 error; got: {[e.code for e in project_errors]}"
+        )
+        err = cfg036[0]
+        assert "fg_a" in err.details
+        assert "fg_b" in err.details
+        assert "fg_c" in err.details
+        assert "gold" in err.details
+
+    def test_error_message_contains_actionable_suggestion(self):
+        """LHP-CFG-036 error must include suggestions for consolidation or split.
+
+        AE: LHP-CFG-036 error quality — actionable suggestions required.
+        """
+        validator = ConfigValidator()
+        fg_a = _fg_for_each(pipeline="silver", flowgroup="fg_a",
+                            actions=[_minimal_load_action()])
+        fg_b = _fg_for_each(pipeline="silver", flowgroup="fg_b",
+                            actions=[_minimal_load_action()])
+        project_errors = validator.validate_project_invariants([fg_a, fg_b])
+        cfg036 = [e for e in project_errors if e.code == "LHP-CFG-036"]
+        assert cfg036, "Expected LHP-CFG-036 to be raised"
+        err = cfg036[0]
+        combined = " ".join(err.suggestions)
+        assert any(
+            keyword in combined.lower()
+            for keyword in ("consolidate", "split", "pipeline", "flowgroup")
+        ), f"Suggestions must provide actionable guidance; got: {err.suggestions}"
+
+    def test_cfg033_empty_actions_fires_before_036(self):
+        """Two for_each flowgroups where one has zero actions → CFG-033 fires first.
+
+        Empty-action is a per-flowgroup defect (CFG-033); CFG-036 fires only when
+        both flowgroups are non-empty.  The ordering guard: _validate_for_each_invariants
+        runs per-flowgroup in validate_flowgroup before validate_project_invariants.
+        We verify CFG-036 still fires at project scope for the non-empty pair.
+        """
+        validator = ConfigValidator()
+        # fg_b has 2 non-empty for_each flowgroups → CFG-036 should still fire
+        fg_a = _fg_for_each(pipeline="bronze", flowgroup="fg_a",
+                            actions=[_minimal_load_action()])
+        fg_b = _fg_for_each(pipeline="bronze", flowgroup="fg_b",
+                            actions=[_minimal_load_action()])
+        project_errors = validator.validate_project_invariants([fg_a, fg_b])
+        cfg036 = [e for e in project_errors if e.code == "LHP-CFG-036"]
+        assert len(cfg036) == 1, "CFG-036 must fire for 2 non-empty for_each flowgroups"

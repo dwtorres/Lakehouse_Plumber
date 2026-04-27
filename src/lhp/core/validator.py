@@ -570,11 +570,15 @@ class ConfigValidator:
     ) -> List[LHPError]:
         """Run project-scope for_each validation across all flowgroups.
 
-        Covers two checks that require visibility across the full project:
+        Covers checks that require visibility across the full project:
 
         * **LHP-CFG-032**: Two for_each flowgroups produce the same composite
           ``<pipeline>::<flowgroup>`` (renamed mid-development collision).
         * **LHP-CFG-033**: A pipeline mixes for_each and non-for_each flowgroups.
+        * **LHP-CFG-036**: A pipeline contains 2+ for_each flowgroups (the DAB
+          workflow generator emits one workflow YAML per pipeline keyed on the
+          first flowgroup; additional for_each flowgroups would silently not
+          execute).
 
         Per-flowgroup checks (LHP-CFG-031, count, concurrency, shared-keys) are
         handled earlier inside ``_validate_for_each_invariants`` which is called
@@ -658,6 +662,76 @@ class ConfigValidator:
                         ],
                     )
                 )
+
+        # LHP-CFG-036: at most one for_each flowgroup per pipeline.
+        # The DAB workflow generator keys pipeline_name_map by pipeline name;
+        # only the first for_each flowgroup's aux files are referenced in the
+        # emitted workflow YAML.  Additional for_each flowgroups in the same
+        # pipeline would silently never execute.
+        errors.extend(self._validate_for_each_per_pipeline_uniqueness(for_each_fgs))
+
+        return errors
+
+    def _validate_for_each_per_pipeline_uniqueness(
+        self, for_each_flowgroups: List[FlowGroup]
+    ) -> List[LHPError]:
+        """Return LHP-CFG-036 errors for pipelines with 2+ for_each flowgroups.
+
+        Empty-action flowgroups raise LHP-CFG-033 earlier in per-flowgroup
+        validation (``_validate_for_each_invariants``).  This method checks
+        purely at project scope and fires regardless of action count so that
+        operators who bypass per-flowgroup validation still see the error.
+
+        Args:
+            for_each_flowgroups: All FlowGroup objects whose execution_mode is
+                ``for_each``, across all pipelines in the project.
+
+        Returns:
+            List of LHPConfigError instances; one per violating pipeline.
+        """
+        errors: List[LHPError] = []
+
+        pipeline_for_each_fgs: Dict[str, List[str]] = defaultdict(list)
+        for fg in for_each_flowgroups:
+            pipeline_for_each_fgs[fg.pipeline].append(fg.flowgroup)
+
+        for pipeline_name, fg_names in pipeline_for_each_fgs.items():
+            if len(fg_names) < 2:
+                continue
+            count = len(fg_names)
+            fg_list = ", ".join(fg_names)
+            errors.append(
+                LHPConfigError(
+                    category=ErrorCategory.CONFIG,
+                    code_number="036",
+                    title="Pipeline has multiple for_each flowgroups",
+                    details=(
+                        f"Pipeline '{pipeline_name}' has {count} flowgroups with "
+                        f"execution_mode: for_each ({fg_list}). LHP currently supports "
+                        "at most one for_each flowgroup per pipeline (the DAB workflow "
+                        "generator emits one workflow YAML per pipeline, keyed on the "
+                        "first flowgroup; remaining flowgroups would not execute). "
+                        "To fix, either: (a) consolidate the for_each actions into a "
+                        "single flowgroup if they share orchestration concerns; or "
+                        "(b) split each flowgroup into its own pipeline if they are "
+                        "organizationally distinct (e.g., separate source systems). "
+                        "If you have a use case requiring multiple for_each flowgroups "
+                        "per pipeline, please file an issue describing the scenario."
+                    ),
+                    context={
+                        "pipeline": pipeline_name,
+                        "for_each_flowgroup_count": count,
+                        "for_each_flowgroups": fg_names,
+                    },
+                    suggestions=[
+                        "Consolidate the for_each actions into a single flowgroup if "
+                        "they share orchestration concerns (same source system, same "
+                        "watermark catalog, same landing path root).",
+                        "Split each flowgroup into its own pipeline if they are "
+                        "organizationally distinct (e.g., separate source systems).",
+                    ],
+                )
+            )
 
         return errors
 
