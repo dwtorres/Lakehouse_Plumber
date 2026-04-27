@@ -256,14 +256,21 @@ running off-peak. They do not block extraction jobs.
 
 | Error code | Cause | Resolution |
 |-----------|-------|------------|
-| LHP-CFG-031 | `::` in pipeline or flowgroup name | Rename to remove `::` — use `-` or `_` as separator instead |
-| LHP-CFG-032 | Two `for_each` flowgroups produce the same `<pipeline>::<flowgroup>` composite | Rename one flowgroup or pipeline so the composite is unique across the project |
-| LHP-CFG-033 | Action count, shared-key disagreement, concurrency out of bounds, or mixed execution_mode in same pipeline | See error message detail; common fixes: split flowgroup if >300 actions, set `concurrency` in 1-100, or move non-`for_each` flowgroups to a separate pipeline |
-| LHP-CFG-034 | Orchestrator-time mixed-mode guard fired (validator missed the condition) | Move `for_each` flowgroups into a separate pipeline; also file an issue if LHP-CFG-033 did not fire first |
-| LHP-VAL-050 | Validate failed: `completed_n != expected` or `failed_n > 0` | Inspect `failed_actions` array in validate summary JSON; check per-iteration logs in Databricks Jobs UI for the failing iteration |
-| LHP-VAL-04B | Parity check failed: JDBC row count does not match landed parquet row count | Inspect `parity_mismatches` in validate summary; check source for late-arriving writes or truncation during the batch window |
-| LHP-MAN-001 | Manifest MERGE retry budget exhausted in `prepare_manifest` | Reduce `concurrency` (lower concurrent Delta commits); inspect Delta concurrent-commit metrics in the cluster Spark UI |
-| LHP-MAN-002 | Manifest UPDATE matches zero rows (race condition) | Check DAB retry behavior; this is usually a transient race — the job typically self-resolves on next attempt; if persistent, check `b2_manifests` for orphaned rows with mismatched `batch_id` |
+| LHP-CFG-031 | `::` in pipeline or flowgroup name | Rename to remove `::` — use `-` or `_` as separator instead. See [errors_reference.rst](../errors_reference.rst#lhp-cfg-031-separator-collision-in-for-each-pipeline-or-flowgroup-name) |
+| LHP-CFG-032 | Two `for_each` flowgroups produce the same `<pipeline>::<flowgroup>` composite | Rename one flowgroup or pipeline so the composite is unique. See [errors_reference.rst](../errors_reference.rst#lhp-cfg-032-composite-load-group-not-unique-within-project) |
+| LHP-CFG-033 | Action count, shared-key disagreement, concurrency out of bounds, or mixed execution_mode in same pipeline | See error message detail and [errors_reference.rst](../errors_reference.rst#lhp-cfg-033-for-each-post-expansion-structural-violation) for sub-check resolutions |
+| LHP-CFG-034 | Orchestrator-time mixed-mode guard fired (validator missed the condition) | Move `for_each` flowgroups into a separate pipeline; file an issue if LHP-CFG-033 did not fire first. See [errors_reference.rst](../errors_reference.rst#lhp-cfg-034-mixed-execution-mode-flowgroups-in-same-pipeline-orchestrator) |
+| LHP-CFG-035 | Non-strict watermark operator (`>=` or `<=`) on a `for_each` action | Set `watermark.operator: ">"`. See [errors_reference.rst](../errors_reference.rst#lhp-cfg-035-non-strict-watermark-operator-for-execution-mode-for-each) |
+| LHP-CFG-036 | Pipeline contains two or more `for_each` flowgroups | Consolidate into one flowgroup or split each into its own pipeline. See [errors_reference.rst](../errors_reference.rst#lhp-cfg-036-pipeline-contains-multiple-for-each-flowgroups) |
+| LHP-VAL-048 | `batch_id` taskValue absent in validate task | Confirm `prepare_manifest` succeeded and is a dependency of `validate`. See [errors_reference.rst](../errors_reference.rst#lhp-val-048-b2-validate-batch-id-taskvalue-absent) |
+| LHP-VAL-049 | Parity check enabled but not yet implemented | Set `workflow.parity_check_enabled: false`. See [errors_reference.rst](../errors_reference.rst#lhp-val-049-parity-check-not-yet-implemented) |
+| LHP-VAL-050 | Validate failed: `completed_n != expected` or `failed_n > 0` | Inspect `unfinished_actions` in validate summary JSON; check per-iteration logs in Databricks Jobs UI. See [errors_reference.rst](../errors_reference.rst#lhp-val-050-b2-validate-failed) |
+| LHP-VAL-04B | Parity check failed: JDBC row count does not match landed parquet row count _(future — not yet implemented; superseded by LHP-VAL-049)_ | Inspect `parity_mismatches` in validate summary; check source for late-arriving writes or truncation during the batch window |
+| LHP-MAN-001 | Manifest MERGE retry budget exhausted in `prepare_manifest` | Reduce `concurrency`; inspect Delta concurrent-commit metrics. See [errors_reference.rst](../errors_reference.rst#lhp-man-001-manifest-merge-retry-budget-exhausted) |
+| LHP-MAN-002 | Manifest claim ownership conflict — competing worker owns the row | Usually transient; re-run failed iterations. If persistent, reset the manifest row. See [errors_reference.rst](../errors_reference.rst#lhp-man-002-manifest-claim-ownership-conflict) |
+| LHP-MAN-003 | Manifest row missing for action after claim UPDATE | Re-run full workflow from beginning; check that `prepare_manifest` succeeded. See [errors_reference.rst](../errors_reference.rst#lhp-man-003-manifest-row-missing-for-action) |
+| LHP-MAN-004 | Completion mirror MERGE retry exhausted; manifest row stuck in `running` | Reduce `concurrency`; manually correct manifest row if watermark shows completed. See [errors_reference.rst](../errors_reference.rst#lhp-man-004-completion-mirror-merge-retry-budget-exhausted) |
+| LHP-MAN-005 | Projected or actual `iterations` taskValue payload exceeds DAB 48 KB ceiling | Reduce action count or shorten field identifiers. At runtime: DELETE orphaned manifest rows and redeploy. See [errors_reference.rst](../errors_reference.rst#lhp-man-005-manifest-taskvalue-payload-exceeds-dab-48-kb-ceiling) |
 
 ---
 
