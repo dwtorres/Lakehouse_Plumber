@@ -5,7 +5,7 @@ Spark/dbutils using runpy.run_path — no Databricks runtime required.
 
 Scenarios:
   - Happy path (3 completed): batch fully done → exit with status "pass"
-  - 1 failed: RuntimeError raised matching LHP-VAL-04A; unfinished_actions populated
+  - 1 failed: RuntimeError raised matching LHP-VAL-050; unfinished_actions populated
   - 1 unfinished (running): RuntimeError raised (unfinished_n > 0)
   - Manifest-only pending (worker never started): final_status='pending' → raise
   - Empty batch: validate query returns (0,0,0,0) → exit with status "noop_pass"
@@ -316,8 +316,8 @@ def test_happy_path_3_completed_exits_pass() -> None:
 # ---------- test: 1 failed ---------------------------------------------------
 
 
-def test_one_failed_raises_lhp_val_04a() -> None:
-    """1 failed action → RuntimeError with LHP-VAL-04A; unfinished_actions list populated."""
+def test_one_failed_raises_lhp_val_050() -> None:
+    """1 failed action → RuntimeError with LHP-VAL-050; unfinished_actions list populated."""
     rendered = _render()
     spark = _ScriptedSpark(
         script=[
@@ -333,7 +333,7 @@ def test_one_failed_raises_lhp_val_04a() -> None:
         _run_rendered(rendered, spark, dbutils)
 
     msg = str(exc_info.value)
-    assert "LHP-VAL-04A" in msg, f"Expected LHP-VAL-04A error code; got: {msg}"
+    assert "LHP-VAL-050" in msg, f"Expected LHP-VAL-050 error code; got: {msg}"
 
     # Extract the JSON summary from the error message.
     json_match = re.search(r"\{.*\}", msg, re.DOTALL)
@@ -351,7 +351,7 @@ def test_one_failed_raises_lhp_val_04a() -> None:
 
 
 def test_one_unfinished_running_raises() -> None:
-    """1 running action → RuntimeError with LHP-VAL-04A (unfinished_n > 0)."""
+    """1 running action → RuntimeError with LHP-VAL-050 (unfinished_n > 0)."""
     rendered = _render()
     spark = _ScriptedSpark(
         script=[
@@ -367,7 +367,7 @@ def test_one_unfinished_running_raises() -> None:
         _run_rendered(rendered, spark, dbutils)
 
     msg = str(exc_info.value)
-    assert "LHP-VAL-04A" in msg
+    assert "LHP-VAL-050" in msg
 
     json_match = re.search(r"\{.*\}", msg, re.DOTALL)
     assert json_match
@@ -398,7 +398,7 @@ def test_manifest_pending_worker_null_raises() -> None:
     with pytest.raises(RuntimeError) as exc_info:
         _run_rendered(rendered, spark, dbutils)
 
-    assert "LHP-VAL-04A" in str(exc_info.value)
+    assert "LHP-VAL-050" in str(exc_info.value)
 
 
 # ---------- test: empty batch (expected == 0) --------------------------------
@@ -542,4 +542,23 @@ def test_parity_block_present_when_enabled() -> None:
     assert "LHP-VAL-049" in rendered, (
         "parity_check_enabled=True must include the NotImplementedError parity guard; "
         "LHP-VAL-049 not found in rendered source"
+    )
+
+
+# ---------- test: LHP-VAL-050 rename guard (U2) --------------------------------
+
+
+def test_error_code_renamed_val_050() -> None:
+    """Rendered notebook must contain LHP-VAL-050 and must NOT contain LHP-VAL-04A.
+
+    Regression guard for the U2 rename (alphanumeric VAL-04A → numeric VAL-050).
+    """
+    rendered = _render()
+    assert "LHP-VAL-050" in rendered, (
+        "Expected LHP-VAL-050 in rendered validate notebook; "
+        "template rename from LHP-VAL-04A may not have been applied"
+    )
+    assert "LHP-VAL-04A" not in rendered, (
+        "LHP-VAL-04A must not appear in rendered validate notebook; "
+        "rename to LHP-VAL-050 was not applied"
     )

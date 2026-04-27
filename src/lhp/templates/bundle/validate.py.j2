@@ -26,7 +26,7 @@
      4. Validate query: LEFT JOIN manifest → watermarks on worker_run_id,
         coalesce(worker_status, manifest_status) → aggregate pass/fail counts
      5. Pass gate: expected==0 → noop_pass; all completed + no failures → pass;
-        else → raise RuntimeError with LHP-VAL-04A (lists every unfinished action)
+        else → raise RuntimeError with LHP-VAL-050 (lists every unfinished action)
      6. Optional parity check ({% if parity_check_enabled %}) — raises
         NotImplementedError until the landed-parquet row-count source ships
    ──────────────────────────────────────────────────────────────────────────
@@ -219,7 +219,7 @@ if not (completed_n == expected and failed_n == 0 and unfinished_n == 0):
         for r in _unfinished_actions
     ]
     print(f"validate: FAIL — {json.dumps(_summary)}")
-    raise RuntimeError(f"LHP-VAL-04A: B2 validate failed — {json.dumps(_summary)}")
+    raise RuntimeError(f"LHP-VAL-050: B2 validate failed — {json.dumps(_summary)}")
 
 # COMMAND ----------
 {% if parity_check_enabled %}
