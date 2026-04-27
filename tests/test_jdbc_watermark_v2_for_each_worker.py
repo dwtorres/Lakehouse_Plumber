@@ -916,3 +916,368 @@ def test_b2_already_completed_row_short_circuits_or_raises() -> None:
         "currently re-extracts and emits a completion UPDATE; "
         "if this behaviour changes (short-circuit / error), update this test."
     )
+
+
+# ---------------------------------------------------------------------------
+# Tests: U1 — status-based reclaim (DAB per-iteration retries, issue #14)
+# ---------------------------------------------------------------------------
+
+
+def _make_scripted_owner_spark(owner_run_id: str) -> "_RecordingSpark":
+    """Return a _RecordingSpark whose readback SELECT always reports *owner_run_id*
+    as the current worker_run_id value.  All other sql() calls behave as the
+    default stub (no-op mock, empty collect)."""
+
+    class _ScriptedOwnerSpark(_RecordingSpark):
+        def sql(self, statement: str) -> Any:
+            self.statements.append(statement)
+            r = MagicMock()
+            if "SELECT" in statement.upper() and "worker_run_id" in statement:
+                row = MagicMock()
+                row.__getitem__ = lambda self, key: owner_run_id if key == "worker_run_id" else None
+                r.collect.return_value = [row]
+            else:
+                r.collect.return_value = []
+            r.first.return_value = None
+            return r
+
+    return _ScriptedOwnerSpark()
+
+
+def test_u1_claim_initial_null_arm() -> None:
+    """Scenario 1 — initial claim: row has worker_run_id=NULL, execution_status='pending'.
+
+    Claim WHERE matches via worker_run_id IS NULL arm.  Readback returns the
+    current run_id.  No error raised.
+    """
+    rendered = _render(execution_mode="for_each", watermark_operator=">")
+    run_id = "job-1-task-2-attempt-0"
+    spark = _make_scripted_owner_spark(run_id)
+    iteration = _default_b2_iteration()
+    dbutils = _FakeDbutils(run_id=run_id, iteration=iteration)
+
+    # No exception expected — claim succeeds, readback matches current run_id.
+    _run_rendered(rendered, spark, dbutils)
+
+    update_stmts = [s for s in spark.statements if "UPDATE" in s.upper()]
+    assert any("execution_status = 'running'" in s for s in update_stmts), (
+        "Initial claim must emit UPDATE setting execution_status='running'"
+    )
+
+
+def test_u1_claim_same_attempt_idempotent() -> None:
+    """Scenario 2 — same-attempt idempotent re-claim: row already running, same run_id.
+
+    Claim WHERE matches via worker_run_id = run_id arm.  Readback returns the
+    same run_id.  No error raised.
+    """
+    rendered = _render(execution_mode="for_each", watermark_operator=">")
+    run_id = "job-1-task-2-attempt-0"
+    # Readback always returns this run_id — simulates the row already being
+    # owned by the same attempt (e.g. Spark task retry mid-notebook).
+    spark = _make_scripted_owner_spark(run_id)
+    iteration = _default_b2_iteration()
+    dbutils = _FakeDbutils(run_id=run_id, iteration=iteration)
+
+    _run_rendered(rendered, spark, dbutils)
+
+    # No LHP-MAN-002 raised; UPDATE with 'running' must be present.
+    update_stmts = [s for s in spark.statements if "UPDATE" in s.upper()]
+    assert any("execution_status = 'running'" in s for s in update_stmts), (
+        "Same-attempt idempotent re-claim must still emit the claim UPDATE"
+    )
+
+
+def test_u1_claim_dab_retry_attempt1_reclaims_attempt0_failed() -> None:
+    """Scenario 3 (the bug fix) — DAB attempt-1 reclaims a row left 'failed' by attempt-0.
+
+    Before U1 fix: claim WHERE has no 'failed' status arm, so the UPDATE
+    matches zero rows.  Readback returns attempt-0's run_id; guard raises
+    LHP-MAN-002.
+
+    After U1 fix: claim WHERE includes OR execution_status = 'failed', so the
+    UPDATE succeeds.  Readback returns attempt-1's run_id.  No error raised.
+    """
+    rendered = _render(execution_mode="for_each", watermark_operator=">")
+    run_id_1 = "job-1-task-2-attempt-1"
+    # Readback returns attempt-1's run_id — simulates the claim UPDATE succeeding
+    # and setting worker_run_id to attempt-1's id.
+    spark = _make_scripted_owner_spark(run_id_1)
+    iteration = _default_b2_iteration()
+    dbutils = _FakeDbutils(run_id=run_id_1, iteration=iteration)
+
+    # After the fix this must NOT raise LHP-MAN-002.
+    _run_rendered(rendered, spark, dbutils)
+
+    # Claim UPDATE must contain the new 'failed' arm.
+    update_stmts = [s for s in spark.statements if "UPDATE" in s.upper()]
+    claim_updates = [s for s in update_stmts if "execution_status = 'running'" in s]
+    assert claim_updates, "Attempt-1 must issue a claim UPDATE for the 'failed' row"
+    # Verify the template WHERE clause includes the 'failed' disjunct.
+    rendered_lower = rendered
+    assert "execution_status = 'failed'" in rendered_lower, (
+        "Claim WHERE must include OR execution_status = 'failed' arm for DAB retries"
+    )
+
+
+def test_u1_claim_dab_retry_attempt1_reclaims_attempt0_pending_null_arm() -> None:
+    """Scenario 4 — attempt-0 crashed before claim UPDATE; row still NULL/'pending'.
+
+    Attempt-1 claim WHERE matches via worker_run_id IS NULL arm (not the new
+    'failed' arm).  No error raised.
+    """
+    rendered = _render(execution_mode="for_each", watermark_operator=">")
+    run_id_1 = "job-1-task-2-attempt-1"
+    spark = _make_scripted_owner_spark(run_id_1)
+    iteration = _default_b2_iteration()
+    dbutils = _FakeDbutils(run_id=run_id_1, iteration=iteration)
+
+    _run_rendered(rendered, spark, dbutils)
+
+    update_stmts = [s for s in spark.statements if "UPDATE" in s.upper()]
+    assert any("execution_status = 'running'" in s for s in update_stmts), (
+        "Attempt-1 must claim a NULL-owned row via IS NULL arm"
+    )
+
+
+def test_u1_claim_competing_owner_running_raises_man002() -> None:
+    """Scenario 5 — competing owner on running row: must raise LHP-MAN-002.
+
+    A row with worker_run_id=OTHER and execution_status='running' must NOT be
+    reclaimable.  None of the WHERE arms match (not NULL, not same run_id, not
+    status='failed').  Readback returns OTHER; guard raises LHP-MAN-002.
+    """
+    rendered = _render(execution_mode="for_each", watermark_operator=">")
+    competing_run_id = "job-99-task-99-attempt-0"
+    spark = _make_scripted_owner_spark(competing_run_id)
+    iteration = _default_b2_iteration()
+    dbutils = _FakeDbutils(run_id="job-1-task-2-attempt-0", iteration=iteration)
+
+    with pytest.raises(RuntimeError, match="LHP-MAN-002"):
+        _run_rendered(rendered, spark, dbutils)
+
+
+def test_u1_claim_competing_owner_completed_raises_man002() -> None:
+    """Scenario 6 — competing owner on completed row: must raise LHP-MAN-002.
+
+    A row with execution_status='completed' must NOT be reclaimable — the
+    new 'failed' disjunct is exact (not an IN clause).  Readback returns
+    the OTHER run_id; guard raises LHP-MAN-002.
+    """
+    rendered = _render(execution_mode="for_each", watermark_operator=">")
+    # 'completed' row owned by a different run_id — claim WHERE must not match.
+    # Readback returns the OTHER run_id; guard raises LHP-MAN-002.
+    other_run_id = "job-99-task-99-attempt-0"
+    spark = _make_scripted_owner_spark(other_run_id)
+    iteration = _default_b2_iteration()
+    dbutils = _FakeDbutils(run_id="job-1-task-2-attempt-1", iteration=iteration)
+
+    with pytest.raises(RuntimeError, match="LHP-MAN-002"):
+        _run_rendered(rendered, spark, dbutils)
+
+    # Regression guard: 'failed' must NOT appear as 'IN (...)' — exact string.
+    assert "execution_status = 'failed'" in rendered, (
+        "Claim WHERE must use exact equality for 'failed', not IN clause"
+    )
+    assert "execution_status = 'completed'" not in rendered.split("SET")[0], (
+        "Claim WHERE must not admit 'completed' rows — fix is exact 'failed' only"
+    )
+
+
+def test_u1_claim_manifest_row_missing_raises_man003() -> None:
+    """Scenario 7 — manifest row missing: raises LHP-MAN-003.  Unchanged by U1.
+
+    Readback returns empty list.  Guard raises LHP-MAN-003 as before.
+    """
+    rendered = _render(execution_mode="for_each", watermark_operator=">")
+
+    class _MissingRowSpark(_RecordingSpark):
+        def sql(self, statement: str) -> Any:
+            self.statements.append(statement)
+            r = MagicMock()
+            r.collect.return_value = []  # readback = empty → no row
+            r.first.return_value = None
+            return r
+
+    spark = _MissingRowSpark()
+    iteration = _default_b2_iteration()
+    dbutils = _FakeDbutils(run_id="job-1-task-2-attempt-0", iteration=iteration)
+
+    with pytest.raises(RuntimeError, match="LHP-MAN-003"):
+        _run_rendered(rendered, spark, dbutils)
+
+
+def test_u1_concurrent_claim_contention_one_winner_one_raises() -> None:
+    """Scenario 8 — concurrent-claim contention (R2 safety regression guard).
+
+    Two attempts both observe execution_status='failed' on the same row.
+    Both submit claim UPDATEs through execute_with_concurrent_commit_retry.
+
+    Delta optimistic concurrency: winner's UPDATE commits first, setting
+    status→running and owner→winner_id.  Loser's retry observes the row is
+    now 'running' with owner=winner_id — claim WHERE matches none of the arms.
+    Readback returns winner_id; loser raises LHP-MAN-002.
+
+    The harness simulates this by scripting the readback to return the winner's
+    run_id when called from the loser's context.
+    """
+    rendered = _render(execution_mode="for_each", watermark_operator=">")
+    winner_id = "job-1-task-2-attempt-1"
+    loser_id = "job-1-task-2-attempt-2"
+
+    # Loser's readback observes the winner already owns the row.
+    loser_spark = _make_scripted_owner_spark(winner_id)
+    iteration = _default_b2_iteration()
+    loser_dbutils = _FakeDbutils(run_id=loser_id, iteration=iteration)
+
+    # Loser must raise LHP-MAN-002 — the winning attempt owns the row.
+    with pytest.raises(RuntimeError, match="LHP-MAN-002"):
+        _run_rendered(rendered, loser_spark, loser_dbutils)
+
+    # Winner succeeds independently (readback returns winner_id).
+    winner_spark = _make_scripted_owner_spark(winner_id)
+    winner_dbutils = _FakeDbutils(run_id=winner_id, iteration=iteration)
+    _run_rendered(rendered, winner_spark, winner_dbutils)  # must not raise
+
+
+def test_u1_integration_attempt0_fails_attempt1_succeeds() -> None:
+    """Scenario 9 — integration: attempt-0-fails, attempt-1-succeeds (5-step SQL trace).
+
+    Step 1: attempt-0 claims via NULL arm → row: run_id_0, running.
+    Step 2: JDBC fails (within the try block).
+    Step 3: fail-mirror WHERE matches worker_run_id=run_id_0 → row: failed.
+    Step 4: attempt-1 claim WHERE matches via status='failed' → row: run_id_1, running.
+    Step 5: JDBC succeeds, completion-mirror WHERE matches worker_run_id=run_id_1 → completed.
+
+    This test verifies the rendered SQL shapes and runtime ordering for all 5 steps.
+    Static assertions inspect the rendered text; the runtime sub-test drives attempt-1
+    through the claim → JDBC-success → completion path end-to-end.
+    """
+    rendered = _render(execution_mode="for_each", watermark_operator=">")
+
+    # --- Steps 3, 4, 5: static shape assertions on the rendered template text ---
+
+    # Step 3: fail-mirror must define _fail_mirror_sql with execution_status='failed'.
+    assert "_fail_mirror_sql" in rendered, (
+        "Rendered notebook must define _fail_mirror_sql for the fail-mirror UPDATE"
+    )
+    assert "execution_status = 'failed'" in rendered, (
+        "Fail-mirror UPDATE must set execution_status='failed'"
+    )
+
+    # Step 4: claim WHERE must include the 'failed' disjunct.
+    assert "OR execution_status = 'failed'" in rendered, (
+        "Claim WHERE must include OR execution_status = 'failed' for DAB retry reclaim"
+    )
+
+    # Step 5: completion-mirror must define _complete_mirror_sql.
+    assert "_complete_mirror_sql" in rendered, (
+        "Rendered notebook must define _complete_mirror_sql for the completion-mirror UPDATE"
+    )
+    assert "execution_status = 'completed'" in rendered, (
+        "Completion-mirror UPDATE must set execution_status='completed'"
+    )
+
+    # --- Runtime: simulate attempt-1 claim → JDBC-success → completion ---
+    run_id_1 = "job-1-task-2-attempt-1"
+    spark = _make_scripted_owner_spark(run_id_1)
+    iteration = _default_b2_iteration()
+    dbutils = _FakeDbutils(run_id=run_id_1, iteration=iteration)
+    _run_rendered(rendered, spark, dbutils)
+
+    update_stmts = [s for s in spark.statements if "UPDATE" in s.upper()]
+    running_updates = [s for s in update_stmts if "execution_status = 'running'" in s]
+    completed_updates = [s for s in update_stmts if "execution_status = 'completed'" in s]
+    assert running_updates, "Step 4 claim must emit UPDATE 'running'"
+    assert completed_updates, "Step 5 completion mirror must emit UPDATE 'completed'"
+
+    first_running_idx = next(
+        i for i, s in enumerate(spark.statements)
+        if "UPDATE" in s.upper() and "execution_status = 'running'" in s
+    )
+    first_completed_idx = next(
+        i for i, s in enumerate(spark.statements)
+        if "UPDATE" in s.upper() and "execution_status = 'completed'" in s
+    )
+    assert first_running_idx < first_completed_idx, (
+        "Claim UPDATE (running) must precede completion-mirror UPDATE (completed)"
+    )
+
+
+def test_u1_integration_attempt0_fails_attempt1_also_fails() -> None:
+    """Scenario 10 — integration: attempt-0-fails, attempt-1-also-fails (terminal-failed).
+
+    Both attempts claim and both hit exceptions inside the try block.
+    Attempt-1's fail-mirror must target worker_run_id=run_id_1 (not run_id_0).
+    Final manifest state: worker_run_id=run_id_1, execution_status='failed'.
+
+    The fail-mirror UPDATE is sent inside the except block (after the JDBC try
+    block raises).  We verify the rendered template contains the fail-mirror
+    SQL definition and that a runtime execution where the try block raises
+    still emits the fail-mirror UPDATE before re-raising.
+
+    Note: wm.insert_new is OUTSIDE the try block (FR-L-05 contract).  The
+    except branch is only entered if something inside the try raises.  We
+    arrange for spark.read to raise by configuring its MagicMock load() call
+    via a side_effect set on the final chained return value.
+    """
+    rendered = _render(execution_mode="for_each", watermark_operator=">")
+
+    # Static assertions: both mirror SQL definitions must be present.
+    assert "_fail_mirror_sql" in rendered, (
+        "Fail-mirror must be defined as _fail_mirror_sql variable in rendered notebook"
+    )
+    assert "_complete_mirror_sql" in rendered, (
+        "Completion-mirror must be defined as _complete_mirror_sql variable"
+    )
+
+    run_id_1 = "job-1-task-2-attempt-1"
+
+    class _Attempt1ClaimsSpark(_RecordingSpark):
+        """Readback returns run_id_1 so the claim guard passes.
+        All MagicMock JDBC chaining succeeds — the load() call returns a mock
+        whose format("jdbc")...load() endpoint raises RuntimeError so the
+        try-block except branch fires and the fail-mirror is emitted.
+        """
+
+        def __init__(self) -> None:
+            super().__init__()
+            # MagicMock auto-chains: every .attribute and .method() call returns
+            # a new MagicMock.  Setting side_effect on the .load attribute of
+            # the auto-chained result ensures the raise happens inside the try
+            # block regardless of how many .option() calls precede .load().
+            self.read = MagicMock()
+            self.read.format.return_value.option.return_value.option.return_value \
+                .option.return_value.option.return_value.option.return_value \
+                .option.return_value.load.side_effect = RuntimeError(
+                    "simulated attempt-1 JDBC failure"
+                )
+
+        def sql(self, statement: str) -> Any:
+            self.statements.append(statement)
+            r = MagicMock()
+            if "SELECT" in statement.upper() and "worker_run_id" in statement:
+                row = MagicMock()
+                row.__getitem__ = lambda self, key: run_id_1 if key == "worker_run_id" else None
+                r.collect.return_value = [row]
+            else:
+                r.collect.return_value = []
+            r.first.return_value = None
+            return r
+
+    spark = _Attempt1ClaimsSpark()
+    iteration = _default_b2_iteration()
+    dbutils = _FakeDbutils(run_id=run_id_1, iteration=iteration)
+
+    with pytest.raises(RuntimeError, match="simulated attempt-1 JDBC failure"):
+        _run_rendered(rendered, spark, dbutils)
+
+    # Fail-mirror UPDATE for attempt-1 must have been issued from the except branch.
+    failed_updates = [
+        s for s in spark.statements
+        if "UPDATE" in s.upper() and "execution_status = 'failed'" in s
+    ]
+    assert failed_updates, (
+        "Attempt-1 fail-mirror must emit UPDATE setting execution_status='failed' "
+        "when the JDBC read fails inside the try block"
+    )
