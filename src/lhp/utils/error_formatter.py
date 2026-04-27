@@ -18,6 +18,7 @@ class ErrorCategory(Enum):
     ACTION = "ACT"  # Action type errors
     GENERAL = "GEN"  # General errors
     WATERMARK = "WM"  # Watermark manager errors (LHP-WM-*)
+    MANIFEST = "MAN"  # Manifest notebook errors (LHP-MAN-*)
 
 
 class LHPError(Exception):

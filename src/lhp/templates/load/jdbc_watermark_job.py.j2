@@ -236,7 +236,7 @@ SET    worker_run_id    = {sql_literal(worker_run_id)},
        updated_at       = current_timestamp()
 WHERE  batch_id    = {sql_literal(batch_id)}
   AND  action_name = {sql_literal(action_name)}
-  AND  ( worker_run_id IS NULL OR worker_run_id = {sql_literal(worker_run_id)} )
+  AND  ( worker_run_id IS NULL OR worker_run_id = {sql_literal(worker_run_id)} OR execution_status = 'failed' )
 """
 def _on_claim_exhausted(exc):
     raise RuntimeError(

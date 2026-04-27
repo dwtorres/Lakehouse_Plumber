@@ -18,6 +18,7 @@ resources:
       name: {{ pipeline_name }}_workflow
       tasks:
         - task_key: prepare_manifest
+          max_retries: 0
           notebook_task:
             notebook_path: {{ prepare_manifest_path }}
             source: WORKSPACE

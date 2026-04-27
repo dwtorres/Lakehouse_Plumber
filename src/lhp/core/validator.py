@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from collections import defaultdict
 from pathlib import Path
@@ -380,6 +381,94 @@ class ConfigValidator:
                 ],
             )
 
+        # LHP-MAN-005: taskValue payload size guard.
+        # Estimate the bytes that prepare_manifest will serialize into
+        # dbutils.jobs.taskValues.set(key="iterations", ...) at runtime.
+        # Build the same 10-key per-action dict that the template renders.
+        # 8 keys come from static action fields; 2 keys use worst-case stubs
+        # because their actual runtime values are unavailable at codegen time:
+        #   batch_id:       64-byte placeholder covers derive_run_id worst-case
+        #   manifest_table: resolved from wm_catalog / wm_schema present on the
+        #                   first jdbc_watermark_v2 action (shared-key invariant
+        #                   guarantees all actions agree on catalog + schema).
+        _BATCH_ID_PLACEHOLDER = "x" * 64
+        _TASKVALUE_CEILING = 48 * 1024  # DAB 48 KB hard limit
+
+        load_group = f"{flowgroup.pipeline}::{flowgroup.flowgroup}"
+        wm_actions_for_payload = [
+            a
+            for a in actions
+            if isinstance(a.source, dict) and a.source.get("type") == "jdbc_watermark_v2"
+        ]
+
+        if wm_actions_for_payload:
+            # Resolve manifest_table from the first wm action (all must agree per CFG-033).
+            first_wm = wm_actions_for_payload[0]
+            wm_catalog = getattr(getattr(first_wm, "watermark", None), "catalog", "") or ""
+            wm_schema = getattr(getattr(first_wm, "watermark", None), "schema", "") or ""
+            manifest_table = f"{wm_catalog}.{wm_schema}.b2_manifests"
+
+            payload_entries = []
+            for a in actions:
+                if not isinstance(a.source, dict):
+                    continue
+                if a.source.get("type") != "jdbc_watermark_v2":
+                    continue
+                action_wm = getattr(a, "watermark", None)
+                source_system_id = (
+                    getattr(action_wm, "source_system_id", None) or ""
+                ) if action_wm else ""
+                if not source_system_id:
+                    import re as _re
+                    url = a.source.get("url", "")
+                    host_match = _re.search(r"//([^:/]+)", url)
+                    source_system_id = host_match.group(1) if host_match else "unknown"
+                payload_entries.append(
+                    {
+                        "source_system_id": source_system_id,
+                        "schema_name": a.source.get("schema_name", ""),
+                        "table_name": a.source.get("table_name", ""),
+                        "action_name": a.name,
+                        "load_group": load_group,
+                        "batch_id": _BATCH_ID_PLACEHOLDER,
+                        "manifest_table": manifest_table,
+                        "jdbc_table": a.source.get("table", ""),
+                        "watermark_column": (
+                            getattr(action_wm, "column", "") if action_wm else ""
+                        ),
+                        "landing_path": a.landing_path or "",
+                    }
+                )
+
+            if payload_entries:
+                # 10% drift cushion: 5% JSON-array overhead + 5% identifier-substitution drift.
+                projected_payload_bytes = len(json.dumps(payload_entries)) * 1.10
+                if projected_payload_bytes > _TASKVALUE_CEILING:
+                    raise LHPError(
+                        category=ErrorCategory.MANIFEST,
+                        code_number="005",
+                        title="for_each flowgroup taskValue payload exceeds DAB 48 KB ceiling",
+                        details=(
+                            f"Projected taskValue payload {projected_payload_bytes:.0f} bytes "
+                            f"exceeds DAB 48 KB ceiling for {len(payload_entries)} actions "
+                            f"in flowgroup '{flowgroup.flowgroup}' of pipeline "
+                            f"'{flowgroup.pipeline}'. Reduce action count or shorten field values."
+                        ),
+                        context={
+                            "pipeline": flowgroup.pipeline,
+                            "flowgroup": flowgroup.flowgroup,
+                            "action_count": len(payload_entries),
+                            "projected_bytes": int(projected_payload_bytes),
+                            "ceiling_bytes": _TASKVALUE_CEILING,
+                        },
+                        suggestions=[
+                            "Trim action count below the projected limit by splitting "
+                            "into multiple for_each flowgroups across separate pipelines.",
+                            "Shorten landing_path / jdbc_table / schema_name identifiers "
+                            "to reduce per-entry payload size.",
+                        ],
+                    )
+
         if action_count > 300:
             raise LHPConfigError(
                 category=ErrorCategory.CONFIG,
@@ -570,11 +659,15 @@ class ConfigValidator:
     ) -> List[LHPError]:
         """Run project-scope for_each validation across all flowgroups.
 
-        Covers two checks that require visibility across the full project:
+        Covers checks that require visibility across the full project:
 
         * **LHP-CFG-032**: Two for_each flowgroups produce the same composite
           ``<pipeline>::<flowgroup>`` (renamed mid-development collision).
         * **LHP-CFG-033**: A pipeline mixes for_each and non-for_each flowgroups.
+        * **LHP-CFG-036**: A pipeline contains 2+ for_each flowgroups (the DAB
+          workflow generator emits one workflow YAML per pipeline keyed on the
+          first flowgroup; additional for_each flowgroups would silently not
+          execute).
 
         Per-flowgroup checks (LHP-CFG-031, count, concurrency, shared-keys) are
         handled earlier inside ``_validate_for_each_invariants`` which is called
@@ -658,6 +751,76 @@ class ConfigValidator:
                         ],
                     )
                 )
+
+        # LHP-CFG-036: at most one for_each flowgroup per pipeline.
+        # The DAB workflow generator keys pipeline_name_map by pipeline name;
+        # only the first for_each flowgroup's aux files are referenced in the
+        # emitted workflow YAML.  Additional for_each flowgroups in the same
+        # pipeline would silently never execute.
+        errors.extend(self._validate_for_each_per_pipeline_uniqueness(for_each_fgs))
+
+        return errors
+
+    def _validate_for_each_per_pipeline_uniqueness(
+        self, for_each_flowgroups: List[FlowGroup]
+    ) -> List[LHPError]:
+        """Return LHP-CFG-036 errors for pipelines with 2+ for_each flowgroups.
+
+        Empty-action flowgroups raise LHP-CFG-033 earlier in per-flowgroup
+        validation (``_validate_for_each_invariants``).  This method checks
+        purely at project scope and fires regardless of action count so that
+        operators who bypass per-flowgroup validation still see the error.
+
+        Args:
+            for_each_flowgroups: All FlowGroup objects whose execution_mode is
+                ``for_each``, across all pipelines in the project.
+
+        Returns:
+            List of LHPConfigError instances; one per violating pipeline.
+        """
+        errors: List[LHPError] = []
+
+        pipeline_for_each_fgs: Dict[str, List[str]] = defaultdict(list)
+        for fg in for_each_flowgroups:
+            pipeline_for_each_fgs[fg.pipeline].append(fg.flowgroup)
+
+        for pipeline_name, fg_names in pipeline_for_each_fgs.items():
+            if len(fg_names) < 2:
+                continue
+            count = len(fg_names)
+            fg_list = ", ".join(fg_names)
+            errors.append(
+                LHPConfigError(
+                    category=ErrorCategory.CONFIG,
+                    code_number="036",
+                    title="Pipeline has multiple for_each flowgroups",
+                    details=(
+                        f"Pipeline '{pipeline_name}' has {count} flowgroups with "
+                        f"execution_mode: for_each ({fg_list}). LHP currently supports "
+                        "at most one for_each flowgroup per pipeline (the DAB workflow "
+                        "generator emits one workflow YAML per pipeline, keyed on the "
+                        "first flowgroup; remaining flowgroups would not execute). "
+                        "To fix, either: (a) consolidate the for_each actions into a "
+                        "single flowgroup if they share orchestration concerns; or "
+                        "(b) split each flowgroup into its own pipeline if they are "
+                        "organizationally distinct (e.g., separate source systems). "
+                        "If you have a use case requiring multiple for_each flowgroups "
+                        "per pipeline, please file an issue describing the scenario."
+                    ),
+                    context={
+                        "pipeline": pipeline_name,
+                        "for_each_flowgroup_count": count,
+                        "for_each_flowgroups": fg_names,
+                    },
+                    suggestions=[
+                        "Consolidate the for_each actions into a single flowgroup if "
+                        "they share orchestration concerns (same source system, same "
+                        "watermark catalog, same landing path root).",
+                        "Split each flowgroup into its own pipeline if they are "
+                        "organizationally distinct (e.g., separate source systems).",
+                    ],
+                )
+            )
 
         return errors
 

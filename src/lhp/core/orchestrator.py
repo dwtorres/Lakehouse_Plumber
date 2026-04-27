@@ -1903,6 +1903,55 @@ class ActionOrchestrator:
                         ],
                     )
 
+                # LHP-CFG-036: at most one for_each flowgroup per pipeline.
+                # This guard fires even when lhp validate was skipped (generate-path
+                # bypass guard).  validate_project_invariants is NOT called from
+                # generate_pipeline_by_field, so this is the load-bearing check.
+                # Must fire before the merge logic below (ref_fg = pipeline_name_map[...])
+                # which silently drops all but the first flowgroup's aux files.
+                for_each_fgs_in_pipeline = [
+                    fg for fg in pipeline_fgs
+                    if (
+                        fg.workflow.get("execution_mode")
+                        if isinstance(fg.workflow, dict)
+                        else None
+                    ) == "for_each"
+                ]
+                if len(for_each_fgs_in_pipeline) > 1:
+                    fg_names = [fg.flowgroup for fg in for_each_fgs_in_pipeline]
+                    count = len(fg_names)
+                    fg_list = ", ".join(fg_names)
+                    raise LHPConfigError(
+                        category=ErrorCategory.CONFIG,
+                        code_number="036",
+                        title="Pipeline has multiple for_each flowgroups",
+                        details=(
+                            f"Pipeline '{pipeline_name}' has {count} flowgroups with "
+                            f"execution_mode: for_each ({fg_list}). LHP currently supports "
+                            "at most one for_each flowgroup per pipeline (the DAB workflow "
+                            "generator emits one workflow YAML per pipeline, keyed on the "
+                            "first flowgroup; remaining flowgroups would not execute). "
+                            "To fix, either: (a) consolidate the for_each actions into a "
+                            "single flowgroup if they share orchestration concerns; or "
+                            "(b) split each flowgroup into its own pipeline if they are "
+                            "organizationally distinct (e.g., separate source systems). "
+                            "If you have a use case requiring multiple for_each flowgroups "
+                            "per pipeline, please file an issue describing the scenario."
+                        ),
+                        context={
+                            "pipeline": pipeline_name,
+                            "for_each_flowgroup_count": count,
+                            "for_each_flowgroups": fg_names,
+                        },
+                        suggestions=[
+                            "Consolidate the for_each actions into a single flowgroup if "
+                            "they share orchestration concerns (same source system, same "
+                            "watermark catalog, same landing path root).",
+                            "Split each flowgroup into its own pipeline if they are "
+                            "organizationally distinct (e.g., separate source systems).",
+                        ],
+                    )
+
                 # Build a synthetic flowgroup with all v2 actions for this pipeline.
                 ref_fg = pipeline_name_map[pipeline_name]
                 merged_fg = FG(

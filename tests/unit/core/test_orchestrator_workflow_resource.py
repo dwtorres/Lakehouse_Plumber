@@ -8,6 +8,7 @@ import pytest
 
 from lhp.core.orchestrator import ActionOrchestrator
 from lhp.models.config import Action, FlowGroup, WriteTarget
+from lhp.utils.error_formatter import LHPConfigError
 
 
 def _make_v2_flowgroup(pipeline_name="test_pipeline"):
@@ -196,3 +197,113 @@ class TestGenerateWorkflowResources:
                 f"task_key must NOT contain __lhp_ prefix (keeps DAB UI clean); "
                 f"got: {task_key}"
             )
+
+
+def _make_for_each_v2_flowgroup(pipeline_name: str, flowgroup_name: str) -> FlowGroup:
+    """Build a for_each FlowGroup with a jdbc_watermark_v2 load action."""
+    load_action = Action(
+        name=f"load_{flowgroup_name}",
+        type="load",
+        source={
+            "type": "jdbc_watermark_v2",
+            "url": "jdbc:postgresql://host:5432/db",
+            "user": "u",
+            "password": "p",
+            "driver": "org.postgresql.Driver",
+            "table": '"Sales"."Orders"',
+            "schema_name": "Sales",
+            "table_name": "Orders",
+        },
+        target=f"v_{flowgroup_name}_raw",
+        landing_path=f"/Volumes/cat/land/{flowgroup_name}",
+        watermark={
+            "column": "updated_at",
+            "type": "timestamp",
+            "source_system_id": "pg_prod",
+        },
+    )
+    write_action = Action(
+        name=f"write_{flowgroup_name}",
+        type="write",
+        source=f"v_{flowgroup_name}_raw",
+        write_target=WriteTarget(
+            type="streaming_table",
+            catalog="bronze_catalog",
+            schema="bronze_schema",
+            table=flowgroup_name,
+        ),
+    )
+    return FlowGroup(
+        pipeline=pipeline_name,
+        flowgroup=flowgroup_name,
+        workflow={"execution_mode": "for_each"},
+        actions=[load_action, write_action],
+    )
+
+
+@pytest.mark.unit
+class TestMultiForEachGeneratePath:
+    """Generate-path bypass guard for LHP-CFG-036 (U4).
+
+    Verifies that _generate_workflow_resources raises LHP-CFG-036 when a pipeline
+    contains 2+ for_each flowgroups, even when validate_project_invariants was never
+    called (i.e., the operator ran `lhp generate` directly without `lhp validate`).
+
+    This is the load-bearing guard: validate_project_invariants is NOT called from
+    generate_pipeline_by_field (orchestrator.py:802).  Without the orchestrator-side
+    raise, a broken topology would silently emit a workflow YAML referencing only the
+    first flowgroup's aux files — the original #16 bug.
+    """
+
+    def test_two_for_each_same_pipeline_raises_cfg036(self, tmp_path):
+        """2 for_each flowgroups in same pipeline → LHP-CFG-036 from orchestrator.
+
+        AE: Generate-path bypass guard — CFG-036 must fire from _generate_workflow_resources
+        even when validate_project_invariants was skipped.
+        """
+        smart_writer = MagicMock()
+
+        orchestrator = MagicMock(spec=ActionOrchestrator)
+        orchestrator.project_root = tmp_path
+        orchestrator.logger = MagicMock()
+
+        fg_a = _make_for_each_v2_flowgroup(pipeline_name="bronze", flowgroup_name="fg_a")
+        fg_b = _make_for_each_v2_flowgroup(pipeline_name="bronze", flowgroup_name="fg_b")
+
+        with pytest.raises(LHPConfigError) as exc_info:
+            ActionOrchestrator._generate_workflow_resources(
+                orchestrator, [fg_a, fg_b], smart_writer
+            )
+
+        err = exc_info.value
+        assert err.code == "LHP-CFG-036", (
+            f"Expected LHP-CFG-036 from orchestrator-side guard; got {err.code}"
+        )
+        assert "bronze" in err.details, "Error must name the pipeline"
+        assert "fg_a" in err.details, "Error must list fg_a"
+        assert "fg_b" in err.details, "Error must list fg_b"
+
+        # Workflow YAML must NOT be emitted — broken topology should never reach disk.
+        smart_writer.write_if_changed.assert_not_called()
+
+    def test_one_for_each_per_pipeline_does_not_raise(self, tmp_path):
+        """One for_each flowgroup per pipeline → no CFG-036 from orchestrator.
+
+        AE: Regression guard — two for_each in different pipelines must still pass.
+        """
+        smart_writer = MagicMock()
+
+        orchestrator = MagicMock(spec=ActionOrchestrator)
+        orchestrator.project_root = tmp_path
+        orchestrator.logger = MagicMock()
+
+        fg_a = _make_for_each_v2_flowgroup(pipeline_name="pipeline_a", flowgroup_name="fg_alpha")
+        fg_b = _make_for_each_v2_flowgroup(pipeline_name="pipeline_b", flowgroup_name="fg_beta")
+
+        # Should not raise; each pipeline has exactly one for_each flowgroup.
+        ActionOrchestrator._generate_workflow_resources(
+            orchestrator, [fg_a, fg_b], smart_writer
+        )
+
+        # Two pipelines → two workflow YAMLs should be written.
+        assert smart_writer.write_if_changed.call_count == 2

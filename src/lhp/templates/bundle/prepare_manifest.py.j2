@@ -268,10 +268,18 @@ _iterations = [
 # (R2 explicit naming). "batch_id" is emitted as a dedicated key so the
 # validate task can read it deterministically without an ORDER BY DESC LIMIT 1
 # lookup against b2_manifests.
-dbutils.jobs.taskValues.set(key="iterations", value=json.dumps(_iterations))
+#
+# U3 LHP-MAN-005: serialize once, log size, guard before set().
+# The log fires before the guard so the operator always sees the byte count,
+# on both pass and fail paths (previously at line 277, after set(), invisible
+# when set() raised).
+_payload = json.dumps(_iterations)
+print(f"manifest entries: {len(_iterations)}, taskvalue payload bytes: {len(_payload)}")
+if len(_payload) > 48 * 1024:
+    raise RuntimeError(
+        f"LHP-MAN-005: taskValue payload {len(_payload)} bytes exceeds DAB 48 KB "
+        f"ceiling for {len(_iterations)} actions. "
+        "Reduce action count or trim per-entry fields."
+    )
+dbutils.jobs.taskValues.set(key="iterations", value=_payload)
 dbutils.jobs.taskValues.set(key="batch_id", value=batch_id)
-
-# COMMAND ----------
-
-# Log payload size for operator visibility into the 48 KB DAB taskValue ceiling.
-print(f"manifest entries: {len(_iterations)}, taskvalue payload bytes: {len(json.dumps(_iterations))}")

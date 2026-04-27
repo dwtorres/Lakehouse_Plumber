@@ -80,6 +80,9 @@ Error Categories
    * - Dependency
      - ``DEP``
      - Circular dependencies between views or preset inheritance cycles
+   * - Manifest
+     - ``MAN``
+     - B2 batch-manifest runtime errors: MERGE retry exhaustion, ownership conflicts, missing rows, or DAB taskValue payload overflow
 
 Configuration Errors (LHP-CFG)
 ==============================
@@ -922,6 +925,408 @@ fan-out logic are incompatible with the legacy per-action emission topology.
    :ref:`LHP-CFG-033 <LHP-CFG-033: for_each Post-Expansion Structural Violation>`
    for the validator-time check covering the same mixed-mode condition.
 
+LHP-CFG-035: Non-Strict Watermark Operator for ``execution_mode: for_each``
+----------------------------------------------------------------------------
+
+**When it occurs:** A ``jdbc_watermark_v2`` action inside a ``for_each`` flowgroup
+declares ``watermark.operator: '>='`` or ``watermark.operator: '<='``.
+
+**Why it is an error:** Non-strict operators include the high-water-mark boundary
+row on every re-run. In ``for_each`` batches the same boundary row is re-read and
+re-landed on every execution, causing silent duplicate rows in the bronze layer.
+The effect is invisible until an analyst notices inflated row counts.
+
+**Common causes:**
+
+- Copying a watermark action that previously used ``>=`` (valid outside ``for_each``)
+  into a new ``for_each`` flowgroup without updating the operator.
+- Accepting the Pydantic model default of ``>=`` without explicitly setting
+  ``operator: '>'`` in the YAML — both look identical after model construction.
+- Believing that ``>=`` is "safer" because it avoids row loss; in ``for_each`` the
+  duplicate cost outweighs the fence-post benefit.
+
+**Resolution:**
+
+Set ``watermark.operator`` to ``'>'`` (ascending watermark, the common case for
+timestamp and numeric columns) or ``'<'`` (descending watermark).
+
+.. code-block:: yaml
+   :caption: Before (triggers LHP-CFG-035)
+
+   actions:
+     - name: load_orders
+       type: load
+       source:
+         type: jdbc_watermark_v2
+       watermark:
+         operator: ">="   # Non-strict — duplicates on re-run in for_each
+
+.. code-block:: yaml
+   :caption: After (fixed)
+
+   actions:
+     - name: load_orders
+       type: load
+       source:
+         type: jdbc_watermark_v2
+       watermark:
+         operator: ">"    # Strict — excludes boundary row
+
+.. seealso::
+
+   The :ref:`R12 strict-\`>\` operator awareness <R12 strict-\`>\` operator awareness>`
+   section of the B2 for-each rollout runbook for the operational context and
+   sub-second precision requirements.
+
+LHP-CFG-036: Pipeline Contains Multiple ``for_each`` Flowgroups
+---------------------------------------------------------------
+
+**When it occurs:** A pipeline contains two or more flowgroups that both declare
+``workflow.execution_mode: for_each``. This is detected at ``lhp validate`` time
+(via ``validate_project_invariants``) and at ``lhp generate`` time (inside
+``_generate_workflow_resources``), whichever runs first.
+
+**Why it is an error:** The DAB workflow generator emits one workflow YAML per
+pipeline, keyed on the **first** ``for_each`` flowgroup it encounters. The second
+(and any subsequent) flowgroup's ``__lhp_prepare_manifest_<fg>.py`` and
+``__lhp_validate_<fg>.py`` aux files are generated on disk but never referenced
+by the workflow YAML, so their actions never execute. The bug is silent — ``lhp
+validate`` counts ``N expected / N completed`` from the one flowgroup that did run
+and reports ``status: pass``.
+
+**Common causes:**
+
+- An engineer split a large set of JDBC tables into two ``for_each`` flowgroups
+  within the same pipeline name (e.g., by source-system prefix) — a natural
+  refactor that unexpectedly triggers this guard.
+- A flowgroup YAML was copy-pasted and the ``pipeline:`` field was not changed to
+  a new name, leaving two ``for_each`` flowgroups sharing one pipeline.
+- Template expansion produces two flowgroups that both land on the same
+  ``pipeline:`` value.
+
+**Resolution:**
+
+Choose one of two options:
+
+1. **Consolidate:** If the two flowgroups target the same source system, same
+   ``wm_catalog``, same ``wm_schema``, and the same ``landing_path`` root, merge
+   their actions into a single ``for_each`` flowgroup. The 300-action cap
+   (LHP-CFG-033) still applies.
+2. **Split into separate pipelines:** Assign each ``for_each`` flowgroup its own
+   ``pipeline:`` value. Separate pipelines each get their own DAB workflow YAML
+   and execute independently.
+
+If neither option fits your use case, file an issue describing the scenario — the
+constraint exists because multi-for-each-per-pipeline workflow generation has not
+yet been implemented.
+
+.. code-block:: yaml
+   :caption: Before (triggers LHP-CFG-036 — two for_each flowgroups in one pipeline)
+
+   # file: pipelines/crm_bronze/crm_orders.yaml
+   pipeline: crm_bronze
+   flowgroup: crm_orders
+   workflow:
+     execution_mode: for_each
+
+   # file: pipelines/crm_bronze/crm_products.yaml
+   pipeline: crm_bronze        # same pipeline — triggers LHP-CFG-036
+   flowgroup: crm_products
+   workflow:
+     execution_mode: for_each
+
+.. code-block:: yaml
+   :caption: After (fixed — split into separate pipelines)
+
+   # file: pipelines/crm_bronze_orders/crm_orders.yaml
+   pipeline: crm_bronze_orders
+   flowgroup: crm_orders
+   workflow:
+     execution_mode: for_each
+
+   # file: pipelines/crm_bronze_products/crm_products.yaml
+   pipeline: crm_bronze_products
+   flowgroup: crm_products
+   workflow:
+     execution_mode: for_each
+
+.. seealso::
+
+   :ref:`LHP-CFG-034 <LHP-CFG-034: Mixed \`\`execution_mode\`\` Flowgroups in Same Pipeline (Orchestrator)>`
+   for the related mixed-mode guard (``for_each`` + non-``for_each`` in one pipeline).
+
+Manifest Errors (LHP-MAN)
+==========================
+
+Manifest errors occur at runtime inside Databricks notebooks generated by the B2
+watermark scale-out feature. They are raised as ``RuntimeError("LHP-MAN-NNN: ...")`
+prefix strings — the ``LHP-MAN-`` prefix is what operators should search for in
+Databricks task logs. Codegen-time manifest errors (LHP-MAN-005) are raised before
+deployment and appear in the ``lhp validate`` / ``lhp generate`` terminal output.
+
+LHP-MAN-001: Manifest MERGE Retry Budget Exhausted
+---------------------------------------------------
+
+**When it occurs:** The ``prepare_manifest`` notebook attempts to MERGE a batch of
+iteration rows into ``b2_manifests`` and the Delta concurrent-commit retry loop
+exhausts its five-attempt budget without a successful commit.
+
+**Why it is an error:** Without a committed MERGE, the manifest contains no rows
+for this batch. Downstream ``for_each_ingest`` iterations receive no tasks and
+the ``validate`` task reports a zero-expected-action noop pass — the batch is
+silently skipped entirely.
+
+**Common causes:**
+
+- ``workflow.concurrency`` set too high relative to the Delta table's concurrent-commit
+  capacity, causing many workers to write simultaneously and triggering frequent
+  write-write conflicts on the ``b2_manifests`` table.
+- A large number of concurrent pipelines all writing to the same ``b2_manifests``
+  table (shared ``wm_catalog`` / ``wm_schema``) at the same time.
+- Transient cluster instability causing Delta transaction log reads to fail mid-retry.
+
+**Resolution:**
+
+1. Reduce ``workflow.concurrency`` in the flowgroup YAML (valid range: 1-100;
+   default is ``min(action_count, 10)``).
+2. If multiple pipelines share the same ``wm_catalog`` / ``wm_schema``, stagger
+   their schedule windows so their ``prepare_manifest`` runs do not overlap.
+3. Inspect the Delta concurrent-commit metrics in the Databricks cluster Spark UI
+   (look for ``numTransactionAborted`` in the Delta Lake metrics tab) to confirm
+   the conflict rate.
+4. As a last resort, set ``workflow.concurrency: 1`` to serialize all MERGE writes.
+
+.. seealso::
+
+   :ref:`LHP-MAN-002 <LHP-MAN-002: Manifest Claim Ownership Conflict>` for the
+   related worker-side claim conflict that can occur when two DAB attempts race
+   to claim the same manifest row.
+
+LHP-MAN-002: Manifest Claim Ownership Conflict
+-----------------------------------------------
+
+**When it occurs:** A B2 worker iteration attempts to claim a manifest row via
+UPDATE and reads back a ``worker_run_id`` that belongs to a different, currently-running
+worker — indicating that a competing iteration has already taken ownership of that
+row.
+
+**Why it is an error:** The manifest's optimistic-concurrency ownership model
+allows exactly one worker to own each row at a time. A ``worker_run_id`` mismatch
+after the claim UPDATE means the current iteration's UPDATE matched zero rows
+(because the competing owner's claim already set the row to ``execution_status:
+'running'``). Proceeding would cause two workers to process the same action and
+write conflicting watermark values.
+
+**Common causes:**
+
+- Two DAB for-each iterations are assigned to the same ``action_name`` in the same
+  batch (which should not occur under normal DAB scheduling but can happen with
+  misconfigured task parameters or a stale ``iterations`` taskValue from a previous
+  run).
+- A prior DAB attempt of the **same** iteration left the row in ``execution_status:
+  'running'`` without transitioning it to ``'failed'`` (e.g., the worker process
+  was killed between the claim UPDATE and the fail-mirror UPDATE). This scenario
+  resolves on the next DAB retry once the row ages out or is manually reset.
+
+**Resolution:**
+
+1. This error is usually transient. DAB automatically retries the iteration
+   (subject to the task ``max_retries`` setting). Check the Databricks Jobs UI
+   for the ``for_each_ingest`` task — failed iterations appear in red and can be
+   re-run individually with the ``Re-run failed iterations`` button.
+2. If the error persists across all retries for a specific action, query
+   ``b2_manifests`` for the row:
+
+   .. code-block:: sql
+
+      SELECT batch_id, action_name, worker_run_id, execution_status, updated_at
+      FROM <wm_catalog>.<wm_schema>.b2_manifests
+      WHERE batch_id = '<batch_id>'
+        AND action_name = '<action_name>';
+
+   If ``execution_status = 'running'`` and the owning ``worker_run_id`` task is
+   no longer active in the Jobs UI, manually reset the row:
+
+   .. code-block:: sql
+
+      UPDATE <wm_catalog>.<wm_schema>.b2_manifests
+      SET execution_status = 'failed', updated_at = current_timestamp()
+      WHERE batch_id = '<batch_id>'
+        AND action_name = '<action_name>';
+
+   Then re-run the failed iteration from the Jobs UI.
+
+.. seealso::
+
+   :ref:`LHP-MAN-001 <LHP-MAN-001: Manifest MERGE Retry Budget Exhausted>` for the
+   MERGE-side conflict that can precede ownership conflicts.
+
+LHP-MAN-003: Manifest Row Missing for Action
+--------------------------------------------
+
+**When it occurs:** A B2 worker iteration reads back the ``b2_manifests`` row after
+the claim UPDATE and finds zero rows matching ``(batch_id, action_name)``.
+
+**Why it is an error:** The claim UPDATE matched zero rows (expected), but instead
+of a competing owner, there is no row at all for this action in the current batch.
+The iteration cannot proceed without a manifest row to track ownership and
+execution status.
+
+**Common causes:**
+
+- The ``prepare_manifest`` task was skipped, failed before the MERGE committed,
+  or ran with a different ``batch_id`` than the one the worker task received.
+- A manual DELETE was run against ``b2_manifests`` for this ``batch_id`` while
+  the job was in flight.
+- The ``iterations`` taskValue was stale (from a previous job run) and refers to
+  a ``batch_id`` for which the corresponding manifest rows have already been cleaned
+  up by the 30-day retention DELETE.
+
+**Resolution:**
+
+1. Check whether ``prepare_manifest`` completed successfully in the Databricks Jobs
+   UI (it must show ``Succeeded`` before ``for_each_ingest`` starts).
+2. If ``prepare_manifest`` failed, inspect its logs for LHP-MAN-001 (MERGE retry
+   exhaustion) or LHP-MAN-005 (payload overflow).
+3. Re-run the entire workflow from the beginning (not just the failed iteration)
+   so that ``prepare_manifest`` generates a fresh ``batch_id`` and a fresh set of
+   manifest rows.
+4. If this occurs after a manual DELETE, re-run the workflow to regenerate the
+   rows.
+
+LHP-MAN-004: Completion Mirror MERGE Retry Budget Exhausted
+-----------------------------------------------------------
+
+**When it occurs:** A B2 worker iteration successfully extracts data and commits
+the watermark, then attempts to transition the manifest row to
+``execution_status: 'completed'`` via a Delta UPDATE (the completion mirror). The
+concurrent-commit retry loop exhausts its budget before the UPDATE commits.
+
+**Why it is an error:** The watermark is updated (the actual data landed correctly),
+but the manifest row remains in ``execution_status: 'running'``. The ``validate``
+task uses ``coalesce(worker_status, manifest_status)`` to determine final state;
+however, a row stuck in ``'running'`` contributes to the ``unfinished_n`` count,
+causing LHP-VAL-050 to fire even though the data was successfully landed.
+
+**Common causes:**
+
+- The same high-concurrency conditions that cause LHP-MAN-001: many workers
+  simultaneously trying to UPDATE the same ``b2_manifests`` table.
+- A transient network or cluster failure between the watermark commit and the
+  completion mirror UPDATE.
+
+**Resolution:**
+
+1. Reduce ``workflow.concurrency`` (same mitigation as LHP-MAN-001).
+2. If the validate task reports LHP-VAL-050 for specific actions, check whether
+   those actions' watermark rows are present and completed in the watermarks
+   registry:
+
+   .. code-block:: sql
+
+      SELECT run_id, status, watermark_value, updated_at
+      FROM metadata.<env>_orchestration.watermarks
+      WHERE load_group = '<pipeline>::<flowgroup>'
+        AND action_name = '<action_name>'
+      ORDER BY updated_at DESC
+      LIMIT 5;
+
+   If the watermark row shows ``status: 'completed'``, the data landed correctly.
+   The manifest row can be manually corrected:
+
+   .. code-block:: sql
+
+      UPDATE <wm_catalog>.<wm_schema>.b2_manifests
+      SET execution_status = 'completed', updated_at = current_timestamp()
+      WHERE batch_id = '<batch_id>'
+        AND action_name = '<action_name>';
+
+3. Re-run ``validate`` as a standalone task (without re-running extraction) after
+   the manual correction.
+
+.. seealso::
+
+   :ref:`LHP-MAN-001 <LHP-MAN-001: Manifest MERGE Retry Budget Exhausted>` for the
+   MERGE-side exhaustion pattern that shares the same root cause.
+   :ref:`LHP-VAL-050 <LHP-VAL-050: B2 Validate Failed>` for the validate-task
+   error that surfaces when completion mirror failures leave unfinished rows.
+
+LHP-MAN-005: Manifest taskValue Payload Exceeds DAB 48 KB Ceiling
+------------------------------------------------------------------
+
+**When it occurs:** Two distinct guards fire this code at different lifecycle stages:
+
+- **Codegen time** (``lhp validate`` / ``lhp generate``): the ``_validate_for_each_invariants``
+  validator estimates the JSON payload that ``prepare_manifest`` will set via
+  ``dbutils.jobs.taskValues.set(key="iterations", ...)`` and finds that the
+  projected size × 1.10 fudge factor exceeds the DAB 48 KB ceiling.
+- **Runtime** (inside the generated ``prepare_manifest`` notebook): the actual
+  serialized payload ``json.dumps(_iterations)`` exceeds 48 × 1024 bytes, immediately
+  before the ``dbutils.jobs.taskValues.set`` call.
+
+**Why it is an error:** DAB hard-rejects any ``taskValues.set`` call whose value
+exceeds 48 KB. If the set call is allowed to run with an oversized payload, DAB
+raises an unstructured SDK exception. The runtime guard fires before the set call
+so the error message is operator-readable. The codegen guard fires before
+deployment so the operator can fix the configuration without ever running the job.
+
+When the runtime guard fires, the ``b2_manifests`` rows for the failing batch have
+already been MERGE'd (they are committed). The downstream ``for_each_ingest``
+workers never receive an ``iterations`` taskValue and fail immediately at
+LHP-VAL-048. The ``validate`` task (if reached) fails at LHP-VAL-050.
+
+**Common causes:**
+
+- A large number of actions combined with long field values. Each iteration entry
+  carries 10 keys; entries average 350–550 bytes. The ceiling is reached at
+  approximately 89–140 actions depending on field length.
+- Long ``landing_path`` values (e.g., deeply nested Unity Catalog volume paths).
+- Long ``jdbc_table`` or ``schema_name`` identifiers.
+- Adding more keys to the iteration payload than the 10-key contract
+  (``B2_ITERATION_KEYS``) defines — this requires a coordinated three-file edit
+  and will push the per-entry size higher.
+
+**Resolution:**
+
+At **codegen time** (LHP-MAN-005 from ``lhp validate``):
+
+1. Reduce action count by splitting the flowgroup into two smaller flowgroups, each
+   in its own pipeline.
+2. Shorten ``landing_path`` or ``jdbc_table`` identifiers.
+3. Re-run ``lhp validate`` until the projected payload is under the ceiling.
+
+At **runtime** (LHP-MAN-005 from ``prepare_manifest`` logs):
+
+1. Apply the same codegen-time fixes and redeploy.
+2. Clean up the orphaned ``b2_manifests`` rows for the failed batch:
+
+   .. code-block:: sql
+
+      DELETE FROM <wm_catalog>.<wm_schema>.b2_manifests
+      WHERE batch_id = '<failed_batch_id>';
+
+   Substitute the ``batch_id`` value from the ``manifest entries:`` log line
+   that appears immediately before the LHP-MAN-005 error in ``prepare_manifest``
+   stdout.
+3. Re-run the workflow after redeployment. The 30-day retention DELETE in
+   ``prepare_manifest`` will also clean up these rows automatically, but the manual
+   DELETE avoids them appearing as stale rows in operational queries.
+
+.. note::
+
+   The ``prepare_manifest`` DAB task is configured with ``max_retries: 0``.
+   LHP-MAN-005 is a deterministic failure — the same batch ID, the same action
+   count, and the same field values produce the same oversized payload on every
+   attempt. Retrying without a config change wastes DAB retry budget.
+
+.. seealso::
+
+   :ref:`LHP-VAL-048 <LHP-VAL-048: B2 Validate batch_id taskValue Absent>` for
+   the worker-side error that fires when ``prepare_manifest`` does not emit the
+   ``iterations`` taskValue.
+   :ref:`LHP-CFG-033 <LHP-CFG-033: for_each Post-Expansion Structural Violation>`
+   for the structural action-count cap (300) that is a companion limit.
+
 Validation Errors (LHP-VAL)
 ============================
 
@@ -1262,6 +1667,126 @@ expected format for its type.
 
    :doc:`actions/index` for the correct source configuration format for each
    action type.
+
+LHP-VAL-048: B2 Validate batch_id taskValue Absent
+---------------------------------------------------
+
+**When it occurs:** The ``validate`` notebook generated for a ``for_each`` flowgroup
+reads the ``batch_id`` taskValue from the ``prepare_manifest`` task and finds it
+absent (the value returned by ``dbutils.jobs.taskValues.get`` is ``None``).
+
+**Why it is an error:** The ``validate`` task identifies which manifest rows to
+inspect by ``batch_id``. Without ``batch_id``, the task cannot construct the
+validation SQL and cannot determine whether all iterations completed. Proceeding
+would produce a misleading ``status: pass`` on an empty result set.
+
+**Common causes:**
+
+- The ``validate`` task ran before ``prepare_manifest`` completed, or
+  ``prepare_manifest`` was skipped altogether (DAB dependency not wired correctly).
+- ``prepare_manifest`` succeeded but the ``batch_id`` taskValue was not emitted
+  — this can happen if an unhandled exception occurred between the
+  ``dbutils.jobs.taskValues.set(key="batch_id", ...)`` call and task completion.
+- LHP-MAN-005 caused ``prepare_manifest`` to fail before the taskValues set calls
+  were reached, yet the DAB workflow still allowed the downstream ``validate`` task
+  to start (check that the task dependency is ``depends_on: prepare_manifest``
+  with ``outcome: succeeded``).
+- A manual trigger of the ``validate`` task outside a full workflow run, without a
+  preceding ``prepare_manifest`` execution in the same job run.
+
+**Resolution:**
+
+1. Confirm that the DAB workflow YAML lists ``prepare_manifest`` as a dependency of
+   the ``validate`` task with ``outcome: succeeded``.
+2. Check ``prepare_manifest`` logs for LHP-MAN-001, LHP-MAN-005, or any unhandled
+   exception that prevented the taskValues set calls from executing.
+3. Re-run the full workflow from the beginning — do not re-run ``validate`` in
+   isolation unless you first confirm a valid ``batch_id`` is available for the
+   current job run.
+
+.. seealso::
+
+   :ref:`LHP-MAN-005 <LHP-MAN-005: Manifest taskValue Payload Exceeds DAB 48 KB Ceiling>`
+   for the prepare_manifest failure mode most likely to leave ``batch_id`` unset.
+
+LHP-VAL-049: Parity Check Not Yet Implemented
+----------------------------------------------
+
+**When it occurs:** The ``validate`` notebook was generated with
+``workflow.parity_check_enabled: true`` but the landed-parquet row-count source
+has not shipped. Any attempt to run parity checking would silently pass every
+batch because the comparison data source does not exist.
+
+**Why it is an error:** Silently passing a parity check that cannot actually compare
+row counts would give operators false confidence in data completeness. Raising
+immediately makes the misconfiguration visible before it causes undetected data
+quality issues.
+
+**Common causes:**
+
+- Setting ``workflow.parity_check_enabled: true`` in a flowgroup YAML before the
+  U6-followup that wires the landing-row-count table or Delta path read has been
+  deployed.
+- Copying a flowgroup configuration from a future design document that includes
+  parity checking as a planned feature.
+
+**Resolution:**
+
+Set ``workflow.parity_check_enabled: false`` (or remove the field, as ``false``
+is the default) until the parity-check infrastructure is available. Monitor the
+project issue tracker for the follow-up that implements the landed-parquet row
+count source.
+
+LHP-VAL-050: B2 Validate Failed
+---------------------------------
+
+**When it occurs:** The ``validate`` notebook for a ``for_each`` flowgroup finds
+that ``completed_n != expected`` or ``failed_n > 0`` after querying the manifest
+and watermark state for the current batch.
+
+**Why it is an error:** One or more iterations in the batch did not complete
+successfully. The bronze layer is in a partially-landed state for this batch —
+some actions' data arrived, others did not. The downstream pipeline (silver
+transforms, gold aggregations) may read an incomplete snapshot if allowed to
+proceed.
+
+.. note::
+
+   This code was renamed from ``LHP-VAL-04A`` to ``LHP-VAL-050`` in the B2
+   milestone (fix #17). Operators searching Databricks logs for the old code
+   should use ``LHP-VAL-050`` in new alerts and runbooks.
+
+**Common causes:**
+
+- JDBC connection failure or timeout for one or more source tables during the
+  extraction window.
+- Source-side lock contention: a long-running transaction on the source database
+  blocked the JDBC read for one action, causing its iteration to time out.
+- A DAB retry budget exhaustion: the iteration failed on all ``max_retries``
+  attempts and the manifest row remained in ``'failed'`` status.
+- LHP-MAN-002 (ownership conflict) or LHP-MAN-004 (completion mirror exhaustion)
+  left manifest rows in a non-``'completed'`` terminal state.
+
+**Resolution:**
+
+1. Inspect the ``validate`` summary JSON in the task output. The ``unfinished_actions``
+   array lists every action that did not reach ``'completed'`` status, along with
+   its ``final_status``.
+2. For each failing action, open the corresponding ``for_each_ingest`` iteration in
+   the Databricks Jobs UI and inspect the iteration log for the root cause.
+3. If the cause is transient (JDBC timeout, cluster preemption), re-run the failed
+   iterations using the ``Re-run failed iterations`` button in the DAB Jobs UI.
+4. If the cause is a persistent LHP-MAN-002 or LHP-MAN-004 manifest state issue,
+   follow the resolution steps in the corresponding error entry to reset the manifest
+   rows, then re-run.
+
+.. seealso::
+
+   :ref:`LHP-MAN-002 <LHP-MAN-002: Manifest Claim Ownership Conflict>` and
+   :ref:`LHP-MAN-004 <LHP-MAN-004: Completion Mirror MERGE Retry Budget Exhausted>`
+   for manifest-side failures that surface as LHP-VAL-050.
+   :ref:`LHP-VAL-048 <LHP-VAL-048: B2 Validate batch_id taskValue Absent>` for
+   the case where ``validate`` cannot even read the batch_id.
 
 I/O Errors (LHP-IO)
 ====================
