@@ -115,10 +115,15 @@ batch_id = SQLInputValidator.string(_batch_id_raw)
 # COMMAND ----------
 
 # R5: Validate query — LEFT JOIN manifest rows for this batch onto watermarks
-# via worker_run_id. coalesce(worker_status, manifest_status) gives the
-# effective final_status: if the worker updated watermarks, use that truth;
-# otherwise fall back to manifest execution_status (handles cases where the
-# worker started but watermark commit was skipped or the worker never ran).
+# via worker_run_id. final_status uses a CASE that requires manifest-side
+# 'completed' (with worker either also 'completed' or NULL) before treating
+# the action as completed. Issue #18 R4: a stale watermarks row matched on
+# worker_run_id (e.g., from a prior replay using the same run_id) cannot
+# coalesce over a manifest row still in 'running' state — that produced a
+# silent false pass under the previous coalesce(worker_status,
+# manifest_status) form. The CASE preserves the existing fallback for
+# every other case so worker-side intermediate statuses (running,
+# landed_not_committed, abandoned) still surface correctly.
 _validate_sql = f"""
 WITH manifest AS (
     SELECT
@@ -140,7 +145,13 @@ worker_states AS (
 final AS (
     SELECT
         m.action_name,
-        coalesce(w.worker_status, m.manifest_status) AS final_status
+        CASE
+            WHEN m.manifest_status = 'completed'
+                 AND (w.worker_status IS NULL OR w.worker_status = 'completed')
+                THEN 'completed'
+            WHEN m.manifest_status = 'failed' THEN 'failed'
+            ELSE coalesce(w.worker_status, m.manifest_status)
+        END AS final_status
     FROM manifest m
     LEFT JOIN worker_states w USING (action_name)
 )
@@ -175,10 +186,11 @@ if expected == 0:
     dbutils.notebook.exit(json.dumps(_summary))
 
 # Failure path: enumerate every unfinished/failed action_name for operator
-# visibility. Uses the same coalesce(worker_status, manifest_status) logic as
-# the count query so that watermark-side statuses (running, landed_not_committed,
+# visibility. Uses the same final_status CASE form as the count query so
+# that worker-side intermediate statuses (running, landed_not_committed,
 # abandoned) are surfaced correctly — those statuses are never written to
-# b2_manifests, so a manifest-only filter would miss them.
+# b2_manifests, so a manifest-only filter would miss them — while still
+# applying the issue #18 R4 silent-divergence guard.
 # Check failures BEFORE the pass exit so the operator gets a clear error.
 if not (completed_n == expected and failed_n == 0 and unfinished_n == 0):
     _unfinished_actions = spark.sql(
@@ -203,7 +215,13 @@ if not (completed_n == expected and failed_n == 0 and unfinished_n == 0):
         final AS (
             SELECT
                 m.action_name,
-                coalesce(w.worker_status, m.manifest_status) AS final_status
+                CASE
+                    WHEN m.manifest_status = 'completed'
+                         AND (w.worker_status IS NULL OR w.worker_status = 'completed')
+                        THEN 'completed'
+                    WHEN m.manifest_status = 'failed' THEN 'failed'
+                    ELSE coalesce(w.worker_status, m.manifest_status)
+                END AS final_status
             FROM manifest m
             LEFT JOIN worker_states w USING (action_name)
         )
