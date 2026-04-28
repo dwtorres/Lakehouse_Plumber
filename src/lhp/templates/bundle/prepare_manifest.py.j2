@@ -130,6 +130,27 @@ _ddl = f"""
 spark.sql(_ddl)
 
 # COMMAND ----------
+{% if not actions %}
+
+# Issue #21 / U3 — Defensive guard: prepare_manifest was rendered with an
+# empty `actions` list. This path is unreachable today: `_emit_b2_aux_files`
+# is only invoked when at least one `jdbc_watermark_v2` LOAD action exists,
+# and validator LHP-CFG-033 rejects `action_count == 0` at codegen time. The
+# guard exists so a future contributor (e.g., a new generator that calls
+# `_emit_b2_aux_files` without the v2-action precondition, or a per-action
+# filter that shrinks the list to zero) sees a clear LHP error instead of a
+# Spark `ParseException` on a malformed `MERGE … FROM VALUES` SQL with no
+# rows.
+raise RuntimeError(
+    "LHP-MAN-006: prepare_manifest rendered with empty actions list. "
+    "Generator contract violation — _emit_b2_aux_files must be invoked "
+    "with at least one jdbc_watermark_v2 LOAD action. LHP-CFG-033 "
+    "enforces this at codegen time; reaching this raise indicates a "
+    "bypass of that validator. Inspect the generator call site and "
+    "the for_each post-expansion action count."
+)
+{% else %}
+# COMMAND ----------
 
 # R1a: batch_id derived once at task entry. DAB retries produce a fresh
 # batch_id (per runtime.py:97); orphaned rows from a prior attempt are
@@ -300,3 +321,4 @@ if len(_payload) > 48 * 1024:
     )
 dbutils.jobs.taskValues.set(key="iterations", value=_payload)
 dbutils.jobs.taskValues.set(key="batch_id", value=batch_id)
+{% endif %}

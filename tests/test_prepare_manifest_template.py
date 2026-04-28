@@ -719,3 +719,80 @@ def test_runtime_guard_size_log_appears_before_guard() -> None:
     assert "taskvalue payload bytes:" in output_l.lower(), (
         f"Size log must appear in stdout even when guard raises; got:\n{output_l!r}"
     )
+
+
+# ---------- U3 / Issue #21: empty-actions guard ------------------------------
+
+
+def test_lhp_man_006_empty_actions_render_contains_guard() -> None:
+    """Issue #21 / U3: empty actions list renders a clear LHP-MAN-006 raise.
+
+    Confirms the {% if not actions %} branch:
+      - emits the LHP-MAN-006 error code
+      - does NOT emit MERGE INTO, taskValues.set, or derive_run_id call
+      - parses as valid Python
+    """
+    import ast as _ast
+
+    rendered = _render([])
+
+    assert "LHP-MAN-006" in rendered, "guard error code missing from empty render"
+    assert "raise RuntimeError" in rendered, "empty-actions guard must raise"
+    # No MERGE / iterations payload / batch_id derivation in empty branch.
+    assert "MERGE INTO" not in rendered, "MERGE leaked into empty-actions branch"
+    assert "taskValues.set" not in rendered, "taskValues.set leaked into empty-actions branch"
+    assert "derive_run_id(" not in rendered, "derive_run_id call leaked into empty-actions branch"
+    # CREATE TABLE IF NOT EXISTS is OK before the guard — it is idempotent and
+    # establishes the manifest table even when no rows are about to be MERGEd.
+    assert "CREATE TABLE IF NOT EXISTS" in rendered, "DDL must still render before guard"
+
+    _ast.parse(rendered)
+
+
+def test_lhp_man_006_empty_actions_runtime_raises_before_spark_sql() -> None:
+    """Empty-actions render raises LHP-MAN-006 at notebook execution time.
+
+    Verifies the rendered notebook executes the DDL (one spark.sql call) and
+    then raises RuntimeError("LHP-MAN-006: ...") before any MERGE / DELETE.
+    """
+    rendered = _render([])
+    spark = _RecordingSpark()
+    dbutils = _FakeDbutils(run_id="job-1-task-1-attempt-0")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        _run_rendered(rendered, spark, dbutils)
+
+    assert "LHP-MAN-006" in str(exc_info.value), (
+        f"Empty-actions notebook must raise LHP-MAN-006; got: {exc_info.value!r}"
+    )
+    # Only the CREATE TABLE DDL should have run before the guard fires.
+    sql_statements = [s for s in spark.statements if s.strip()]
+    assert len(sql_statements) == 1, (
+        f"Expected exactly one spark.sql call (the DDL) before LHP-MAN-006; "
+        f"got {len(sql_statements)}: {sql_statements!r}"
+    )
+    assert "CREATE TABLE IF NOT EXISTS" in sql_statements[0]
+    # No taskValues.set should fire on the empty path.
+    assert dbutils.jobs.taskValues.calls == [], (
+        f"taskValues.set must not be called on empty-actions path; "
+        f"got {dbutils.jobs.taskValues.calls!r}"
+    )
+
+
+def test_non_empty_actions_render_unchanged_by_u3_guard() -> None:
+    """Regression check: non-empty render still contains MERGE + taskValues.
+
+    Ensures the {% else %} branch carries the existing MERGE / taskValues
+    payload code unchanged — the guard must not alter the happy path.
+    """
+    rendered = _render(_three_action_fixture())
+
+    assert "MERGE INTO" in rendered, "non-empty render must contain MERGE"
+    assert 'taskValues.set(key="iterations"' in rendered, (
+        "non-empty render must emit iterations taskValue"
+    )
+    assert 'taskValues.set(key="batch_id"' in rendered, (
+        "non-empty render must emit batch_id taskValue"
+    )
+    # Guard error code must NOT leak into the non-empty branch.
+    assert "LHP-MAN-006" not in rendered, "LHP-MAN-006 leaked into non-empty render"
