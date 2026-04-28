@@ -384,21 +384,71 @@ two requirements simultaneously:
 
 1. It must be a member of `B2_ITERATION_KEYS` — the canonical frozenset defined in
    `src/lhp/models/b2_iteration.py`.
-2. It must be emitted by `prepare_manifest` into the `b2_manifests` row for that
-   action (via the manifest INSERT template).
+2. It must be emitted by `prepare_manifest` into the iteration payload that flows
+   to each worker via DAB `taskValues.set("iterations", ...)`.
 
-If either requirement is not met, the worker will either skip the attribute silently
-or raise a `KeyError` at runtime.
+The 10 keys split into two persistence categories — both flow through the
+iteration payload, but only six are also persisted in `b2_manifests` rows:
+
+| Key | In `b2_manifests` row? | In iteration payload? |
+|---|---|---|
+| `batch_id` | yes (PK) | yes |
+| `action_name` | yes (PK) | yes |
+| `source_system_id` | yes | yes |
+| `schema_name` | yes | yes |
+| `table_name` | yes | yes |
+| `load_group` | yes | yes |
+| `manifest_table` | no (FQN, not data) | yes |
+| `jdbc_table` | **no** (issue #19) | yes |
+| `watermark_column` | **no** (issue #19) | yes |
+| `landing_path` | **no** (issue #19) | yes |
+
+The three "no" rows are a deliberate design choice: `jdbc_table`,
+`watermark_column`, and `landing_path` flow via `taskValues` only because the
+`watermarks` table already records all three on every run and is joinable on
+`worker_run_id`. Adding them to the manifest DDL would require an `ALTER TABLE`
+migration on every existing devtest/qa/prod manifest table for an
+observability gap already covered by the watermarks join.
+
+### Audit join pattern (for the three taskValue-only keys)
+
+To reconstruct full per-action source coordinates from a completed batch:
+
+```sql
+SELECT
+    m.batch_id,
+    m.action_name,
+    m.execution_status                AS manifest_status,
+    m.worker_run_id,
+    w.source_system_id,
+    w.schema_name,
+    w.table_name,
+    w.watermark_column_name,
+    w.watermark_value,
+    w.row_count,
+    w.status                          AS worker_status,
+    w.completed_at
+FROM metadata.<env>_orchestration.b2_manifests m
+LEFT JOIN metadata.<env>_orchestration.watermarks w
+    ON w.run_id = m.worker_run_id
+WHERE m.batch_id = '<batch_id>'
+ORDER BY m.action_name;
+```
+
+`jdbc_table` and `landing_path` are not stored in either table; recover them
+from the rendered pipeline YAML if needed (each LOAD action declares both as
+inline literals, which is how `prepare_manifest` populates them at codegen).
 
 **To extend the contract** (add a new per-action attribute):
 
 1. Add the attribute name to `B2_ITERATION_KEYS` in `src/lhp/models/b2_iteration.py`.
 2. Emit the attribute from the `prepare_manifest` template
-   (`src/lhp/templates/b2/prepare_manifest.py.j2`).
+   (`src/lhp/templates/b2/prepare_manifest.py.j2`) into the iteration payload.
 3. Consume the attribute in the worker template
    (`src/lhp/templates/b2/worker/jdbc_watermark_job.py.j2`).
 4. Re-run `tests/test_b2_iteration_contract.py` — it asserts that every key in
-   `B2_ITERATION_KEYS` is present in the manifest INSERT and the worker read path.
+   `B2_ITERATION_KEYS` is present in both the iteration payload and the worker
+   read path.
 
 ---
 

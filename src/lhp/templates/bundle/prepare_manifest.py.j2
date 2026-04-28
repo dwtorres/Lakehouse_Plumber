@@ -87,6 +87,23 @@ manifest_table = f"{wm_catalog}.{wm_schema}.b2_manifests"
 # R9: Auto-DDL — create b2_manifests on first run. CREATE TABLE IF NOT EXISTS
 # is the idempotency guard; Delta handles the existence check natively.
 # No SHOW TABLES pre-check is needed or used here.
+#
+# Issue #19 — intentional column omission: three keys carried by
+# B2_ITERATION_KEYS (jdbc_table, watermark_column, landing_path) flow to each
+# worker via DAB taskValues only and are NOT persisted in b2_manifests. This
+# is a deliberate design choice — the watermarks table records all three on
+# every run and is joinable on worker_run_id. Audit pattern:
+#
+#     SELECT m.*, w.source_system_id, w.schema_name, w.table_name,
+#            w.watermark_column_name, w.watermark_value
+#     FROM <manifest_table> m
+#     LEFT JOIN <watermarks_table> w ON w.run_id = m.worker_run_id
+#     WHERE m.batch_id = '<batch_id>';
+#
+# Adding the three columns to this DDL would require an ALTER TABLE migration
+# on every existing devtest/qa/prod manifest table for an observability gap
+# already covered by the watermarks join. See docs/runbooks/b2-for-each-rollout.md
+# section "Audit join pattern" for operator guidance.
 _ddl = f"""
     CREATE TABLE IF NOT EXISTS {manifest_table} (
         batch_id         STRING NOT NULL,
