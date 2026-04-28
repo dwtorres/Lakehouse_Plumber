@@ -37,7 +37,7 @@ actions:
     watermark:
       column: ModifiedDate
       type: timestamp
-      # operator omitted — codegen defaults to ">" for execution_mode: for_each (R12)
+      operator: ">"  # LHP-CFG-035: explicit strict-gt required for for_each
       source_system_id: pg_supabase_aw_b2
       catalog: "${watermark_catalog}"
       schema: "${watermark_schema}"
@@ -58,6 +58,7 @@ actions:
     watermark:
       column: ModifiedDate
       type: timestamp
+      operator: ">"  # LHP-CFG-035: explicit strict-gt required for for_each
       source_system_id: pg_supabase_aw_b2
       catalog: "${watermark_catalog}"
       schema: "${watermark_schema}"
@@ -78,6 +79,7 @@ actions:
     watermark:
       column: ModifiedDate
       type: timestamp
+      operator: ">"  # LHP-CFG-035: explicit strict-gt required for for_each
       source_system_id: pg_supabase_aw_b2
       catalog: "${watermark_catalog}"
       schema: "${watermark_schema}"

@@ -618,3 +618,29 @@ def test_final_status_no_bare_coalesce_projection() -> None:
         "Issue #18 R4: bare coalesce projection of final_status must not "
         "appear; the CASE form supersedes it"
     )
+
+
+def test_final_status_running_plus_completed_watermark_guard() -> None:
+    """Issue #18 R4 silent-divergence guard: when manifest_status='running'
+    and a stale watermarks row matched on worker_run_id shows 'completed',
+    the CASE must trust manifest ('running') — not coalesce to 'completed'.
+
+    Devtest 2026-04-27 caught the original U2 CASE form was incomplete:
+    the ELSE branch's coalesce(worker_status, manifest_status) returned
+    'completed' for this scenario, false-passing an action that never
+    actually ran extraction this batch (DuplicateRunError abort, partial
+    replay, or run_id collision via override widget).
+
+    The fix adds an explicit WHEN m.manifest_status = 'running' AND
+    w.worker_status = 'completed' branch that returns manifest_status."""
+    rendered = _render()
+    assert "WHEN m.manifest_status = 'running'" in rendered, (
+        "Issue #18 R4: missing silent-divergence guard branch for "
+        "manifest='running' + worker='completed'"
+    )
+    # Both call sites (count + failure-enumeration) must carry the guard.
+    guard_count = rendered.count("WHEN m.manifest_status = 'running'")
+    assert guard_count == 2, (
+        f"Expected 2 silent-divergence guards (count + failure-enumeration "
+        f"queries); got {guard_count}"
+    )
