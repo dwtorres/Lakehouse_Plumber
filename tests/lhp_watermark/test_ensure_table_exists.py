@@ -379,3 +379,185 @@ def test_second_call_is_idempotent_and_emits_no_alter() -> None:
     assert _statements_starting_with(spark, "DESCRIBE DETAIL"), (
         "second call must re-probe clustering"
     )
+
+
+# ---------- 6. U4 / Issue #22: ALTER paths retry on ConcurrentAppendException
+
+
+class _RetryConcurrentSpark(_ScriptedByPrefixSpark):
+    """Variant that fails the first N ``ALTER TABLE`` statements with a
+    fake ``ConcurrentAppendException`` before letting subsequent calls succeed.
+
+    Used to assert U4: ``_alter_with_retry`` recovers from a transient
+    fleet-deploy race, and the budget is correctly bounded.
+    """
+
+    def __init__(self, fail_alter_n_times: int) -> None:
+        super().__init__()
+        self._remaining_fails = fail_alter_n_times
+        self.alter_attempts = 0
+
+    def sql(self, statement: str) -> Any:
+        if statement.strip().upper().startswith("ALTER TABLE"):
+            self.alter_attempts += 1
+            if self._remaining_fails > 0:
+                self._remaining_fails -= 1
+                self.statements.append(statement)
+                # Class name match is what `is_concurrent_commit_exception`
+                # detects in test environments.
+                exc = type("ConcurrentAppendException", (Exception,), {})(
+                    "transient fleet-deploy race"
+                )
+                raise exc
+        return super().sql(statement)
+
+
+def test_alter_cluster_by_retries_on_concurrent_commit_then_succeeds(monkeypatch: Any) -> None:
+    """U4 / #22: a single transient ConcurrentAppendException is retried; a
+    second ALTER attempt succeeds. Verifies the fleet-deploy recovery path."""
+    # Skip the production backoff sleep in tests.
+    monkeypatch.setattr("lhp_watermark._merge_helpers.time.sleep", lambda _s: None)
+    spark = _RetryConcurrentSpark(fail_alter_n_times=1)
+    spark.register("SHOW TABLES", _show_tables_handler(table_present=True))
+    # Column present; clustering wrong → ALTER CLUSTER BY fires.
+    spark.register(
+        "DESCRIBE TABLE",
+        _describe_table_handler(
+            columns=[
+                "run_id", "source_system_id", "schema_name", "table_name",
+                "load_group", "status",
+            ]
+        ),
+    )
+    spark.register(
+        "DESCRIBE DETAIL",
+        _describe_detail_handler(
+            clustering=("source_system_id", "schema_name", "table_name")
+        ),
+    )
+
+    _build_manager(spark)
+
+    # Two attempts: first failed (concurrent-commit), second succeeded.
+    assert spark.alter_attempts == 2, (
+        f"expected exactly 2 ALTER attempts (1 fail + 1 success); "
+        f"got {spark.alter_attempts}"
+    )
+
+
+def test_alter_cluster_by_exhausts_budget_and_raises_typed(monkeypatch: Any) -> None:
+    """U4 / #22: 11 consecutive ConcurrentAppendException → exhaustion →
+    WatermarkConcurrencyError with ``attempts`` reflecting the actual
+    retry count (10), not the constant 1 of the pre-U4 implementation."""
+    from lhp_watermark.exceptions import WatermarkConcurrencyError
+    import pytest
+
+    # Skip backoff sleep — exhaustion path would otherwise sleep ~256s
+    # cumulative (0.5 × 2^N for N=0..8) before raising.
+    monkeypatch.setattr("lhp_watermark._merge_helpers.time.sleep", lambda _s: None)
+    spark = _RetryConcurrentSpark(fail_alter_n_times=20)
+    spark.register("SHOW TABLES", _show_tables_handler(table_present=True))
+    spark.register(
+        "DESCRIBE TABLE",
+        _describe_table_handler(
+            columns=[
+                "run_id", "source_system_id", "schema_name", "table_name",
+                "load_group", "status",
+            ]
+        ),
+    )
+    spark.register(
+        "DESCRIBE DETAIL",
+        _describe_detail_handler(
+            clustering=("source_system_id", "schema_name", "table_name")
+        ),
+    )
+
+    with pytest.raises(WatermarkConcurrencyError) as exc_info:
+        _build_manager(spark)
+
+    err = exc_info.value
+    # Pre-U4 implementation hard-coded `attempts=1`. Post-U4 reports the
+    # real retry count (10). Accept ``>= 2`` defensively in case the
+    # budget is tuned later, but require it to be more than the trivial 1.
+    assert err.attempts >= 2, (
+        f"WatermarkConcurrencyError.attempts must reflect real retry count; "
+        f"got attempts={err.attempts}"
+    )
+    assert spark.alter_attempts == 10, (
+        f"expected exactly _ALTER_RETRY_BUDGET (10) ALTER attempts; "
+        f"got {spark.alter_attempts}"
+    )
+
+
+def test_alter_add_columns_retries_on_concurrent_commit(monkeypatch: Any) -> None:
+    """U4 / #22: same retry behavior on ADD COLUMNS path."""
+    monkeypatch.setattr("lhp_watermark._merge_helpers.time.sleep", lambda _s: None)
+    spark = _RetryConcurrentSpark(fail_alter_n_times=1)
+    spark.register("SHOW TABLES", _show_tables_handler(table_present=True))
+    # Column missing → ADD COLUMNS fires; clustering already correct.
+    spark.register(
+        "DESCRIBE TABLE",
+        _describe_table_handler(
+            columns=[
+                "run_id", "source_system_id", "schema_name", "table_name",
+                "status",
+            ]
+        ),
+    )
+    spark.register(
+        "DESCRIBE DETAIL",
+        _describe_detail_handler(
+            clustering=("source_system_id", "load_group", "schema_name", "table_name")
+        ),
+    )
+
+    _build_manager(spark)
+
+    assert spark.alter_attempts == 2, (
+        f"ADD COLUMNS should retry once on concurrent-commit; "
+        f"got {spark.alter_attempts} attempts"
+    )
+
+
+def test_alter_non_concurrent_exception_raises_first_attempt_no_retry() -> None:
+    """U4 / #22: non-concurrent-commit exception raises on first attempt
+    without retry — the helper distinguishes by exception type."""
+    import pytest
+
+    class _AnalysisErrorSpark(_ScriptedByPrefixSpark):
+        def __init__(self) -> None:
+            super().__init__()
+            self.alter_attempts = 0
+
+        def sql(self, statement: str) -> Any:
+            if statement.strip().upper().startswith("ALTER TABLE"):
+                self.alter_attempts += 1
+                raise RuntimeError("AnalysisException: invalid clustering column")
+            return super().sql(statement)
+
+    spark = _AnalysisErrorSpark()
+    spark.register("SHOW TABLES", _show_tables_handler(table_present=True))
+    spark.register(
+        "DESCRIBE TABLE",
+        _describe_table_handler(
+            columns=[
+                "run_id", "source_system_id", "schema_name", "table_name",
+                "load_group", "status",
+            ]
+        ),
+    )
+    spark.register(
+        "DESCRIBE DETAIL",
+        _describe_detail_handler(
+            clustering=("source_system_id", "schema_name", "table_name")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="AnalysisException"):
+        _build_manager(spark)
+
+    assert spark.alter_attempts == 1, (
+        f"non-concurrent-commit exception must NOT retry; "
+        f"got {spark.alter_attempts} attempts"
+    )

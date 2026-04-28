@@ -250,6 +250,36 @@ Apply the same recurring maintenance policy to the watermarks registry:
 Schedule these as separate Databricks SQL tasks or as a maintenance workflow
 running off-peak. They do not block extraction jobs.
 
+### First-deploy concurrent ALTER race (issue #22)
+
+When two pipelines deploy concurrently against a fresh (or schema-mismatched)
+watermarks registry, both `WatermarkManager.__init__` calls can race on
+`ALTER TABLE … ADD COLUMNS (load_group …)` or `ALTER TABLE … CLUSTER BY (...)`.
+The probes (`DESCRIBE TABLE` / `DESCRIBE DETAIL`) and the `ALTER` form a TOCTOU
+pair that Delta cannot make atomic — under fleet load the cumulative race
+window is small but non-zero.
+
+The two ALTER paths are wrapped in `execute_with_concurrent_commit_retry` with
+a 10-attempt budget and 0.5-second base backoff. Expected behavior on first
+multi-pipeline deploy:
+
+- **Steady state**: zero ALTER retries — the second deploy sees the target
+  shape and the probes short-circuit before any ALTER is composed.
+- **Race occurred and recovered**: one or two `WARN` log lines per worker —
+  `<op_label> retry … after ConcurrentAppendException` — followed by clean
+  startup. No operator action required.
+- **Race exhausted budget**: the worker raises `WatermarkConcurrencyError`
+  with `attempts >= 2`. Investigate the deploy churn (is a third pipeline
+  also rolling out? a manual ALTER outside DAB?) and re-run the failed
+  iteration. The manifest row stays at `pending` — recovery is the same as
+  for `LHP-MAN-002`.
+
+Tuning notes: the 10-attempt budget × cumulative ~256 s backoff worst-case is
+intentional. Reducing it makes first-deploy spurious failures more likely;
+raising it hides genuine deploy contention. If a steady-state deploy starts
+producing routine retries, the right response is to stagger pipeline
+deploys, not to widen the budget.
+
 ---
 
 ## Troubleshooting
