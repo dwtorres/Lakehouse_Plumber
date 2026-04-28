@@ -1327,6 +1327,144 @@ At **runtime** (LHP-MAN-005 from ``prepare_manifest`` logs):
    :ref:`LHP-CFG-033 <LHP-CFG-033: for_each Post-Expansion Structural Violation>`
    for the structural action-count cap (300) that is a companion limit.
 
+LHP-MAN-006: prepare_manifest Empty Actions List
+-------------------------------------------------
+
+**When it occurs:** The ``prepare_manifest.py.j2`` template was rendered with
+an empty ``actions`` codegen-context list. The Jinja-level ``{% if not
+actions %}`` guard wraps the MERGE block, retention DELETE, iteration payload,
+and ``dbutils.jobs.taskValues.set`` calls; the ``{% else %}`` branch raises
+``RuntimeError("LHP-MAN-006: ...")`` immediately after the
+``CREATE TABLE IF NOT EXISTS`` (which is idempotent and harmless).
+
+**Why it is an error:** With an empty actions list, the MERGE statement's
+``FROM VALUES`` clause renders with zero tuples — Spark would raise an
+unstructured ``ParseException`` rather than a clear LHP error. The guard
+surfaces the contract violation at the lowest layer possible so the operator
+sees the LHP code instead of a SQL parse error.
+
+**Common causes (none reachable via valid YAML today):**
+
+- A future generator that calls ``_emit_b2_aux_files`` without first checking
+  that at least one ``jdbc_watermark_v2`` LOAD action exists.
+- A future per-action filter (e.g., ``include_tests=False``) that shrinks
+  the codegen actions list to zero before render time.
+- A direct unit-test harness that renders ``prepare_manifest.py.j2`` with
+  ``actions=[]`` to exercise the guard itself.
+
+**Resolution:**
+
+LHP-MAN-006 indicates a generator contract violation. The runtime check
+exists so the violation surfaces clearly; the actual fix belongs in the
+codegen layer:
+
+1. Inspect ``src/lhp/generators/load/jdbc_watermark_job.py``
+   (``_emit_b2_aux_files``) and confirm the call site only fires when at
+   least one ``jdbc_watermark_v2`` LOAD action is present in the post-
+   expansion flowgroup.
+2. Confirm validator LHP-CFG-033 (``action_count >= 1``) is being run
+   before codegen; if it was bypassed, the bypass is the bug.
+3. File an LHP issue with the rendered notebook + the generator call site
+   stack trace.
+
+.. note::
+
+   The ``CREATE TABLE IF NOT EXISTS`` statement runs **before** the LHP-MAN-006
+   guard. This is intentional and harmless — the manifest table is created
+   idempotently, no rows are written, and no taskValues are emitted. There
+   is no orphaned state to clean up.
+
+.. seealso::
+
+   :ref:`LHP-CFG-033 <LHP-CFG-033: for_each Post-Expansion Structural Violation>`
+   for the codegen-time validator that should fire before LHP-MAN-006 is
+   ever reached.
+
+LHP-MAN-007: batch_id Collision With Non-Pending Rows
+------------------------------------------------------
+
+**When it occurs:** ``prepare_manifest`` derives a ``batch_id`` (typically
+via the ``lhp_run_id_override`` widget) and the ``b2_manifests`` table
+already contains one or more rows with that ``batch_id`` whose
+``execution_status`` is **not** ``'pending'``. The collision-rejection
+``SELECT count(1) FROM b2_manifests WHERE batch_id = :derived AND
+execution_status != 'pending'`` runs immediately after ``batch_id``
+derivation and raises ``RuntimeError("LHP-MAN-007: ...")``.
+
+**Why it is an error:** Without this guard, the ``MERGE WHEN MATCHED``
+clause would silently update only ``updated_at`` on the colliding rows,
+leaving the prior batch's ``worker_run_id``, ``execution_status``, and
+worker-state intact. Workers in the new batch would then see rows already
+claimed (every action raises LHP-MAN-002) and ``validate`` would coalesce
+on stale watermarks rows matched on the same ``worker_run_id`` — the
+operator sees ``status='pass'`` for a batch that never ran extraction.
+
+**Common causes:**
+
+- An operator deliberately re-uses an ``lhp_run_id_override`` value across
+  batches (the override widget is intended for backfill/test, but DAB does
+  not enforce uniqueness).
+- A bundle redeploy resets DAB job/task counters such that
+  ``derive_run_id`` resolves to a previously-used composite token.
+- A test harness or backfill script supplies a hard-coded run_id for
+  reproducibility.
+
+**Resolution (operator):**
+
+1. Read the worker task log for ``prepare_manifest``; the LHP-MAN-007
+   message contains the colliding ``batch_id`` and the count of non-
+   pending rows.
+2. Decide whether to retain the prior batch's rows for audit, or
+   invalidate them:
+
+   **Retain** (audit needed):
+
+   - Pick a distinct override value (e.g., ``local-<new-uuid>``) and set
+     it on the workflow widget.
+   - Or clear the widget and let ``derive_run_id`` resolve from the Jobs
+     context — DAB job/task identifiers will produce a fresh composite
+     token.
+   - Re-run the workflow.
+
+   **Invalidate** (operator confirms the prior batch is dead):
+
+   .. code-block:: sql
+
+      DELETE FROM <wm_catalog>.<wm_schema>.b2_manifests
+      WHERE batch_id = '<colliding_batch_id>';
+
+   Then re-run the workflow with the original (or any) override value.
+   The 30-day retention DELETE in ``prepare_manifest`` would also clean
+   these rows automatically; the manual DELETE avoids them appearing in
+   operational queries in the meantime.
+
+**Pending-only collisions are NOT errors.** The predicate filters
+``execution_status != 'pending'`` so a batch that successfully called
+``prepare_manifest`` but was cancelled before any worker claimed a row
+remains in ``'pending'`` state and is treated as the legitimate
+idempotent re-execute case (MERGE WHEN MATCHED updates ``updated_at``
+as today).
+
+.. note::
+
+   ``lhp_run_id_override`` widget values are validated by
+   ``SQLInputValidator.uuid_or_job_run_id`` against three strict forms:
+   bare UUID v4, ``local-<uuid4>``, and ``job-<digits>-task-<digits>-
+   attempt-<digits>``. Malformed values are rejected at the widget read
+   site with ``WatermarkValidationError`` before reaching this collision
+   check.
+
+.. seealso::
+
+   :ref:`LHP-MAN-002 <LHP-MAN-002: Manifest Claim Ownership Conflict>`
+   for the worker-side error that pre-LHP-MAN-007 would have fired
+   cascade-style across every action when collision was undetected.
+   :ref:`LHP-WM-001 <LHP-WM-001: Duplicate run_id (DuplicateRunError)>`
+   for the related run-id provenance issue at the ``insert_new`` site.
+   `b2-for-each-rollout.md <https://github.com/dwtorres/Lakehouse_Plumber/blob/watermark/docs/runbooks/b2-for-each-rollout.md>`_
+   "lhp_run_id_override widget (issue #23)" section for the operator
+   recovery procedure.
+
 Watermark Errors (LHP-WM)
 ==========================
 
