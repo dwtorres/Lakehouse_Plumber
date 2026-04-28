@@ -260,19 +260,27 @@ pair that Delta cannot make atomic — under fleet load the cumulative race
 window is small but non-zero.
 
 The two ALTER paths are wrapped in `execute_with_concurrent_commit_retry` with
-a 10-attempt budget and 0.5-second base backoff. Expected behavior on first
-multi-pipeline deploy:
+a 10-attempt budget and 0.5-second base backoff. The retry helper is silent
+on success and on per-attempt retries — consistent with the DML retry path
+used by `WatermarkManager._merge_with_retry` and `insert_new`. Expected
+behavior on first multi-pipeline deploy:
 
 - **Steady state**: zero ALTER retries — the second deploy sees the target
-  shape and the probes short-circuit before any ALTER is composed.
-- **Race occurred and recovered**: one or two `WARN` log lines per worker —
-  `<op_label> retry … after ConcurrentAppendException` — followed by clean
-  startup. No operator action required.
+  shape and the probes short-circuit before any ALTER is composed. No log
+  output from the retry path.
+- **Race occurred and recovered**: silent. The retry helper does not log
+  per-attempt; observability comes from total `WatermarkManager.__init__`
+  duration in worker driver logs (a recovered race adds at most a few
+  seconds at base backoff 0.5 s × jitter). Workers proceed to claim
+  manifest rows and the batch completes normally.
 - **Race exhausted budget**: the worker raises `WatermarkConcurrencyError`
-  with `attempts >= 2`. Investigate the deploy churn (is a third pipeline
-  also rolling out? a manual ALTER outside DAB?) and re-run the failed
-  iteration. The manifest row stays at `pending` — recovery is the same as
-  for `LHP-MAN-002`.
+  with `attempts >= 2` (the actual retry count, surfaced via the
+  `_CountingSpark` wrapper). The error is logged at `ERROR` level with
+  the `op_label` (`ALTER TABLE CLUSTER BY` or `ALTER TABLE ADD COLUMNS`)
+  and the underlying exception. Investigate the deploy churn (is a third
+  pipeline also rolling out? a manual ALTER outside DAB?) and re-run the
+  failed iteration. The manifest row stays at `pending` — recovery is the
+  same as for `LHP-MAN-002`.
 
 Tuning notes: the 10-attempt budget × cumulative ~256 s backoff worst-case is
 intentional. Reducing it makes first-deploy spurious failures more likely;
