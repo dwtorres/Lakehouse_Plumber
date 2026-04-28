@@ -275,6 +275,20 @@ running off-peak. They do not block extraction jobs.
 
 ---
 
+### Long-running fleets and the validate window (issue #20)
+
+`validate` does not time-bound its scan. The query filters
+`b2_manifests` by exact `batch_id` (delivered from `prepare_manifest`
+via DAB taskValue), so fleets that take longer than 24 hours to
+complete — e.g., `concurrency: 1` × ~300 actions × slow JDBC source —
+are read correctly. There is no `INTERVAL N HOURS` predicate in
+`validate.py.j2`; reintroducing one would re-open the silent
+`noop_pass` failure mode this design eliminated. The
+`prepare_manifest` retention `DELETE … INTERVAL 30 DAYS` is a separate,
+intentional cleanup path and does not affect any in-flight batch.
+
+---
+
 ### Anomaly B addendum (issue #18 — explicit DuplicateRunError handling)
 
 The Anomaly B failure-mirror was added in PR #13 / PR #24 to make
