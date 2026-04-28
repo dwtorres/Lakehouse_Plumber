@@ -644,3 +644,154 @@ def test_final_status_running_plus_completed_watermark_guard() -> None:
         f"Expected 2 silent-divergence guards (count + failure-enumeration "
         f"queries); got {guard_count}"
     )
+
+
+# ---------- behavioral CASE-form test matrix (issue #28) ---------------------
+#
+# Why this exists: PR #26's render-substring tests confirmed the new CASE form
+# was *present* in the template but never executed it. Devtest replay caught a
+# silent false pass live (manifest='running' + worker='completed' coalesced to
+# 'completed' via the ELSE branch). PR #27 added an explicit guard branch.
+# Issue #28 tracks the test-coverage gap that allowed the bug through.
+#
+# This section closes that gap by extracting both CASE blocks from the rendered
+# template and executing each against an in-memory DuckDB connection for every
+# (manifest_status, worker_status) input pair the issue #18 plan named.
+#
+# DuckDB dialect dependencies (R6): the rendered CASE relies only on:
+#   - CASE / WHEN / THEN / ELSE / END
+#   - String equality on literals
+#   - AND / OR / IS NULL boolean expressions
+#   - coalesce(...) on string columns with NULL semantics
+# DuckDB and Spark agree on all of these. If a future template change adds
+# Spark-only constructs (window functions, lateral subqueries, Spark-specific
+# functions), the helpers below will need re-validation.
+
+import duckdb  # noqa: E402  (test-only dep; intentional bottom-of-file import)
+
+# Regex captures everything from `CASE` through `END AS final_status` non-
+# greedily. Whitespace is tolerated (re.DOTALL + \s+) so indentation differences
+# between the count CTE and the failure-enumeration CTE do not break extraction.
+_CASE_BLOCK_RE = re.compile(r"CASE\s+WHEN.*?END AS final_status", re.DOTALL)
+
+_CALL_SITES = ("count_case", "failure_case")
+
+
+def _extract_case_blocks(rendered: str) -> List[str]:
+    """Extract the two `CASE ... END AS final_status` blocks from rendered template.
+
+    Returns them in template-source order: ``[count_case, failure_case]``.
+    Raises AssertionError with a short snippet of the rendered output when
+    extraction does not yield exactly two blocks — this is the signal that
+    template structure has drifted and the helper needs updating.
+    """
+    blocks = _CASE_BLOCK_RE.findall(rendered)
+    assert len(blocks) == 2, (
+        f"Expected exactly 2 final_status CASE blocks in rendered template, "
+        f"got {len(blocks)}. Template structure may have drifted; update "
+        f"_CASE_BLOCK_RE or the validate.py.j2 CASE form. "
+        f"First 500 chars of rendered output:\n{rendered[:500]}"
+    )
+    return blocks
+
+
+def _eval_case_in_duckdb(
+    case_block: str,
+    inputs: List[tuple],
+) -> List[Any]:
+    """Execute the extracted CASE block against an in-memory DuckDB connection.
+
+    Substitutions performed (documented for audit fidelity):
+      - ``m.manifest_status`` -> ``m_manifest_status`` (qualifier flattened
+        because the test fixture uses a single subquery, not a JOIN)
+      - ``w.worker_status``   -> ``w_worker_status``
+      - `` AS final_status``  -> stripped (the column alias would conflict with
+        the SELECT list)
+
+    Each entry in ``inputs`` is a ``(manifest_status, worker_status)`` tuple.
+    Returns the resulting ``final_status`` value per input, in input order.
+    """
+    expr = (
+        case_block
+        .replace("m.manifest_status", "m_manifest_status")
+        .replace("w.worker_status", "w_worker_status")
+        .replace(" AS final_status", "")
+    )
+    con = duckdb.connect(":memory:")
+    try:
+        results: List[Any] = []
+        for manifest_status, worker_status in inputs:
+            sql = (
+                f"SELECT {expr} "
+                f"FROM (SELECT ? AS m_manifest_status, ? AS w_worker_status)"
+            )
+            row = con.execute(sql, [manifest_status, worker_status]).fetchone()
+            results.append(row[0])
+        return results
+    finally:
+        con.close()
+
+
+# Each tuple: (manifest_status, worker_status, expected_final_status, label).
+# The label feeds @pytest.mark.parametrize ids= so test failures name the
+# scenario, not its index.
+_SCENARIOS = [
+    # Happy path: both sides terminal-completed.
+    ("completed", "completed", "completed", "happy_path_both_completed"),
+    # Edge: manifest terminal, worker row absent (rare but legal).
+    ("completed", None, "completed", "manifest_done_no_worker_row"),
+    # Happy path: both sides terminal-failed.
+    ("failed", "failed", "failed", "loud_failure_both_failed"),
+    # Edge: manifest failed, worker row absent (defense-in-depth).
+    ("failed", None, "failed", "manifest_failed_no_worker_row"),
+    # ERROR PATH: issue #18 R4 silent-divergence guard. Stale watermarks row
+    # matched on worker_run_id shows 'completed' while manifest is still
+    # 'running'. CASE must trust manifest, not coalesce.
+    ("running", "completed", "running", "issue_18_silent_divergence_guard"),
+    # Edge: in-flight pass-through.
+    ("running", "running", "running", "in_flight_passthrough"),
+    # Edge: worker never started; manifest claim still 'running'.
+    ("running", None, "running", "worker_never_started"),
+    # Integration: ELSE coalesce surfaces worker-side intermediate status that
+    # never lands in b2_manifests. Operator-visibility purpose of the ELSE.
+    ("running", "abandoned", "abandoned", "else_coalesce_abandoned"),
+    ("running", "landed_not_committed", "landed_not_committed",
+     "else_coalesce_landed_not_committed"),
+]
+
+
+@pytest.mark.parametrize("call_site", _CALL_SITES)
+@pytest.mark.parametrize(
+    "manifest_status,worker_status,expected,label",
+    _SCENARIOS,
+    ids=[s[3] for s in _SCENARIOS],
+)
+def test_final_status_case_behavioral(
+    manifest_status: Optional[str],
+    worker_status: Optional[str],
+    expected: str,
+    label: str,
+    call_site: str,
+) -> None:
+    """Behavioral lock-down of validate.py.j2 final_status CASE projection.
+
+    Issue #28: PR #26 shipped a structurally-correct CASE form whose ELSE
+    branch silently false-passed the (manifest='running', worker='completed')
+    input combination. PR #27 added an explicit guard branch. This test
+    exercises the *rendered* CASE — extracted from the template, not
+    re-stated — against every input combination the issue #18 plan named,
+    on both call sites (count aggregate + failure-enumeration CTE).
+
+    A future template change that breaks behavior on any input/output pair
+    here fails this test loudly with the scenario label and call site named
+    in the parametrize id.
+    """
+    rendered = _render()
+    blocks = _extract_case_blocks(rendered)
+    case_block = blocks[_CALL_SITES.index(call_site)]
+    [actual] = _eval_case_in_duckdb(case_block, [(manifest_status, worker_status)])
+    assert actual == expected, (
+        f"Behavioral CASE test failed: scenario={label} call_site={call_site} "
+        f"input=({manifest_status!r}, {worker_status!r}) "
+        f"expected={expected!r} actual={actual!r}"
+    )
