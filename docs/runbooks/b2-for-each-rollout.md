@@ -301,9 +301,59 @@ deploys, not to widen the budget.
 | LHP-MAN-003 | Manifest row missing for action after claim UPDATE | Re-run full workflow from beginning; check that `prepare_manifest` succeeded. See [errors_reference.rst](../errors_reference.rst#lhp-man-003-manifest-row-missing-for-action) |
 | LHP-MAN-004 | Completion mirror MERGE retry exhausted; manifest row stuck in `running` | Reduce `concurrency`; manually correct manifest row if watermark shows completed. See [errors_reference.rst](../errors_reference.rst#lhp-man-004-completion-mirror-merge-retry-budget-exhausted) |
 | LHP-MAN-005 | Projected or actual `iterations` taskValue payload exceeds DAB 48 KB ceiling | Reduce action count or shorten field identifiers. At runtime: DELETE orphaned manifest rows and redeploy. See [errors_reference.rst](../errors_reference.rst#lhp-man-005-manifest-taskvalue-payload-exceeds-dab-48-kb-ceiling) |
+| LHP-MAN-006 | `prepare_manifest` rendered with empty `actions` list — codegen contract violation | Inspect the generator call site; LHP-CFG-033 should have rejected this earlier. File an LHP issue. See [errors_reference.rst](../errors_reference.rst#lhp-man-006-prepare-manifest-empty-actions-list) |
+| LHP-MAN-007 | Operator-supplied `lhp_run_id_override` collides with a non-pending row in `b2_manifests` | Pick a distinct override value or clear the widget; or DELETE the colliding `batch_id` rows if the prior batch is invalidated. See [`lhp_run_id_override` widget](#lhp_run_id_override-widget-issue-23) section above and [errors_reference.rst](../errors_reference.rst#lhp-man-007-batch-id-collision-with-non-pending-rows) |
 | LHP-WM-001 | `DuplicateRunError` raised by `wm.insert_new` — `run_id` already present in watermarks. Often a `__lhp_run_id_override` collision or a redeploy that resets DAB task counters. | Search worker task log for `duplicate_run_id_abort`. Clear the override widget or redeploy to refresh task identifiers. The manifest row stays in `running` and `validate` surfaces it as `final_status='running'` — manually reset via the LHP-MAN-002 procedure after fixing run_id provenance. See [errors_reference.rst](../errors_reference.rst#lhp-wm-001-duplicate-run-id-duplicaterunerror) |
 
 ---
+
+### `lhp_run_id_override` widget (issue #23)
+
+The widget is intended for backfill/test scenarios — `derive_run_id`
+honours an operator-supplied value over the Jobs context and emits a
+`WARNING` log entry so the override leaves an audit trail.
+
+**Valid forms** (enforced by `SQLInputValidator.uuid_or_job_run_id`):
+
+- A bare UUID v4: `12345678-1234-1234-1234-123456789abc`
+- A `local-` prefixed UUID: `local-<uuid4>`
+- A Jobs-context-shaped token: `job-{int}-task-{int}-attempt-{int}`
+
+Any other form (alphabetic where digits are required, leading/trailing
+whitespace, mixed case, missing segments) raises
+`WatermarkValidationError` at the widget read site — the override is
+rejected before any downstream code trusts it.
+
+**Collision risk and recovery (LHP-MAN-007)**
+
+Re-using an override value whose derived `batch_id` matches a prior live,
+completed, or failed batch silently re-uses the prior batch's manifest
+rows. Pre-U5 (issue #23), the `MERGE WHEN MATCHED` clause in
+`prepare_manifest` only updated `updated_at`, leaving the prior batch's
+`worker_run_id` and `execution_status` intact. Workers then saw rows
+already claimed and raised `LHP-MAN-002` for every action; `validate`
+coalesced on stale watermarks rows and returned `pass`. The operator saw
+green for a batch that never ran extraction.
+
+The `prepare_manifest` task now runs a collision-rejection
+`SELECT count(1) FROM b2_manifests WHERE batch_id = :derived AND
+execution_status != 'pending'` immediately after `batch_id` derivation.
+Any non-pending row triggers `LHP-MAN-007` and the task fails fast
+without mutating state. A `pending`-only collision is the legitimate
+idempotent re-execute case and is allowed through to the MERGE as today.
+
+**Recovery procedure for LHP-MAN-007:**
+
+1. Read the worker task log; the error message contains the colliding
+   `batch_id` and the count of non-pending rows.
+2. Decide whether to retain or invalidate the prior batch's rows:
+   - **Retain** (audit needed): pick a distinct `lhp_run_id_override`
+     value (e.g., `local-<new-uuid>`), or clear the widget and let
+     `derive_run_id` resolve from the Jobs context, then re-run.
+   - **Invalidate** (operator confirms the prior batch is dead):
+     `DELETE FROM metadata.<env>_orchestration.b2_manifests WHERE
+     batch_id = '<colliding_batch_id>'`, then re-run with the
+     original override (or any override).
 
 ### Long-running fleets and the validate window (issue #20)
 

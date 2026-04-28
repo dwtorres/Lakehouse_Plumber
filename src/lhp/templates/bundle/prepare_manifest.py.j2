@@ -161,6 +161,45 @@ SQLInputValidator.string(batch_id)
 
 # COMMAND ----------
 
+# Issue #23 / U5 — reject operator-supplied lhp_run_id_override values that
+# collide with a non-pending row in b2_manifests. Without this guard, the
+# `MERGE WHEN MATCHED` clause below silently updates only `updated_at` on
+# pre-existing rows — workers then see worker_run_id already set from the
+# prior batch and raise LHP-MAN-002 for every action, validate coalesces on
+# stale watermarks rows, and the operator sees a silent extraction skip
+# with a green validate. Reject collision before any DML state mutation.
+#
+# Collision predicate: any row sharing the derived batch_id with status
+# != 'pending' indicates a prior live, completed, or failed batch. A
+# pending-only collision is the legitimate idempotent re-execute case
+# and is left to the MERGE WHEN MATCHED clause as today.
+_collision_sql = (
+    f"SELECT count(1) AS n FROM {manifest_table} "
+    f"WHERE batch_id = {sql_literal(batch_id)} "
+    "AND execution_status != 'pending'"
+)
+_collision_result = spark.sql(_collision_sql)
+try:
+    _collision_row = _collision_result.first() if _collision_result is not None else None
+    _collision_n = int(_collision_row["n"]) if _collision_row is not None else 0
+except (KeyError, IndexError, TypeError, AttributeError):
+    # Mock or older Spark may not surface the count column; treat absent as 0.
+    _collision_n = 0
+if _collision_n > 0:
+    raise RuntimeError(
+        f"LHP-MAN-007: derived batch_id {batch_id!r} collides with "
+        f"{_collision_n} non-pending row(s) in {manifest_table}. The "
+        "MERGE WHEN MATCHED clause would silently update only updated_at, "
+        "leaving the prior batch's worker_run_id and execution_status "
+        "intact and producing a silent extraction skip. Operator action: "
+        "clear the lhp_run_id_override widget and let derive_run_id "
+        "resolve from the Jobs context, or supply a distinct override "
+        "value. See docs/runbooks/b2-for-each-rollout.md section "
+        "'lhp_run_id_override widget (issue #23)' for recovery steps."
+    )
+
+# COMMAND ----------
+
 # R1: Build manifest source rows from codegen-injected actions list.
 # Each interpolated value is rendered with tojson at the template level so
 # the rendered notebook contains Python string literals; runtime validation

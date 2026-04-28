@@ -607,10 +607,13 @@ def test_retention_deleted_count_logged() -> None:
     rendered = _render(_three_action_fixture())
     dbutils = _FakeDbutils(run_id="job-7-task-3-attempt-0")
 
-    # Script: DDL call → noop, DELETE call → 2 affected rows, MERGE call → noop.
-    # Fix #5 moved retention BEFORE the MERGE; execution order is now:
-    # (1) CREATE TABLE, (2) DELETE for retention, (3) MERGE via execute_with_concurrent_commit_retry.
-    spark = _RecordingSpark(script=["noop", 2, "noop"])
+    # Script: DDL call → noop, collision-check SELECT (U5/#23) → noop (zero
+    # rows), DELETE call → 2 affected rows, MERGE call → noop.
+    # Fix #5 moved retention BEFORE the MERGE; U5 inserted a collision check
+    # AFTER batch_id derivation but BEFORE retention. Execution order is now:
+    # (1) CREATE TABLE, (2) SELECT count(1) collision check, (3) DELETE for
+    # retention, (4) MERGE via execute_with_concurrent_commit_retry.
+    spark = _RecordingSpark(script=["noop", "noop", 2, "noop"])
 
     captured = io.StringIO()
     with patch("builtins.print", side_effect=lambda *a, **kw: captured.write(" ".join(str(x) for x in a) + "\n")):
@@ -796,3 +799,111 @@ def test_non_empty_actions_render_unchanged_by_u3_guard() -> None:
     )
     # Guard error code must NOT leak into the non-empty branch.
     assert "LHP-MAN-006" not in rendered, "LHP-MAN-006 leaked into non-empty render"
+
+
+# ---------- U5 / Issue #23: prepare-time collision rejection -----------------
+
+
+class _CollisionScriptedSpark(_RecordingSpark):
+    """Recording spark whose collision-check SELECT returns the configured
+    row count.
+
+    The U5 collision check is the FIRST `SELECT count(1)` after the DDL.
+    This wrapper intercepts that call and returns a row whose ``row["n"]``
+    equals the configured count; all other ``spark.sql`` calls fall through
+    to the recording defaults.
+    """
+
+    def __init__(self, collision_n: int, script: Optional[List[Any]] = None) -> None:
+        super().__init__(script=script)
+        self._collision_n = collision_n
+        self._collision_consumed = False
+
+    def sql(self, statement: str) -> Any:
+        # Match the U5 collision-check SELECT before falling through to
+        # the recording defaults. The query carries `count(1) AS n` which
+        # uniquely identifies it among prepare_manifest's SQL.
+        if (
+            not self._collision_consumed
+            and "count(1) AS n" in statement
+            and "execution_status != 'pending'" in statement
+        ):
+            self._collision_consumed = True
+            self.statements.append(statement)
+            row = MagicMock()
+            row.__getitem__ = lambda s, k, _n=self._collision_n: _n if k == "n" else None
+            r = MagicMock()
+            r.first.return_value = row
+            r.collect.return_value = [row]
+            return r
+        return super().sql(statement)
+
+
+def test_lhp_man_007_collision_rejected_on_completed_row() -> None:
+    """U5 / #23: a non-pending row in b2_manifests for the same batch_id
+    triggers LHP-MAN-007 BEFORE any MERGE / DELETE / taskValues.set fires."""
+    rendered = _render(_three_action_fixture())
+    dbutils = _FakeDbutils(run_id="job-1-task-1-attempt-0")
+    spark = _CollisionScriptedSpark(collision_n=1)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        _run_rendered(rendered, spark, dbutils)
+
+    assert "LHP-MAN-007" in str(exc_info.value), (
+        f"Expected LHP-MAN-007 collision error; got: {exc_info.value!r}"
+    )
+
+    # Only DDL + collision SELECT should have run before the raise.
+    sql_statements = [s for s in spark.statements if s.strip()]
+    assert len(sql_statements) == 2, (
+        f"Expected exactly 2 spark.sql calls (DDL + collision SELECT) "
+        f"before LHP-MAN-007; got {len(sql_statements)}: {sql_statements!r}"
+    )
+    assert "CREATE TABLE IF NOT EXISTS" in sql_statements[0]
+    assert "count(1) AS n" in sql_statements[1]
+    assert "execution_status != 'pending'" in sql_statements[1]
+    # No MERGE / retention DELETE / taskValues.set on the rejection path.
+    assert not any("MERGE" in s for s in sql_statements), (
+        f"MERGE must not run when collision detected; got {sql_statements!r}"
+    )
+    assert dbutils.jobs.taskValues.calls == [], (
+        f"taskValues.set must not be called when collision detected; "
+        f"got {dbutils.jobs.taskValues.calls!r}"
+    )
+
+
+def test_lhp_man_007_pending_only_collision_does_not_block() -> None:
+    """U5 / #23: a `pending`-only collision is the legitimate idempotent
+    re-execute case — the predicate filters `!= 'pending'`, so this returns
+    0 and the MERGE proceeds (WHEN MATCHED updates updated_at as today)."""
+    rendered = _render(_three_action_fixture())
+    dbutils = _FakeDbutils(run_id="job-1-task-1-attempt-0")
+    # collision_n=0 — no non-pending rows exist; pending rows are not
+    # surfaced by the filter.
+    spark = _CollisionScriptedSpark(collision_n=0)
+
+    # Should run cleanly to completion.
+    _run_rendered(rendered, spark, dbutils)
+
+    # Both taskValues should be set on the success path.
+    keys_emitted = [k for (k, _v) in dbutils.jobs.taskValues.calls]
+    assert "iterations" in keys_emitted
+    assert "batch_id" in keys_emitted
+
+
+def test_lhp_man_007_predicate_excludes_pending_status() -> None:
+    """U5 / #23: the rendered collision-check SQL filters
+    `execution_status != 'pending'` — the predicate must be present so
+    legitimate idempotent re-execute is allowed through."""
+    rendered = _render(_three_action_fixture())
+    # Direct text match — predicate must be exact.
+    assert "execution_status != 'pending'" in rendered, (
+        "collision-check predicate must filter `!= 'pending'` so "
+        "idempotent re-execute is not blocked"
+    )
+    # The error message must point operators to the runbook section.
+    assert "LHP-MAN-007" in rendered
+    assert "lhp_run_id_override" in rendered, (
+        "collision error must mention the override widget by its actual "
+        "name (lhp_run_id_override per src/lhp_watermark/runtime.py:31)"
+    )
