@@ -174,3 +174,61 @@ class TestFallbackPath:
         )
         result = derive_run_id(dbutils)
         assert _LOCAL_UUID_RE.match(result), result
+
+
+# -------------------- U5 / R7: override-pattern regression -------------------
+
+# Issue #23 R7: lhp_run_id_override widget values must match either:
+#   - UUID v4 form
+#   - "local-<uuid4>" form
+#   - "job-<digits>-task-<digits>-attempt-<digits>" form
+# The validator (`SQLInputValidator.uuid_or_job_run_id`) is the single
+# enforcement point; these tests lock the contract so a future weakening
+# of the regex (e.g., allowing alphabetic segments) fails loudly.
+
+
+class TestOverridePatternRegression:
+    r"""Lock the override-widget pattern contract for issue #23 R7.
+
+    The validator regex (``_JOB_RUN_ID = r"^job-\d+-task-\d+-attempt-\d+$"``)
+    plus ``_UUID_V4`` and ``_LOCAL_UUID`` is already strict — these tests
+    are regression guards, not new functionality.
+    """
+
+    @pytest.mark.parametrize(
+        "bad_override",
+        [
+            "job-foo-task-bar-attempt-baz",      # alphabetic where digits required
+            "job--task--attempt-",                # empty digit segments
+            "job-1-task-2",                       # missing attempt segment
+            "task-1-attempt-1",                   # missing job- prefix
+            "JOB-1-TASK-1-ATTEMPT-1",             # wrong case (validator anchors are lowercase)
+            "job-1-task-1-attempt-1-extra",       # trailing garbage
+            "local-not-a-uuid",                   # local- prefix without uuid4 body
+            " job-1-task-1-attempt-1",            # leading whitespace
+            "job-1-task-1-attempt-1 ",            # trailing whitespace
+            "job-1-task-1-attempt--1",            # negative-shaped attempt
+        ],
+    )
+    def test_malformed_overrides_raise_validation_error(self, bad_override: str) -> None:
+        dbutils = _make_dbutils(widget=bad_override)
+        with pytest.raises(WatermarkValidationError):
+            derive_run_id(dbutils)
+
+    @pytest.mark.parametrize(
+        "good_override",
+        [
+            "job-1-task-1-attempt-1",
+            "job-12345-task-67890-attempt-2",
+            "job-0-task-0-attempt-0",
+            "12345678-1234-1234-1234-123456789abc",  # uuid v4 hex
+        ],
+    )
+    def test_well_formed_overrides_accepted(self, good_override: str) -> None:
+        dbutils = _make_dbutils(widget=good_override)
+        assert derive_run_id(dbutils) == good_override
+
+    def test_local_uuid_override_accepted(self) -> None:
+        good = f"local-{uuid.uuid4()}"
+        dbutils = _make_dbutils(widget=good)
+        assert derive_run_id(dbutils) == good

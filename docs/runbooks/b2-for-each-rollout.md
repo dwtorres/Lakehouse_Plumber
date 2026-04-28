@@ -250,6 +250,44 @@ Apply the same recurring maintenance policy to the watermarks registry:
 Schedule these as separate Databricks SQL tasks or as a maintenance workflow
 running off-peak. They do not block extraction jobs.
 
+### First-deploy concurrent ALTER race (issue #22)
+
+When two pipelines deploy concurrently against a fresh (or schema-mismatched)
+watermarks registry, both `WatermarkManager.__init__` calls can race on
+`ALTER TABLE … ADD COLUMNS (load_group …)` or `ALTER TABLE … CLUSTER BY (...)`.
+The probes (`DESCRIBE TABLE` / `DESCRIBE DETAIL`) and the `ALTER` form a TOCTOU
+pair that Delta cannot make atomic — under fleet load the cumulative race
+window is small but non-zero.
+
+The two ALTER paths are wrapped in `execute_with_concurrent_commit_retry` with
+a 10-attempt budget and 0.5-second base backoff. The retry helper is silent
+on success and on per-attempt retries — consistent with the DML retry path
+used by `WatermarkManager._merge_with_retry` and `insert_new`. Expected
+behavior on first multi-pipeline deploy:
+
+- **Steady state**: zero ALTER retries — the second deploy sees the target
+  shape and the probes short-circuit before any ALTER is composed. No log
+  output from the retry path.
+- **Race occurred and recovered**: silent. The retry helper does not log
+  per-attempt; observability comes from total `WatermarkManager.__init__`
+  duration in worker driver logs (a recovered race adds at most a few
+  seconds at base backoff 0.5 s × jitter). Workers proceed to claim
+  manifest rows and the batch completes normally.
+- **Race exhausted budget**: the worker raises `WatermarkConcurrencyError`
+  with `attempts >= 2` (the actual retry count, surfaced via the
+  `_CountingSpark` wrapper). The error is logged at `ERROR` level with
+  the `op_label` (`ALTER TABLE CLUSTER BY` or `ALTER TABLE ADD COLUMNS`)
+  and the underlying exception. Investigate the deploy churn (is a third
+  pipeline also rolling out? a manual ALTER outside DAB?) and re-run the
+  failed iteration. The manifest row stays at `pending` — recovery is the
+  same as for `LHP-MAN-002`.
+
+Tuning notes: the 10-attempt budget × cumulative ~256 s backoff worst-case is
+intentional. Reducing it makes first-deploy spurious failures more likely;
+raising it hides genuine deploy contention. If a steady-state deploy starts
+producing routine retries, the right response is to stagger pipeline
+deploys, not to widen the budget.
+
 ---
 
 ## Troubleshooting
@@ -271,7 +309,71 @@ running off-peak. They do not block extraction jobs.
 | LHP-MAN-003 | Manifest row missing for action after claim UPDATE | Re-run full workflow from beginning; check that `prepare_manifest` succeeded. See [errors_reference.rst](../errors_reference.rst#lhp-man-003-manifest-row-missing-for-action) |
 | LHP-MAN-004 | Completion mirror MERGE retry exhausted; manifest row stuck in `running` | Reduce `concurrency`; manually correct manifest row if watermark shows completed. See [errors_reference.rst](../errors_reference.rst#lhp-man-004-completion-mirror-merge-retry-budget-exhausted) |
 | LHP-MAN-005 | Projected or actual `iterations` taskValue payload exceeds DAB 48 KB ceiling | Reduce action count or shorten field identifiers. At runtime: DELETE orphaned manifest rows and redeploy. See [errors_reference.rst](../errors_reference.rst#lhp-man-005-manifest-taskvalue-payload-exceeds-dab-48-kb-ceiling) |
+| LHP-MAN-006 | `prepare_manifest` rendered with empty `actions` list — codegen contract violation | Inspect the generator call site; LHP-CFG-033 should have rejected this earlier. File an LHP issue. See [errors_reference.rst](../errors_reference.rst#lhp-man-006-prepare-manifest-empty-actions-list) |
+| LHP-MAN-007 | Operator-supplied `lhp_run_id_override` collides with a non-pending row in `b2_manifests` | Pick a distinct override value or clear the widget; or DELETE the colliding `batch_id` rows if the prior batch is invalidated. See [`lhp_run_id_override` widget](#lhp_run_id_override-widget-issue-23) section above and [errors_reference.rst](../errors_reference.rst#lhp-man-007-batch-id-collision-with-non-pending-rows) |
 | LHP-WM-001 | `DuplicateRunError` raised by `wm.insert_new` — `run_id` already present in watermarks. Often a `__lhp_run_id_override` collision or a redeploy that resets DAB task counters. | Search worker task log for `duplicate_run_id_abort`. Clear the override widget or redeploy to refresh task identifiers. The manifest row stays in `running` and `validate` surfaces it as `final_status='running'` — manually reset via the LHP-MAN-002 procedure after fixing run_id provenance. See [errors_reference.rst](../errors_reference.rst#lhp-wm-001-duplicate-run-id-duplicaterunerror) |
+
+---
+
+### `lhp_run_id_override` widget (issue #23)
+
+The widget is intended for backfill/test scenarios — `derive_run_id`
+honours an operator-supplied value over the Jobs context and emits a
+`WARNING` log entry so the override leaves an audit trail.
+
+**Valid forms** (enforced by `SQLInputValidator.uuid_or_job_run_id`):
+
+- A bare UUID v4: `12345678-1234-1234-1234-123456789abc`
+- A `local-` prefixed UUID: `local-<uuid4>`
+- A Jobs-context-shaped token: `job-{int}-task-{int}-attempt-{int}`
+
+Any other form (alphabetic where digits are required, leading/trailing
+whitespace, mixed case, missing segments) raises
+`WatermarkValidationError` at the widget read site — the override is
+rejected before any downstream code trusts it.
+
+**Collision risk and recovery (LHP-MAN-007)**
+
+Re-using an override value whose derived `batch_id` matches a prior live,
+completed, or failed batch silently re-uses the prior batch's manifest
+rows. Pre-U5 (issue #23), the `MERGE WHEN MATCHED` clause in
+`prepare_manifest` only updated `updated_at`, leaving the prior batch's
+`worker_run_id` and `execution_status` intact. Workers then saw rows
+already claimed and raised `LHP-MAN-002` for every action; `validate`
+coalesced on stale watermarks rows and returned `pass`. The operator saw
+green for a batch that never ran extraction.
+
+The `prepare_manifest` task now runs a collision-rejection
+`SELECT count(1) FROM b2_manifests WHERE batch_id = :derived AND
+execution_status != 'pending'` immediately after `batch_id` derivation.
+Any non-pending row triggers `LHP-MAN-007` and the task fails fast
+without mutating state. A `pending`-only collision is the legitimate
+idempotent re-execute case and is allowed through to the MERGE as today.
+
+**Recovery procedure for LHP-MAN-007:**
+
+1. Read the worker task log; the error message contains the colliding
+   `batch_id` and the count of non-pending rows.
+2. Decide whether to retain or invalidate the prior batch's rows:
+   - **Retain** (audit needed): pick a distinct `lhp_run_id_override`
+     value (e.g., `local-<new-uuid>`), or clear the widget and let
+     `derive_run_id` resolve from the Jobs context, then re-run.
+   - **Invalidate** (operator confirms the prior batch is dead):
+     `DELETE FROM metadata.<env>_orchestration.b2_manifests WHERE
+     batch_id = '<colliding_batch_id>'`, then re-run with the
+     original override (or any override).
+
+### Long-running fleets and the validate window (issue #20)
+
+`validate` does not time-bound its scan. The query filters
+`b2_manifests` by exact `batch_id` (delivered from `prepare_manifest`
+via DAB taskValue), so fleets that take longer than 24 hours to
+complete — e.g., `concurrency: 1` × ~300 actions × slow JDBC source —
+are read correctly. There is no `INTERVAL N HOURS` predicate in
+`validate.py.j2`; reintroducing one would re-open the silent
+`noop_pass` failure mode this design eliminated. The
+`prepare_manifest` retention `DELETE … INTERVAL 30 DAYS` is a separate,
+intentional cleanup path and does not affect any in-flight batch.
 
 ---
 
@@ -384,21 +486,71 @@ two requirements simultaneously:
 
 1. It must be a member of `B2_ITERATION_KEYS` — the canonical frozenset defined in
    `src/lhp/models/b2_iteration.py`.
-2. It must be emitted by `prepare_manifest` into the `b2_manifests` row for that
-   action (via the manifest INSERT template).
+2. It must be emitted by `prepare_manifest` into the iteration payload that flows
+   to each worker via DAB `taskValues.set("iterations", ...)`.
 
-If either requirement is not met, the worker will either skip the attribute silently
-or raise a `KeyError` at runtime.
+The 10 keys split into two persistence categories — both flow through the
+iteration payload, but only six are also persisted in `b2_manifests` rows:
+
+| Key | In `b2_manifests` row? | In iteration payload? |
+|---|---|---|
+| `batch_id` | yes (PK) | yes |
+| `action_name` | yes (PK) | yes |
+| `source_system_id` | yes | yes |
+| `schema_name` | yes | yes |
+| `table_name` | yes | yes |
+| `load_group` | yes | yes |
+| `manifest_table` | no (FQN, not data) | yes |
+| `jdbc_table` | **no** (issue #19) | yes |
+| `watermark_column` | **no** (issue #19) | yes |
+| `landing_path` | **no** (issue #19) | yes |
+
+The three "no" rows are a deliberate design choice: `jdbc_table`,
+`watermark_column`, and `landing_path` flow via `taskValues` only because the
+`watermarks` table already records all three on every run and is joinable on
+`worker_run_id`. Adding them to the manifest DDL would require an `ALTER TABLE`
+migration on every existing devtest/qa/prod manifest table for an
+observability gap already covered by the watermarks join.
+
+### Audit join pattern (for the three taskValue-only keys)
+
+To reconstruct full per-action source coordinates from a completed batch:
+
+```sql
+SELECT
+    m.batch_id,
+    m.action_name,
+    m.execution_status                AS manifest_status,
+    m.worker_run_id,
+    w.source_system_id,
+    w.schema_name,
+    w.table_name,
+    w.watermark_column_name,
+    w.watermark_value,
+    w.row_count,
+    w.status                          AS worker_status,
+    w.completed_at
+FROM metadata.<env>_orchestration.b2_manifests m
+LEFT JOIN metadata.<env>_orchestration.watermarks w
+    ON w.run_id = m.worker_run_id
+WHERE m.batch_id = '<batch_id>'
+ORDER BY m.action_name;
+```
+
+`jdbc_table` and `landing_path` are not stored in either table; recover them
+from the rendered pipeline YAML if needed (each LOAD action declares both as
+inline literals, which is how `prepare_manifest` populates them at codegen).
 
 **To extend the contract** (add a new per-action attribute):
 
 1. Add the attribute name to `B2_ITERATION_KEYS` in `src/lhp/models/b2_iteration.py`.
 2. Emit the attribute from the `prepare_manifest` template
-   (`src/lhp/templates/b2/prepare_manifest.py.j2`).
+   (`src/lhp/templates/b2/prepare_manifest.py.j2`) into the iteration payload.
 3. Consume the attribute in the worker template
    (`src/lhp/templates/b2/worker/jdbc_watermark_job.py.j2`).
 4. Re-run `tests/test_b2_iteration_contract.py` — it asserts that every key in
-   `B2_ITERATION_KEYS` is present in the manifest INSERT and the worker read path.
+   `B2_ITERATION_KEYS` is present in both the iteration payload and the worker
+   read path.
 
 ---
 

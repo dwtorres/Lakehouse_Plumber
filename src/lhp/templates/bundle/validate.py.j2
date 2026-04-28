@@ -124,6 +124,15 @@ batch_id = SQLInputValidator.string(_batch_id_raw)
 # manifest_status) form. The CASE preserves the existing fallback for
 # every other case so worker-side intermediate statuses (running,
 # landed_not_committed, abandoned) still surface correctly.
+#
+# Issue #20 — DO NOT reintroduce a time-window predicate here (e.g.,
+# `created_at > current_timestamp() - INTERVAL N HOURS`). The original
+# scale-out used a 24h window which produced silent `noop_pass` for
+# fleets that ran longer than 24 hours (concurrency=1 × ~300 actions).
+# PR #25 (issue #19 / U7 in that plan) replaced the window with the
+# `WHERE batch_id = …` filter below — `batch_id` flows from
+# `prepare_manifest` via DAB taskValue, so the lookup is exact and
+# unbounded. Long-running fleets are no longer at risk of false-pass.
 _validate_sql = f"""
 WITH manifest AS (
     SELECT

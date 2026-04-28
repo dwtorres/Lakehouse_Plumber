@@ -287,24 +287,82 @@ class WatermarkManager:
             return False
         return tuple(current) == self._TARGET_CLUSTERING
 
+    # Retry budget for DDL ALTER paths. Issue #22: fleet-deploy concurrency
+    # (~300 workers × N pipelines) makes the narrow ALTER race window non-
+    # negligible cumulatively. ALTER is slower than DML, so the budget is
+    # widened (10 vs the DML default of 5) and the base delay raised
+    # (0.5 s vs 0.1 s) to give competing deploys time to commit. Non-
+    # concurrent-commit exceptions still raise on the first attempt — the
+    # helper inspects exception type before retrying.
+    _ALTER_RETRY_BUDGET = 10
+    _ALTER_BACKOFF_BASE_SECS = 0.5
+
+    def _alter_with_retry(self, sql: str, *, op_label: str) -> None:
+        """Run an ``ALTER TABLE`` with concurrent-commit retry; raise typed.
+
+        Issue #22 — wraps a single ``ALTER`` in
+        ``execute_with_concurrent_commit_retry`` so a concurrent fleet
+        deploy can recover instead of dying inside ``__init__`` and
+        leaving the worker without a ``WatermarkManager``. Non-
+        concurrent-commit exceptions raise on the first attempt with the
+        original exception preserved as the cause; concurrent-commit
+        exhaustion raises ``WatermarkConcurrencyError`` carrying the
+        actual attempt count (not constant 1).
+        """
+        # Tiny duck-type wrapper: the helper calls ``spark.sql(stmt)`` and
+        # we only need the call count to surface real attempts in the
+        # exhaustion error.
+        class _CountingSpark:
+            def __init__(self, inner: Any) -> None:
+                self._inner = inner
+                self.calls = 0
+
+            def sql(self, statement: str) -> Any:  # noqa: ANN401 — passthrough
+                self.calls += 1
+                return self._inner.sql(statement)
+
+        counting = _CountingSpark(self.spark)
+
+        def _on_exhausted(last_exc: Optional[BaseException]) -> NoReturn:
+            logger.error(
+                "%s exhausted concurrent-commit retry budget on %s: %s",
+                op_label,
+                self.table_name,
+                last_exc,
+            )
+            raise WatermarkConcurrencyError(
+                run_id=f"ddl:{self.table_name}",
+                attempts=counting.calls or self._ALTER_RETRY_BUDGET,
+            ) from last_exc
+
+        try:
+            execute_with_concurrent_commit_retry(
+                counting,
+                sql,
+                on_exhausted=_on_exhausted,
+                retry_budget=self._ALTER_RETRY_BUDGET,
+                backoff_base_secs=self._ALTER_BACKOFF_BASE_SECS,
+            )
+        except BaseException as exc:  # noqa: BLE001 — typed surface below
+            if isinstance(exc, WatermarkConcurrencyError):
+                raise
+            logger.error("%s failed on %s: %s", op_label, self.table_name, exc)
+            if _is_concurrent_commit_exception(exc):
+                # Helper re-raises the first non-retryable concurrent-commit
+                # case before reaching on_exhausted; mirror the typed surface.
+                raise WatermarkConcurrencyError(
+                    run_id=f"ddl:{self.table_name}",
+                    attempts=counting.calls or 1,
+                ) from exc
+            raise
+
     def _add_load_group_column(self) -> None:
         """Emit ``ALTER TABLE … ADD COLUMNS (load_group STRING)``; surface concurrency errors typed."""
         logger.info(
             "Adding load_group column to watermarks table: %s", self.table_name
         )
         sql = f"ALTER TABLE {self.table_name} ADD COLUMNS (load_group STRING)"
-        try:
-            self.spark.sql(sql)
-        except BaseException as exc:  # noqa: BLE001 — typed surface below
-            logger.error(
-                "ALTER TABLE ADD COLUMNS failed on %s: %s", self.table_name, exc
-            )
-            if _is_concurrent_commit_exception(exc):
-                raise WatermarkConcurrencyError(
-                    run_id=f"ddl:{self.table_name}",
-                    attempts=1,
-                ) from exc
-            raise
+        self._alter_with_retry(sql, op_label="ALTER TABLE ADD COLUMNS")
 
     def _alter_clustering_to_target(self) -> None:
         """Emit ``ALTER TABLE … CLUSTER BY (...)``; surface concurrency errors typed."""
@@ -315,18 +373,7 @@ class WatermarkManager:
             target,
         )
         sql = f"ALTER TABLE {self.table_name} CLUSTER BY ({target})"
-        try:
-            self.spark.sql(sql)
-        except BaseException as exc:  # noqa: BLE001 — typed surface below
-            logger.error(
-                "ALTER TABLE CLUSTER BY failed on %s: %s", self.table_name, exc
-            )
-            if _is_concurrent_commit_exception(exc):
-                raise WatermarkConcurrencyError(
-                    run_id=f"ddl:{self.table_name}",
-                    attempts=1,
-                ) from exc
-            raise
+        self._alter_with_retry(sql, op_label="ALTER TABLE CLUSTER BY")
 
     def get_latest_watermark(
         self,

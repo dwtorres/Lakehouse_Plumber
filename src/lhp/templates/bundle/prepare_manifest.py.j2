@@ -87,6 +87,23 @@ manifest_table = f"{wm_catalog}.{wm_schema}.b2_manifests"
 # R9: Auto-DDL — create b2_manifests on first run. CREATE TABLE IF NOT EXISTS
 # is the idempotency guard; Delta handles the existence check natively.
 # No SHOW TABLES pre-check is needed or used here.
+#
+# Issue #19 — intentional column omission: three keys carried by
+# B2_ITERATION_KEYS (jdbc_table, watermark_column, landing_path) flow to each
+# worker via DAB taskValues only and are NOT persisted in b2_manifests. This
+# is a deliberate design choice — the watermarks table records all three on
+# every run and is joinable on worker_run_id. Audit pattern:
+#
+#     SELECT m.*, w.source_system_id, w.schema_name, w.table_name,
+#            w.watermark_column_name, w.watermark_value
+#     FROM <manifest_table> m
+#     LEFT JOIN <watermarks_table> w ON w.run_id = m.worker_run_id
+#     WHERE m.batch_id = '<batch_id>';
+#
+# Adding the three columns to this DDL would require an ALTER TABLE migration
+# on every existing devtest/qa/prod manifest table for an observability gap
+# already covered by the watermarks join. See docs/runbooks/b2-for-each-rollout.md
+# section "Audit join pattern" for operator guidance.
 _ddl = f"""
     CREATE TABLE IF NOT EXISTS {manifest_table} (
         batch_id         STRING NOT NULL,
@@ -113,6 +130,27 @@ _ddl = f"""
 spark.sql(_ddl)
 
 # COMMAND ----------
+{% if not actions %}
+
+# Issue #21 / U3 — Defensive guard: prepare_manifest was rendered with an
+# empty `actions` list. This path is unreachable today: `_emit_b2_aux_files`
+# is only invoked when at least one `jdbc_watermark_v2` LOAD action exists,
+# and validator LHP-CFG-033 rejects `action_count == 0` at codegen time. The
+# guard exists so a future contributor (e.g., a new generator that calls
+# `_emit_b2_aux_files` without the v2-action precondition, or a per-action
+# filter that shrinks the list to zero) sees a clear LHP error instead of a
+# Spark `ParseException` on a malformed `MERGE … FROM VALUES` SQL with no
+# rows.
+raise RuntimeError(
+    "LHP-MAN-006: prepare_manifest rendered with empty actions list. "
+    "Generator contract violation — _emit_b2_aux_files must be invoked "
+    "with at least one jdbc_watermark_v2 LOAD action. LHP-CFG-033 "
+    "enforces this at codegen time; reaching this raise indicates a "
+    "bypass of that validator. Inspect the generator call site and "
+    "the for_each post-expansion action count."
+)
+{% else %}
+# COMMAND ----------
 
 # R1a: batch_id derived once at task entry. DAB retries produce a fresh
 # batch_id (per runtime.py:97); orphaned rows from a prior attempt are
@@ -120,6 +158,45 @@ spark.sql(_ddl)
 batch_id = derive_run_id(dbutils)
 # Validate the batch_id before any SQL composition.
 SQLInputValidator.string(batch_id)
+
+# COMMAND ----------
+
+# Issue #23 / U5 — reject operator-supplied lhp_run_id_override values that
+# collide with a non-pending row in b2_manifests. Without this guard, the
+# `MERGE WHEN MATCHED` clause below silently updates only `updated_at` on
+# pre-existing rows — workers then see worker_run_id already set from the
+# prior batch and raise LHP-MAN-002 for every action, validate coalesces on
+# stale watermarks rows, and the operator sees a silent extraction skip
+# with a green validate. Reject collision before any DML state mutation.
+#
+# Collision predicate: any row sharing the derived batch_id with status
+# != 'pending' indicates a prior live, completed, or failed batch. A
+# pending-only collision is the legitimate idempotent re-execute case
+# and is left to the MERGE WHEN MATCHED clause as today.
+_collision_sql = (
+    f"SELECT count(1) AS n FROM {manifest_table} "
+    f"WHERE batch_id = {sql_literal(batch_id)} "
+    "AND execution_status != 'pending'"
+)
+_collision_result = spark.sql(_collision_sql)
+try:
+    _collision_row = _collision_result.first() if _collision_result is not None else None
+    _collision_n = int(_collision_row["n"]) if _collision_row is not None else 0
+except (KeyError, IndexError, TypeError, AttributeError):
+    # Mock or older Spark may not surface the count column; treat absent as 0.
+    _collision_n = 0
+if _collision_n > 0:
+    raise RuntimeError(
+        f"LHP-MAN-007: derived batch_id {batch_id!r} collides with "
+        f"{_collision_n} non-pending row(s) in {manifest_table}. The "
+        "MERGE WHEN MATCHED clause would silently update only updated_at, "
+        "leaving the prior batch's worker_run_id and execution_status "
+        "intact and producing a silent extraction skip. Operator action: "
+        "clear the lhp_run_id_override widget and let derive_run_id "
+        "resolve from the Jobs context, or supply a distinct override "
+        "value. See docs/runbooks/b2-for-each-rollout.md section "
+        "'lhp_run_id_override widget (issue #23)' for recovery steps."
+    )
 
 # COMMAND ----------
 
@@ -283,3 +360,4 @@ if len(_payload) > 48 * 1024:
     )
 dbutils.jobs.taskValues.set(key="iterations", value=_payload)
 dbutils.jobs.taskValues.set(key="batch_id", value=batch_id)
+{% endif %}
