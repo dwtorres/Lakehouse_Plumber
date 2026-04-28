@@ -239,7 +239,7 @@ query = _build_jdbc_query(hwm_value)
 # invariant (R4 / test_r4_raise_on_failure_block_verbatim_between_modes)
 # remains untouched.
 {% if execution_mode == "for_each" %}
-# B2 manifest UPDATE: claim this attempt's worker_run_id (optimistic-concurrency).
+# B2 manifest UPDATE: claim the worker_run_id for this attempt (optimistic-concurrency).
 # DAB-retry-timeout race: if UPDATE matches zero, read back current state.
 worker_run_id = run_id
 update_sql = f"""

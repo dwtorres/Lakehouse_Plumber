@@ -150,6 +150,16 @@ final AS (
                  AND (w.worker_status IS NULL OR w.worker_status = 'completed')
                 THEN 'completed'
             WHEN m.manifest_status = 'failed' THEN 'failed'
+            -- Issue #18 R4 silent-divergence guard: when manifest is non-
+            -- terminal ('running') but a stale watermarks row matched on
+            -- worker_run_id shows 'completed', trust manifest. The ELSE
+            -- coalesce below would return 'completed' from the stale
+            -- watermark and false-pass an action that never actually ran
+            -- extraction this batch (DuplicateRunError abort, partial
+            -- replay, run_id collision via override widget).
+            WHEN m.manifest_status = 'running'
+                 AND w.worker_status = 'completed'
+                THEN m.manifest_status
             ELSE coalesce(w.worker_status, m.manifest_status)
         END AS final_status
     FROM manifest m
@@ -220,6 +230,12 @@ if not (completed_n == expected and failed_n == 0 and unfinished_n == 0):
                          AND (w.worker_status IS NULL OR w.worker_status = 'completed')
                         THEN 'completed'
                     WHEN m.manifest_status = 'failed' THEN 'failed'
+                    -- Issue #18 R4 silent-divergence guard (mirrors count
+                    -- query above): trust manifest when 'running' and a
+                    -- stale watermarks row shows 'completed'.
+                    WHEN m.manifest_status = 'running'
+                         AND w.worker_status = 'completed'
+                        THEN m.manifest_status
                     ELSE coalesce(w.worker_status, m.manifest_status)
                 END AS final_status
             FROM manifest m
